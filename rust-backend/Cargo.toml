@@ -1,0 +1,21 @@
+[package]
+name = "telugu-dating-backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7", features = ["json", "ws", "multipart"] }
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+jsonwebtoken = "9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "uuid"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.5", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+base64 = "0.22"
+image = "0.25"
+tract-onnx = "0.21"

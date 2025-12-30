@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.env.*
+.venv/
+venv/
+env/
+pip-wheel-metadata/
+dist/
+build/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Logs & local data
+*.log
+*.db
+uploads/
+uploaded_photos/
+
+# App artifacts
+*.sqlite3
+
+# Rust models
+rust-backend/models/
+!rust-backend/models/README.md

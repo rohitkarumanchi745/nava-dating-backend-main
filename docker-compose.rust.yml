@@ -1,0 +1,39 @@
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: nava
+      POSTGRES_PASSWORD: nava
+      POSTGRES_DB: nava
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  rust-api:
+    build:
+      context: ./rust-backend
+    depends_on:
+      - db
+      - redis
+    environment:
+      DATABASE_URL: postgresql://nava:nava@db:5432/nava
+      SECRET_KEY: change-me
+      BIND_ADDR: 0.0.0.0:8080
+      VISION_MODEL_DIR: /app/models
+      MAX_PHOTO_BYTES: 10485760
+      SELFIE_MATCH_THRESHOLD: 0.45
+      SELFIE_LIVENESS_THRESHOLD: 0.5
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./rust-backend/models:/app/models:ro
+
+volumes:
+  pgdata:

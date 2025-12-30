@@ -1,0 +1,117 @@
+<mxfile host="app.diagrams.net" agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36" version="28.2.3">
+  <diagram name="System Architecture" id="telugumatch-backend">
+    <mxGraphModel dx="946" dy="644" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="900" background="#ffffff" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="client-layer" value="Client Layer" style="swimlane;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=14;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="100" y="40" width="1400" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="ios-app" value="iOS App&#xa;(SwiftUI)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" parent="client-layer" vertex="1">
+          <mxGeometry x="630" y="30" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="android-app" value="Android App&#xa;(Kotlin)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" parent="client-layer" vertex="1">
+          <mxGeometry x="520" y="30" width="110" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="web-app" value="Web App&#xa;(React)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" parent="client-layer" vertex="1">
+          <mxGeometry x="750" y="30" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="cdn" value="CloudFlare CDN&#xa;(Static Assets, Voice Files)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="650" y="200" width="300" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="api-gateway" value="API Gateway&#xa;(Kong / AWS API Gateway)&#xa;• Rate Limiting&#xa;• Authentication&#xa;• Request Routing" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="625" y="300" width="350" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="load-balancer" value="Load Balancer&#xa;(NGINX / AWS ALB)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e6e6e6;strokeColor=#666666;fontSize=12;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="700" y="410" width="200" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="services-layer" value="Microservices Layer" style="swimlane;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=14;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="100" y="490" width="1400" height="200" as="geometry" />
+        </mxCell>
+        <mxCell id="auth-service" value="Auth Service&#xa;• SMS OTP&#xa;• JWT&#xa;• Sessions" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="services-layer" vertex="1">
+          <mxGeometry x="30" y="50" width="150" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="profile-service" value="Profile Service&#xa;• CRUD&#xa;• Photos&#xa;• Voice Intro" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="services-layer" vertex="1">
+          <mxGeometry x="210" y="50" width="150" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="discovery-service" value="Discovery Service&#xa;• Matching&#xa;• ML Scoring&#xa;• Filters" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="services-layer" vertex="1">
+          <mxGeometry x="390" y="50" width="150" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="voice-service" value="Voice Service&#xa;• Upload&#xa;• Process&#xa;• Transcode" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="services-layer" vertex="1">
+          <mxGeometry x="570" y="50" width="150" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="chat-service" value="Chat Service&#xa;• Messages&#xa;• WebSocket&#xa;• History" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="services-layer" vertex="1">
+          <mxGeometry x="750" y="50" width="150" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="ml-service" value="ML Service&#xa;• Training&#xa;• Predictions&#xa;• Features" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="services-layer" vertex="1">
+          <mxGeometry x="930" y="50" width="150" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="location-service" value="Location Service&#xa;• GPS&#xa;• Distance&#xa;• Nearby" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="services-layer" vertex="1">
+          <mxGeometry x="1110" y="50" width="150" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="queue" value="Message Queue&#xa;(RabbitMQ / Kafka)&#xa;• Voice Processing Queue&#xa;• Notification Queue&#xa;• ML Training Queue" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="650" y="710" width="300" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="data-layer" value="Data Layer" style="swimlane;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="100" y="810" width="1400" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="postgres" value="PostgreSQL&#xa;Cluster&#xa;• Master (Write)&#xa;• Replicas (Read)" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" parent="data-layer" vertex="1">
+          <mxGeometry x="50" y="40" width="150" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="redis" value="Redis Cluster&#xa;• Session Cache&#xa;• User Profiles&#xa;• OTP Storage" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" parent="data-layer" vertex="1">
+          <mxGeometry x="250" y="40" width="150" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="s3" value="AWS S3&#xa;• Voice Messages&#xa;• Photos&#xa;• Backups" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" parent="data-layer" vertex="1">
+          <mxGeometry x="450" y="40" width="150" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="elasticsearch" value="Elasticsearch&#xa;• User Search&#xa;• Analytics&#xa;• Logs" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="data-layer" vertex="1">
+          <mxGeometry x="650" y="40" width="150" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="monitoring" value="Monitoring&#xa;• Prometheus&#xa;• Grafana&#xa;• Jaeger" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" parent="data-layer" vertex="1">
+          <mxGeometry x="850" y="40" width="150" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="WME3NPlfMf-dbuAkiVek-1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=1;exitDx=0;exitDy=-15;exitPerimeter=0;entryX=0.855;entryY=1;entryDx=0;entryDy=-4.35;entryPerimeter=0;" edge="1" parent="data-layer" source="redis" target="redis">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="410" y="125" />
+              <mxPoint x="410" y="136" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="external-layer" value="External Services" style="swimlane;fillColor=#f0f0f0;strokeColor=#999999;fontSize=14;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="100" y="1010" width="1400" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="twilio" value="Twilio&#xa;(SMS)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e6e6e6;strokeColor=#666666;" parent="external-layer" vertex="1">
+          <mxGeometry x="50" y="30" width="100" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="stripe" value="Stripe&#xa;(Payments)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e6e6e6;strokeColor=#666666;" parent="external-layer" vertex="1">
+          <mxGeometry x="180" y="30" width="100" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="openai" value="OpenAI&#xa;(AI/ML)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e6e6e6;strokeColor=#666666;" parent="external-layer" vertex="1">
+          <mxGeometry x="310" y="30" width="100" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="sendgrid" value="SendGrid&#xa;(Email)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e6e6e6;strokeColor=#666666;" parent="external-layer" vertex="1">
+          <mxGeometry x="440" y="30" width="100" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="edge1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" parent="1" source="ios-app" target="cdn" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" parent="1" source="cdn" target="api-gateway" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" parent="1" source="api-gateway" target="load-balancer" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" parent="1" source="load-balancer" target="services-layer" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" parent="1" source="services-layer" target="queue" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" parent="1" source="queue" target="data-layer" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
