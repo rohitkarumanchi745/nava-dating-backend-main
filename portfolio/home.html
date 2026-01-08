@@ -106,76 +106,23 @@
         <article class="rounded-2xl border border-zinc-200 bg-white/80 p-6 shadow-soft">
           <div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
             <div>
-              <h3 class="text-xl font-semibold">Nava - High-Performance Dating Platform</h3>
-              <div class="text-zinc-600">Distributed systems architecture for real-time social connections at scale</div>
+              <h3 class="text-xl font-semibold">Nava (Dating App Backend)</h3>
+              <div class="text-zinc-600">FastAPI + JWT + OTP login + profile flows + uploads</div>
             </div>
             <a class="mt-2 inline-flex w-fit rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-800 transition hover:-translate-y-0.5 hover:bg-emerald-50" href="https://github.com/rohitkarumanchi745/telugu-dating-backend-main" target="_blank" rel="noreferrer">
               View Repo
             </a>
           </div>
-
-          <div class="mt-4 space-y-4">
-            <div>
-              <h4 class="font-semibold text-zinc-800">System Architecture</h4>
-              <p class="mt-1 text-zinc-700 leading-relaxed">
-                Architected a <strong>multi-layer backend</strong> in Rust using Axum, designed for horizontal scaling with stateless API servers and shared state via Redis. Implemented <strong>connection pooling</strong> (SQLx + PgBouncer patterns) and async I/O throughout using Tokio runtime to handle 10K+ concurrent connections per node.
-              </p>
-            </div>
-
-            <div>
-              <h4 class="font-semibold text-zinc-800">API Layer & Data Access</h4>
-              <p class="mt-1 text-zinc-700 leading-relaxed">
-                Built a <strong>GraphQL API</strong> with async-graphql featuring DataLoader for batched database queries (solving N+1), field-level authorization, and automatic schema introspection. Designed <strong>efficient data models</strong> with JSONB for flexible attributes, composite indexes for query optimization, and read replicas awareness.
-              </p>
-            </div>
-
-            <div>
-              <h4 class="font-semibold text-zinc-800">Real-Time Infrastructure</h4>
-              <p class="mt-1 text-zinc-700 leading-relaxed">
-                Designed a <strong>WebSocket pub/sub system</strong> with in-memory broadcast channels per chat room, supporting typing indicators, read receipts, and message fanout. Extended to <strong>WebRTC signaling</strong> for video/voice calls — managing session state, offer/answer exchange, ICE candidate relay, and graceful disconnection handling.
-              </p>
-            </div>
-
-            <div>
-              <h4 class="font-semibold text-zinc-800">ML Pipeline & Fraud Prevention</h4>
-              <p class="mt-1 text-zinc-700 leading-relaxed">
-                Integrated <strong>ONNX Runtime</strong> (tract) for low-latency inference — face detection, liveness verification, and embedding extraction. Built a <strong>similarity search layer</strong> using cosine distance on face embeddings to detect duplicate/fraudulent accounts. Designed for CPU-bound workloads with async offloading to prevent blocking.
-              </p>
-            </div>
-
-            <div>
-              <h4 class="font-semibold text-zinc-800">Matching Engine & Recommendations</h4>
-              <p class="mt-1 text-zinc-700 leading-relaxed">
-                Implemented a <strong>preference-based matching algorithm</strong> with compatibility scoring across multiple dimensions (interests, location, preferences). Added <strong>geo-filtering</strong> with distance calculations, bloom filters for seen-user deduplication, and configurable ranking weights for AI-assisted discovery.
-              </p>
-            </div>
-
-            <div>
-              <h4 class="font-semibold text-zinc-800">Monetization & Access Control</h4>
-              <p class="mt-1 text-zinc-700 leading-relaxed">
-                Designed <strong>tiered subscription system</strong> with feature gating via JWT claims — premium unlocks (unlimited swipes, read receipts, advanced filters). Implemented <strong>student verification flow</strong> with discount tiers and expiration handling. Role-based access control at resolver level.
-              </p>
-            </div>
-
-            <div>
-              <h4 class="font-semibold text-zinc-800">Observability & Reliability</h4>
-              <p class="mt-1 text-zinc-700 leading-relaxed">
-                Added <strong>Prometheus metrics</strong> for request latency histograms, active connections, cache hit rates, and error budgets. Implemented <strong>structured tracing</strong> with correlation IDs across services. Health endpoints with deep dependency checks (DB, Redis, ML models) for orchestrator probes.
-              </p>
-            </div>
-          </div>
-
-          <div class="mt-5 flex flex-wrap gap-2">
-            <span class="rounded-full bg-emerald-50 px-3 py-1 text-sm text-emerald-800">Rust/Axum</span>
-            <span class="rounded-full bg-emerald-50 px-3 py-1 text-sm text-emerald-800">async-graphql</span>
-            <span class="rounded-full bg-emerald-50 px-3 py-1 text-sm text-emerald-800">WebSocket</span>
-            <span class="rounded-full bg-emerald-50 px-3 py-1 text-sm text-emerald-800">WebRTC</span>
-            <span class="rounded-full bg-emerald-50 px-3 py-1 text-sm text-emerald-800">ONNX Runtime</span>
-            <span class="rounded-full bg-emerald-50 px-3 py-1 text-sm text-emerald-800">Tokio</span>
-            <span class="rounded-full bg-emerald-50 px-3 py-1 text-sm text-emerald-800">SQLx/Postgres</span>
-            <span class="rounded-full bg-emerald-50 px-3 py-1 text-sm text-emerald-800">Redis</span>
-            <span class="rounded-full bg-emerald-50 px-3 py-1 text-sm text-emerald-800">Prometheus</span>
-            <span class="rounded-full bg-emerald-50 px-3 py-1 text-sm text-emerald-800">Docker</span>
+          <ul class="mt-4 list-disc space-y-2 pl-5 text-zinc-700">
+            <li>Built phone OTP auth, token-based APIs, and profile update flows (multipart/form-data).</li>
+            <li>Designed service boundaries for matchmaking/chat/analytics for future scaling.</li>
+            <li>Focused on privacy-aware recommendations and explainability.</li>
+          </ul>
+          <div class="mt-4 flex flex-wrap gap-2">
+            <span class="rounded-full bg-emerald-50 px-3 py-1 text-sm text-emerald-800">FastAPI</span>
+            <span class="rounded-full bg-emerald-50 px-3 py-1 text-sm text-emerald-800">SQLite/Postgres</span>
+            <span class="rounded-full bg-emerald-50 px-3 py-1 text-sm text-emerald-800">JWT</span>
+            <span class="rounded-full bg-emerald-50 px-3 py-1 text-sm text-emerald-800">Expo/React Native</span>
           </div>
         </article>
 
