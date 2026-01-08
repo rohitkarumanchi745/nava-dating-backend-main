@@ -4,12 +4,21 @@ use axum::{
     Json,
 };
 use serde_json::json;
+use std::fmt;
 
 #[derive(Debug)]
 pub struct AppError {
     status: StatusCode,
     message: String,
 }
+
+impl fmt::Display for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for AppError {}
 
 impl AppError {
     pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
@@ -49,7 +58,10 @@ impl IntoResponse for AppError {
 }
 
 impl From<sqlx::Error> for AppError {
-    fn from(_: sqlx::Error) -> Self {
-        AppError::internal("Database error")
+    fn from(err: sqlx::Error) -> Self {
+        // Log the actual error for debugging
+        eprintln!("Database error: {:?}", err);
+        // Return a more detailed message (safe for development, adjust for production)
+        AppError::internal(format!("Database error: {}", err))
     }
 }

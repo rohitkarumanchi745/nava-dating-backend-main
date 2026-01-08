@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Rohit Karumanchi — Portfolio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="page">
+    <header class="nav">
+      <div class="logo">RK</div>
+      <nav>
+        <a href="#work">Work</a>
+        <a href="#ml">ML/AI</a>
+        <a href="#stack">Stack</a>
+        <a href="#contact">Contact</a>
+      </nav>
+      <a class="pill" href="mailto:rohitkarumanchi745@gmail.com">Say hello</a>
+    </header>
+
+    <main>
+      <section class="hero">
+        <p class="eyebrow">Backend · Rust · Vision ML · Distributed systems</p>
+        <div class="hero-grid">
+          <div>
+            <h1>Rohit Karumanchi</h1>
+            <p class="lede">
+              Backend engineer building production-grade APIs, ML-powered vision flows, and reliable infra in Rust, Python, and cloud-native stacks.
+            </p>
+            <div class="cta">
+              <a class="btn primary" href="mailto:rohitkarumanchi745@gmail.com">Book a call</a>
+              <a class="btn ghost" href="https://github.com/rohitkarumanchi745" target="_blank" rel="noreferrer">GitHub</a>
+            </div>
+            <div class="chips">
+              <span>Axum + SQLx</span>
+              <span>gRPC & GraphQL</span>
+              <span>Kafka</span>
+              <span>ONNX / OpenCV</span>
+              <span>Postgres</span>
+              <span>Docker & Compose</span>
+            </div>
+          </div>
+          <div class="stat-card">
+            <p class="stat-title">Recent build</p>
+            <h3>Rust-native dating backend</h3>
+            <ul>
+              <li>Axum API with JWT auth, OTP flows, profile & media uploads</li>
+              <li>Vision inference (tract-onnx) for selfie verification + liveness</li>
+              <li>gRPC notifications, Redis caching, Postgres via SQLx</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="work" class="panel">
+        <div class="panel-head">
+          <p class="eyebrow">Selected work</p>
+          <h2>Projects that ship</h2>
+        </div>
+        <div class="card-grid">
+          <article class="card">
+            <p class="card-kicker">Rust · Axum · SQLx · Vision</p>
+            <h3>Identity & profile platform</h3>
+            <p>End-to-end account flows: OTP login, JWT auth, profile CRUD, media uploads with vision-powered verification and embeddings matching.</p>
+            <ul>
+              <li>Selfie liveness + cosine similarity for fraud prevention</li>
+              <li>Multipart uploads to storage with background processing</li>
+              <li>Dockerized with multi-stage builds and Compose stack</li>
+            </ul>
+          </article>
+          <article class="card">
+            <p class="card-kicker">Python · gRPC · Kafka</p>
+            <h3>Event-driven engagement</h3>
+            <p>Notification and matchmaking pipelines using Kafka for fan-out, gRPC for low-latency services, and Redis for hot-path caching.</p>
+            <ul>
+              <li>Schema-first protos with generated clients</li>
+              <li>Resilient workers with backpressure and retries</li>
+              <li>Metrics + tracing for delivery SLAs</li>
+            </ul>
+          </article>
+          <article class="card">
+            <p class="card-kicker">ML · Recsys · RL</p>
+            <h3>Adaptive recommendations</h3>
+            <p>Ranking and exploration with bandits/RL for feed and spotlight placements, backed by feature stores and real-time signals.</p>
+            <ul>
+              <li>Contextual bandits (LinUCB/Thompson)</li>
+              <li>Cold-start heuristics blended with embeddings</li>
+              <li>Offline eval + online A/B toggles</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section id="ml" class="panel accent">
+        <div class="panel-head">
+          <p class="eyebrow">ML / Vision</p>
+          <h2>Productionized models</h2>
+        </div>
+        <div class="card-grid two-col">
+          <article class="card ghosty">
+            <h3>Vision verification</h3>
+            <p>ONNX models via tract-onnx with pre/post-processing in Rust; embeddings stored for similarity search and re-use.</p>
+            <ul>
+              <li>Face detection, alignment, and normalization</li>
+              <li>Batch-safe execution on CPU targets</li>
+              <li>Guardrails: max bytes, liveness thresholds, auditing</li>
+            </ul>
+          </article>
+          <article class="card ghosty">
+            <h3>ML operations</h3>
+            <p>Model packaging, versioning, and rollout controls to keep inference safe and observable.</p>
+            <ul>
+              <li>Model registry + checksum validation on boot</li>
+              <li>Shadow deployments and latency SLOs</li>
+              <li>Tracing hooks for misclassification review</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section id="stack" class="panel">
+        <div class="panel-head">
+          <p class="eyebrow">Toolbox</p>
+          <h2>What I build with</h2>
+        </div>
+        <div class="stack-grid">
+          <div>
+            <h4>Backend</h4>
+            <p>Rust (Axum, SQLx, Tokio), Python (FastAPI, asyncio), gRPC, GraphQL, REST.</p>
+          </div>
+          <div>
+            <h4>Data & ML</h4>
+            <p>Postgres, Redis, Kafka, ONNX, OpenCV, bandits/RL, embeddings search.</p>
+          </div>
+          <div>
+            <h4>Infra</h4>
+            <p>Docker, Compose, CI/CD, observability with tracing/metrics/logging.</p>
+          </div>
+          <div>
+            <h4>Frontends</h4>
+            <p>API-first; ship to React Native and Swift clients via clean contracts.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="contact" class="panel contact">
+        <div>
+          <p class="eyebrow">Let’s talk</p>
+          <h2>Consulting, builds, or collabs</h2>
+          <p class="lede">Available for high-impact backend and ML engagements.</p>
+        </div>
+        <div class="cta">
+          <a class="btn primary" href="mailto:rohitkarumanchi745@gmail.com">Email</a>
+          <a class="btn ghost" href="https://github.com/rohitkarumanchi745" target="_blank" rel="noreferrer">GitHub</a>
+          <a class="btn ghost" href="https://www.linkedin.com/in/rohitkarumanchi745" target="_blank" rel="noreferrer">LinkedIn</a>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   db:
     image: postgres:15-alpine
@@ -11,25 +9,145 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./rust-backend/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nava -d nava"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
 
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
 
   api:
-    build: .
+    build:
+      context: ./rust-backend
     depends_on:
-      - db
-      - redis
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
+      # Environment
+      ENVIRONMENT: production
+
+      # Database
       DATABASE_URL: postgresql://nava:nava@db:5432/nava
-      REDIS_URL: redis://redis:6379/0
-      SECRET_KEY: change-me
+      DB_MAX_CONNECTIONS: 100
+      DB_MIN_CONNECTIONS: 10
+      DB_ACQUIRE_TIMEOUT_SECS: 30
+      DB_IDLE_TIMEOUT_SECS: 600
+
+      # Redis
+      REDIS_URL: redis://redis:6379
+
+      # Auth & Security
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production-use-strong-secret-at-least-32-chars}
+      ACCESS_TOKEN_EXPIRE_MINUTES: 10080
+      CALL_TOKEN_EXPIRE_MINUTES: 15
+
+      # Server
+      BIND_ADDR: 0.0.0.0:8080
+      RUST_LOG: info,sqlx=warn
+      REQUEST_TIMEOUT_SECS: 30
+      SHUTDOWN_TIMEOUT_SECS: 30
+
+      # Rate Limiting
+      RATE_LIMIT_RPM: 60
+      RATE_LIMIT_BURST: 10
+
+      # Vision (optional - graceful degradation if not configured)
+      VISION_ENABLED: "true"
+      VISION_MODEL_DIR: /app/models
+      MAX_PHOTO_BYTES: 10485760
+      SELFIE_MATCH_THRESHOLD: 0.45
+      SELFIE_LIVENESS_THRESHOLD: 0.5
+
+      # Discovery & Matching
+      DISCOVER_LIMIT: 20
+      DEFAULT_MAX_DISTANCE_KM: 50
+
+      # Spots/Videos
+      MAX_VIDEO_BYTES: 52428800
+      MAX_SPOT_DURATION_SEC: 30
+      FREE_SPOTS_LIMIT: 2
+      SPOT_EXPIRY_DAYS: 15
+
+      # Uploads
+      UPLOAD_DIR: /app/uploads
+
+      # Pass Pricing (cents)
+      PASS_PRICE_HOURLY: 1200
+      PASS_PRICE_DAILY: 2000
+      PASS_PRICE_WEEKLY: 9900
+      PASS_PRICE_MONTHLY: 29900
+      PASS_PRICE_ULTRA: 49900
+
+      # Student Discounts (decimal: 0.30 = 30%)
+      STUDENT_DISCOUNT_IVY: 0.30
+      STUDENT_DISCOUNT_TOP50: 0.20
+      STUDENT_DISCOUNT_STATE: 0.15
+      STUDENT_DISCOUNT_OTHER: 0.10
+      STUDENT_DISCOUNT_GRADUATE: 0.15
+      STUDENT_DISCOUNT_ALUMNI: 0.05
+
+      # LLM Labeling
+      LLM_ENABLED: "true"
+      LLM_API_URL: http://localhost:8000
+      LLM_MODEL_NAME: llama3
+      LLM_BATCH_SIZE: 10
+      LLM_MAX_RETRIES: 3
+
+      # Federated Learning
+      FL_ENABLED: "true"
+      FL_MIN_CLIENTS: 10
+      FL_CLIENT_FRACTION: 0.1
+      FL_LOCAL_EPOCHS: 1
+      FL_LEARNING_RATE: 0.01
+      FL_DP_ENABLED: "true"
+      FL_NOISE_MULTIPLIER: 1.0
+      FL_CLIP_NORM: 1.0
+
     ports:
-      - "8000:8000"
+      - "8080:8080"
     volumes:
-      - ./uploads:/app/uploads
+      - uploads:/app/uploads
+      - ./rust-backend/models:/app/models:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
 
 volumes:
   pgdata:
+  redis_data:
+  uploads:
