@@ -1,1 +1,0 @@
-tower_http::timeout::Timeout<tower_http::trace::Trace<Cors<Route>, SharedClassifier<ServerErrorsAsFailures>, DefaultMakeSpan, {closure@src/main.rs:361:37: 361:73}, {closure@src/main.rs:368:38: 368:95}>>

@@ -28,3 +28,6 @@ uploaded_photos/
 # Rust models
 rust-backend/models/
 !rust-backend/models/README.md
+
+# Rust build artifacts
+rust-backend/target/

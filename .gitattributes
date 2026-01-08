@@ -9,3 +9,13 @@
 *.pt binary
 *.bin binary
 *.h5 binary
+
+# Language detection - mark Rust as primary
+*.rs linguist-language=Rust
+*.toml linguist-detectable
+
+# Ignore from language stats
+rust-backend/target/** linguist-generated
+portfolio/** linguist-documentation
+*.sql linguist-documentation
+*.py linguist-vendored
