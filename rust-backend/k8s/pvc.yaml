@@ -1,0 +1,61 @@
+# =============================================================================
+# NAVA Backend - Persistent Volume Claims
+# =============================================================================
+# Storage for ML models and temporary uploads
+
+---
+# PVC for Vision AI Models (ReadOnlyMany - shared across all pods)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nava-models-pvc
+  labels:
+    app: nava-backend
+spec:
+  accessModes:
+    - ReadOnlyMany  # Models are read-only, shared across pods
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: standard  # Change based on your cloud provider
+  # AWS EKS: gp2, gp3
+  # GKE: standard, premium-rwo
+  # Azure AKS: default, managed-premium
+
+---
+# PVC for Uploads (ReadWriteMany - for local storage fallback)
+# Note: In production, use S3 instead of local uploads
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nava-uploads-pvc
+  labels:
+    app: nava-backend
+spec:
+  accessModes:
+    - ReadWriteMany  # Multiple pods need write access
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: standard  # Must support ReadWriteMany (EFS, Filestore, Azure Files)
+  # AWS EKS: Use efs-sc (EFS CSI driver)
+  # GKE: Use Filestore CSI driver
+  # Azure AKS: Use azurefile-csi
+
+---
+# =============================================================================
+# Optional: PVC for Local Cache (per-pod, improves performance)
+# =============================================================================
+# Uncomment if you need per-pod caching (e.g., image processing temp files)
+
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: nava-cache-pvc
+# spec:
+#   accessModes:
+#     - ReadWriteOnce
+#   resources:
+#     requests:
+#       storage: 10Gi
+#   storageClassName: fast-ssd  # Use SSD for cache performance

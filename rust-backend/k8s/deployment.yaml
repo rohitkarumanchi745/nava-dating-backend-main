@@ -1,0 +1,194 @@
+# =============================================================================
+# NAVA Backend - Kubernetes Deployment (10,000+ Concurrent Users)
+# =============================================================================
+# Deploy with: kubectl apply -f k8s/
+# Scale with: kubectl scale deployment nava-backend --replicas=5
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nava-backend
+  labels:
+    app: nava-backend
+    version: v1
+spec:
+  replicas: 3  # Start with 3 replicas, HPA will scale based on load
+  selector:
+    matchLabels:
+      app: nava-backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # Zero downtime deployments
+  template:
+    metadata:
+      labels:
+        app: nava-backend
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: nava-backend
+          image: nava/backend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+
+          # Environment variables from ConfigMap and Secrets
+          envFrom:
+            - configMapRef:
+                name: nava-config
+            - secretRef:
+                name: nava-secrets
+
+          env:
+            # Instance ID from pod name for horizontal scaling
+            - name: INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: ENVIRONMENT
+              value: "production"
+
+          # Resource limits for 10k+ users (per pod)
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+
+          # Kubernetes Health Probes
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+
+          # Startup probe for slow-starting containers
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 30  # 30 * 5s = 150s max startup time
+
+          # Volume mounts for models and uploads
+          volumeMounts:
+            - name: models
+              mountPath: /app/models
+              readOnly: true
+            - name: uploads
+              mountPath: /app/uploads
+
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: nava-models-pvc
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: nava-uploads-pvc
+
+      # Pod anti-affinity to spread across nodes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - nava-backend
+                topologyKey: kubernetes.io/hostname
+
+---
+# =============================================================================
+# Service - ClusterIP for internal access
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: nava-backend
+  labels:
+    app: nava-backend
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: nava-backend
+
+---
+# =============================================================================
+# Horizontal Pod Autoscaler - Auto-scale based on CPU/Memory
+# =============================================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nava-backend-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nava-backend
+  minReplicas: 3
+  maxReplicas: 10  # Scale up to 10 pods for 10k+ users
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # Wait 5 min before scaling down
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0  # Scale up immediately
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+        - type: Pods
+          value: 4
+          periodSeconds: 15
+      selectPolicy: Max

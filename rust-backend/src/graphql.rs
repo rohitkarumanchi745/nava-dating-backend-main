@@ -72,6 +72,30 @@ pub struct DiscoverProfile {
     pub compatibility_score: Option<f64>,
     pub distance_km: Option<f64>,
     pub is_verified: bool,
+    // Voice intro fields
+    pub voice_intro_url: Option<String>,
+    pub voice_intro_duration: Option<i32>,
+    pub has_voice_intro: bool,
+    // Enhanced profile fields
+    pub profession_title: Option<String>,
+    pub languages: Vec<String>,
+    pub looking_for: Option<String>,
+    pub height_cm: Option<i32>,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct LikeResult {
+    pub success: bool,
+    pub is_mutual: bool,
+    pub match_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct VoiceIntroResult {
+    pub success: bool,
+    pub url: String,
+    pub duration: i32,
 }
 
 #[derive(SimpleObject, Clone, Debug)]
@@ -322,7 +346,7 @@ impl QueryRoot {
         }))
     }
 
-    /// Discover profiles for matching
+    /// Discover profiles for matching with AI-powered compatibility scoring
     async fn discover(&self, ctx: &Context<'_>, filters: Option<DiscoverFilters>) -> Result<Vec<DiscoverProfile>> {
         let state = ctx.data::<AppState>()?;
         let user_id = get_user_id_from_context(ctx)?;
@@ -339,12 +363,22 @@ impl QueryRoot {
 
         let limit = f.limit.unwrap_or(20).min(50);
 
-        // Get profiles excluding already interacted users
+        // Get current user's profile for compatibility calculation
+        let current_user = sqlx::query_as::<_, UserCompatibilityRow>(
+            "SELECT interests, languages, looking_for, gender FROM users WHERE id = $1"
+        )
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await?;
+
+        // Get profiles excluding already interacted users with enhanced fields
         let rows = sqlx::query_as::<_, DiscoverRow>(
             r#"
             SELECT u.id, u.name, u.dob, u.gender, u.bio, u.location_text,
                    u.profile_photo_1, u.profile_photo_2, u.profile_photo_3, u.profile_photos,
-                   u.interests, u.is_verified, u.attractiveness_score
+                   u.interests, u.languages, u.is_verified, u.attractiveness_score,
+                   u.voice_intro_url, u.voice_intro_duration,
+                   u.profession_title, u.looking_for, u.height_cm
             FROM users u
             WHERE u.id != $1
               AND u.is_profile_complete = true
@@ -352,7 +386,19 @@ impl QueryRoot {
               AND u.id NOT IN (
                   SELECT target_user_id FROM swipes WHERE user_id = $1
               )
-            ORDER BY u.attractiveness_score DESC NULLS LAST, u.created_at DESC
+              AND u.id NOT IN (
+                  SELECT CASE WHEN user1_id = $1 THEN user2_id ELSE user1_id END
+                  FROM matches WHERE (user1_id = $1 OR user2_id = $1)
+                    AND ((user1_id = $1 AND user1_liked IS NOT NULL) OR (user2_id = $1 AND user2_liked IS NOT NULL))
+              )
+            ORDER BY
+                -- Prioritize profiles with voice intros
+                CASE WHEN u.voice_intro_url IS NOT NULL THEN 0 ELSE 1 END,
+                -- Then by attractiveness/quality score
+                u.attractiveness_score DESC NULLS LAST,
+                -- Then by recent activity
+                u.last_active DESC NULLS LAST,
+                u.created_at DESC
             LIMIT $2
             "#,
         )
@@ -360,6 +406,20 @@ impl QueryRoot {
         .bind(limit)
         .fetch_all(&state.db)
         .await?;
+
+        // Calculate compatibility scores
+        let current_interests: Vec<String> = current_user.as_ref()
+            .and_then(|u| u.interests.as_ref())
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        let current_languages: Vec<String> = current_user.as_ref()
+            .and_then(|u| u.languages.as_ref())
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        let current_looking_for = current_user.as_ref()
+            .and_then(|u| u.looking_for.clone());
 
         Ok(rows.into_iter().map(|r| {
             let age = r.dob.map(|dob| {
@@ -380,9 +440,27 @@ impl QueryRoot {
                         .collect()
                 });
 
-            let interests = r.interests
+            let interests: Vec<String> = r.interests
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default();
+
+            let languages: Vec<String> = r.languages
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+
+            // Calculate compatibility score (0-100)
+            let compatibility_score = calculate_compatibility(
+                &current_interests,
+                &current_languages,
+                &current_looking_for,
+                &interests,
+                &languages,
+                &r.looking_for,
+                r.voice_intro_url.is_some(),
+                r.is_verified.unwrap_or(false),
+            );
+
+            let has_voice = r.voice_intro_url.is_some();
 
             DiscoverProfile {
                 id: i64::from(r.id),
@@ -393,9 +471,16 @@ impl QueryRoot {
                 location: r.location_text,
                 photos,
                 interests,
-                compatibility_score: r.attractiveness_score.map(|d| d.to_string().parse().unwrap_or(0.0)),
-                distance_km: None, // Would calculate from location
+                compatibility_score: Some(compatibility_score),
+                distance_km: None,
                 is_verified: r.is_verified.unwrap_or(false),
+                voice_intro_url: r.voice_intro_url,
+                voice_intro_duration: r.voice_intro_duration,
+                has_voice_intro: has_voice,
+                profession_title: r.profession_title,
+                languages,
+                looking_for: r.looking_for,
+                height_cm: r.height_cm,
             }
         }).collect())
     }
@@ -1077,6 +1162,237 @@ impl MutationRoot {
         let id = format!("custom_{}_{}", category, title.to_lowercase().replace(' ', "_"));
         Ok(id)
     }
+
+    /// Upload voice intro - accepts base64 encoded audio or URL
+    #[graphql(name = "upload_voice_intro")]
+    async fn upload_voice_intro(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "voice_url")] voice_url: Option<String>,
+        #[graphql(name = "duration_seconds")] duration: i32,
+    ) -> Result<VoiceIntroResult> {
+        let state = ctx.data::<AppState>()?;
+        let user_id = get_user_id_from_context(ctx)?;
+
+        // Validate duration (max 30 seconds for voice intro)
+        if duration <= 0 || duration > 30 {
+            return Err(Error::new("Voice intro must be between 1-30 seconds"));
+        }
+
+        let url = voice_url.unwrap_or_default();
+        if url.is_empty() {
+            return Err(Error::new("Voice URL is required"));
+        }
+
+        // Update user's voice intro
+        sqlx::query(
+            "UPDATE users SET voice_intro_url = $1, voice_intro_duration = $2, updated_at = NOW() WHERE id = $3"
+        )
+        .bind(&url)
+        .bind(duration)
+        .bind(user_id)
+        .execute(&state.db)
+        .await?;
+
+        Ok(VoiceIntroResult {
+            success: true,
+            url,
+            duration,
+        })
+    }
+
+    /// Like a user with detailed result
+    #[graphql(name = "likeUser")]
+    async fn like_user_v2(&self, ctx: &Context<'_>, target_user_id: i32) -> Result<LikeResult> {
+        let state = ctx.data::<AppState>()?;
+        let user_id = get_user_id_from_context(ctx)? as i32;
+
+        if user_id == target_user_id {
+            return Err(Error::new("Cannot like yourself"));
+        }
+
+        // Check if target exists
+        let target_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND is_active = TRUE)",
+        )
+        .bind(target_user_id)
+        .fetch_one(&state.db)
+        .await?;
+
+        if !target_exists {
+            return Err(Error::new("User not found"));
+        }
+
+        // Determine user order (lower ID is user1)
+        let (user1_id, user2_id, is_user1) = if user_id < target_user_id {
+            (user_id, target_user_id, true)
+        } else {
+            (target_user_id, user_id, false)
+        };
+
+        // Check for existing match record
+        let existing = sqlx::query_as::<_, MatchCheckRow>(
+            "SELECT id, user1_liked, user2_liked FROM matches WHERE user1_id = $1 AND user2_id = $2",
+        )
+        .bind(user1_id)
+        .bind(user2_id)
+        .fetch_optional(&state.db)
+        .await?;
+
+        let (match_id, is_mutual) = match existing {
+            Some(m) => {
+                // Update existing match
+                let other_liked = if is_user1 { m.user2_liked } else { m.user1_liked };
+                let is_mutual = other_liked.unwrap_or(false);
+
+                let query = if is_user1 {
+                    "UPDATE matches SET user1_liked = TRUE, is_mutual_match = $1, updated_at = NOW() WHERE id = $2"
+                } else {
+                    "UPDATE matches SET user2_liked = TRUE, is_mutual_match = $1, updated_at = NOW() WHERE id = $2"
+                };
+
+                sqlx::query(query)
+                    .bind(is_mutual)
+                    .bind(&m.id)
+                    .execute(&state.db)
+                    .await?;
+
+                (m.id, is_mutual)
+            }
+            None => {
+                // Create new match record
+                let new_id = uuid::Uuid::new_v4().to_string();
+                let (u1_liked, u2_liked) = if is_user1 { (Some(true), None) } else { (None, Some(true)) };
+
+                sqlx::query(
+                    r#"
+                    INSERT INTO matches (id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match, status, created_at, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, FALSE, 'active', NOW(), NOW())
+                    "#,
+                )
+                .bind(&new_id)
+                .bind(user1_id)
+                .bind(user2_id)
+                .bind(u1_liked)
+                .bind(u2_liked)
+                .execute(&state.db)
+                .await?;
+
+                (new_id, false)
+            }
+        };
+
+        // Log interaction event
+        let _ = sqlx::query(
+            "INSERT INTO interaction_events (user_id, target_user_id, event_type, surface, created_at) VALUES ($1, $2, 'like', 'discover', NOW())"
+        )
+        .bind(user_id)
+        .bind(target_user_id)
+        .execute(&state.db)
+        .await;
+
+        Ok(LikeResult {
+            success: true,
+            is_mutual,
+            match_id: if is_mutual { Some(match_id) } else { None },
+            message: if is_mutual { "It's a match!".to_string() } else { "Like sent".to_string() },
+        })
+    }
+
+    /// Pass on a user
+    #[graphql(name = "passUser")]
+    async fn pass_user_v2(&self, ctx: &Context<'_>, target_user_id: i32) -> Result<bool> {
+        let state = ctx.data::<AppState>()?;
+        let user_id = get_user_id_from_context(ctx)? as i32;
+
+        // Determine user order
+        let (user1_id, user2_id, is_user1) = if user_id < target_user_id {
+            (user_id, target_user_id, true)
+        } else {
+            (target_user_id, user_id, false)
+        };
+
+        // Check for existing match record
+        let existing = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM matches WHERE user1_id = $1 AND user2_id = $2",
+        )
+        .bind(user1_id)
+        .bind(user2_id)
+        .fetch_optional(&state.db)
+        .await?;
+
+        if let Some(match_id) = existing {
+            let query = if is_user1 {
+                "UPDATE matches SET user1_liked = FALSE, updated_at = NOW() WHERE id = $1"
+            } else {
+                "UPDATE matches SET user2_liked = FALSE, updated_at = NOW() WHERE id = $1"
+            };
+            sqlx::query(query)
+                .bind(&match_id)
+                .execute(&state.db)
+                .await?;
+        } else {
+            // Create record to track the pass
+            let new_id = uuid::Uuid::new_v4().to_string();
+            let (u1_liked, u2_liked): (Option<bool>, Option<bool>) = if is_user1 {
+                (Some(false), None)
+            } else {
+                (None, Some(false))
+            };
+
+            sqlx::query(
+                r#"
+                INSERT INTO matches (id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match, status, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, FALSE, 'active', NOW(), NOW())
+                "#,
+            )
+            .bind(&new_id)
+            .bind(user1_id)
+            .bind(user2_id)
+            .bind(u1_liked)
+            .bind(u2_liked)
+            .execute(&state.db)
+            .await?;
+        }
+
+        // Log interaction event
+        let _ = sqlx::query(
+            "INSERT INTO interaction_events (user_id, target_user_id, event_type, surface, created_at) VALUES ($1, $2, 'pass', 'discover', NOW())"
+        )
+        .bind(user_id)
+        .bind(target_user_id)
+        .execute(&state.db)
+        .await;
+
+        Ok(true)
+    }
+
+    /// Track voice intro playback
+    #[graphql(name = "trackVoicePlay")]
+    async fn track_voice_play(
+        &self,
+        ctx: &Context<'_>,
+        target_user_id: i32,
+        #[graphql(name = "play_duration_seconds")] play_duration: Option<i32>,
+    ) -> Result<bool> {
+        let state = ctx.data::<AppState>()?;
+        let user_id = get_user_id_from_context(ctx)? as i32;
+
+        // Log the voice play event for ML training
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO interaction_events (user_id, target_user_id, event_type, surface, reward, created_at)
+            VALUES ($1, $2, 'voice_play', 'discover', $3, NOW())
+            "#
+        )
+        .bind(user_id)
+        .bind(target_user_id)
+        .bind(play_duration.map(|d| d as f64 / 30.0).unwrap_or(0.5)) // Normalize to 0-1 based on 30s max
+        .execute(&state.db)
+        .await;
+
+        Ok(true)
+    }
 }
 
 // ============================================================================
@@ -1106,8 +1422,16 @@ struct DiscoverRow {
     profile_photo_3: Option<String>,
     profile_photos: Option<serde_json::Value>,
     interests: Option<serde_json::Value>,
+    languages: Option<serde_json::Value>,
     is_verified: Option<bool>,
     attractiveness_score: Option<rust_decimal::Decimal>,
+    // Voice intro
+    voice_intro_url: Option<String>,
+    voice_intro_duration: Option<i32>,
+    // Enhanced fields
+    profession_title: Option<String>,
+    looking_for: Option<String>,
+    height_cm: Option<i32>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1118,6 +1442,13 @@ struct MatchRow {
     is_mutual_match: Option<bool>,
     status: Option<String>,
     matched_at: Option<NaiveDateTime>,
+}
+
+#[derive(sqlx::FromRow)]
+struct MatchCheckRow {
+    id: String,
+    user1_liked: Option<bool>,
+    user2_liked: Option<bool>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1138,10 +1469,76 @@ struct StudentVerificationRow {
     expires_at: Option<NaiveDateTime>,
 }
 
+#[derive(sqlx::FromRow)]
+struct UserCompatibilityRow {
+    interests: Option<serde_json::Value>,
+    languages: Option<serde_json::Value>,
+    looking_for: Option<String>,
+    gender: Option<String>,
+}
+
 fn get_user_id_from_context(ctx: &Context<'_>) -> Result<i64> {
     ctx.data_opt::<i64>()
         .copied()
         .ok_or_else(|| Error::new("Authentication required"))
+}
+
+/// Calculate compatibility score between two users (0-100)
+fn calculate_compatibility(
+    my_interests: &[String],
+    my_languages: &[String],
+    my_looking_for: &Option<String>,
+    their_interests: &[String],
+    their_languages: &[String],
+    their_looking_for: &Option<String>,
+    has_voice_intro: bool,
+    is_verified: bool,
+) -> f64 {
+    let mut score = 50.0; // Base score
+
+    // Interest overlap (up to +25 points)
+    if !my_interests.is_empty() && !their_interests.is_empty() {
+        let my_set: std::collections::HashSet<_> = my_interests.iter().map(|s| s.to_lowercase()).collect();
+        let their_set: std::collections::HashSet<_> = their_interests.iter().map(|s| s.to_lowercase()).collect();
+        let overlap = my_set.intersection(&their_set).count();
+        let max_possible = my_set.len().min(their_set.len()).max(1);
+        let interest_score = (overlap as f64 / max_possible as f64) * 25.0;
+        score += interest_score;
+    }
+
+    // Language match (up to +15 points)
+    if !my_languages.is_empty() && !their_languages.is_empty() {
+        let my_langs: std::collections::HashSet<_> = my_languages.iter().map(|s| s.to_lowercase()).collect();
+        let their_langs: std::collections::HashSet<_> = their_languages.iter().map(|s| s.to_lowercase()).collect();
+        let lang_overlap = my_langs.intersection(&their_langs).count();
+        if lang_overlap > 0 {
+            score += 15.0;
+        }
+    }
+
+    // Looking for match (+10 points)
+    if let (Some(mine), Some(theirs)) = (my_looking_for, their_looking_for) {
+        if mine.to_lowercase() == theirs.to_lowercase() {
+            score += 10.0;
+        }
+    }
+
+    // Voice intro bonus (+5 points) - shows effort/authenticity
+    if has_voice_intro {
+        score += 5.0;
+    }
+
+    // Verified bonus (+5 points) - trust signal
+    if is_verified {
+        score += 5.0;
+    }
+
+    // Add some randomness to avoid identical scores (±5%)
+    let variance = (rand::random::<f64>() - 0.5) * 10.0;
+    score += variance;
+
+    // Clamp to 0-100 range
+    score.max(0.0).min(100.0).round()
 }
 
 // ============================================================================
@@ -1159,5 +1556,18 @@ pub fn build_schema(state: AppState) -> AppSchema {
     Schema::build(QueryRoot, MutationRoot, EmptySubscription)
         .data(state)
         .data(user_loader)
+        // ====================================================================
+        // Production Security: Query Complexity & Depth Limits
+        // ====================================================================
+        // These limits prevent GraphQL DoS attacks:
+        // - Deeply nested queries that exhaust server resources
+        // - Queries with excessive field selections
+        // - Recursive queries that create exponential load
+        //
+        // Complexity: Each field costs 1, nested objects multiply
+        // Example: user { matches { partner { ... } } } = 1 + 1*10 + 10*10 = 111
+        .limit_complexity(200)  // Max complexity score for a single query
+        .limit_depth(7)         // Max nesting depth (user->matches->partner->... max 7 levels)
+        // ====================================================================
         .finish()
 }

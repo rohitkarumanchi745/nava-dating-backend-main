@@ -1,3 +1,12 @@
+// Graph-powered endpoints module
+pub mod graph_handlers;
+// Web payments module (Razorpay + Stripe)
+pub mod payments;
+// Ads monetization module
+pub mod ads;
+// Ambassador program module
+pub mod ambassador;
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -21,7 +30,7 @@ use tokio::task;
 use uuid::Uuid;
 
 use crate::{
-    auth::{create_access_token, create_call_token, decode_access_token, extract_bearer_token},
+    auth::{create_access_token, create_call_token, decode_access_token, extract_bearer_token, AdminClaims},
     config::Config,
     error::AppError,
     models::*,
@@ -61,6 +70,136 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
         StatusCode::SERVICE_UNAVAILABLE
     };
     (status, Json(response))
+}
+
+/// Extended health check response for load balancers and monitoring
+#[derive(Serialize)]
+pub struct ExtendedHealthResponse {
+    pub status: &'static str,
+    pub instance_id: String,
+    pub uptime_secs: u64,
+    pub db: DbHealthStatus,
+    pub redis: RedisHealthStatus,
+    pub neo4j: &'static str,
+    pub vision: &'static str,
+    pub metrics: HealthMetrics,
+}
+
+#[derive(Serialize)]
+pub struct DbHealthStatus {
+    pub status: &'static str,
+    pub pool_size: u32,
+    pub pool_idle: u32,
+}
+
+#[derive(Serialize)]
+pub struct RedisHealthStatus {
+    pub status: &'static str,
+    pub connected: bool,
+}
+
+#[derive(Serialize)]
+pub struct HealthMetrics {
+    pub requests_total: u64,
+    pub requests_active: u64,
+    pub errors_total: u64,
+    pub websocket_connections: u64,
+}
+
+/// Detailed health check for load balancer and monitoring systems
+/// GET /health/detailed
+pub async fn health_detailed(State(state): State<AppState>) -> (StatusCode, Json<ExtendedHealthResponse>) {
+    use std::sync::atomic::Ordering;
+
+    // Database health
+    let db_ok = sqlx::query("SELECT 1").execute(&state.db).await.is_ok();
+    let pool_size = state.db.size();
+    let pool_idle = state.db.num_idle();
+
+    // Redis health
+    let redis_ok = if let Some(ref redis) = state.redis {
+        let redis_service = crate::redis_service::RedisService::new(redis.clone());
+        redis_service.ping().await.unwrap_or(false)
+    } else {
+        false
+    };
+
+    // Neo4j health
+    let neo4j_ok = state.graph_service.is_some();
+
+    // Vision health
+    let vision_ok = state.vision.is_some();
+
+    // Uptime
+    let uptime = state.start_time.elapsed().as_secs();
+
+    // Metrics
+    let metrics = HealthMetrics {
+        requests_total: state.metrics.requests_total.load(Ordering::Relaxed),
+        requests_active: state.metrics.requests_active.load(Ordering::Relaxed),
+        errors_total: state.metrics.errors_total.load(Ordering::Relaxed),
+        websocket_connections: state.metrics.websocket_connections.load(Ordering::Relaxed),
+    };
+
+    let overall_status = if db_ok { "healthy" } else { "degraded" };
+    let status_code = if db_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+
+    let response = ExtendedHealthResponse {
+        status: overall_status,
+        instance_id: state.config.instance_id.clone(),
+        uptime_secs: uptime,
+        db: DbHealthStatus {
+            status: if db_ok { "healthy" } else { "unhealthy" },
+            pool_size,
+            pool_idle: pool_idle as u32,
+        },
+        redis: RedisHealthStatus {
+            status: if redis_ok { "healthy" } else { "unavailable" },
+            connected: redis_ok,
+        },
+        neo4j: if neo4j_ok { "connected" } else { "unavailable" },
+        vision: if vision_ok { "enabled" } else { "disabled" },
+        metrics,
+    };
+
+    (status_code, Json(response))
+}
+
+/// Kubernetes Readiness Probe
+/// Used by K8s to determine if pod should receive traffic
+/// Configure in deployment.yaml:
+///   readinessProbe:
+///     httpGet:
+///       path: /ready
+///       port: 8080
+///     initialDelaySeconds: 5
+///     periodSeconds: 10
+/// GET /ready
+pub async fn readiness_probe(State(state): State<AppState>) -> StatusCode {
+    // Check database connectivity - required for readiness
+    let db_ready = sqlx::query("SELECT 1").execute(&state.db).await.is_ok();
+
+    // For readiness, we only require DB (Redis and Neo4j are optional)
+    if db_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+/// Kubernetes Liveness Probe
+/// Used by K8s to determine if pod should be restarted
+/// Configure in deployment.yaml:
+///   livenessProbe:
+///     httpGet:
+///       path: /live
+///       port: 8080
+///     initialDelaySeconds: 15
+///     periodSeconds: 20
+/// GET /live
+pub async fn liveness_probe() -> StatusCode {
+    // If this endpoint responds, the service is alive
+    StatusCode::OK
 }
 
 // ============================================================================
@@ -421,6 +560,178 @@ pub async fn update_bio(
     }
 
     Ok(Json(json!({ "message": "Bio updated successfully" })))
+}
+
+// ============================================================================
+// Voice Intro Upload
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct VoiceIntroRequest {
+    pub voice_url: Option<String>,
+    pub duration_seconds: i32,
+}
+
+pub async fn upload_voice_intro(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let mut voice_url: Option<String> = None;
+    let mut duration: Option<i32> = None;
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| AppError::bad_request("Invalid multipart data"))?
+    {
+        let field_name = field.name().unwrap_or("").to_string();
+        match field_name.as_str() {
+            "voice_url" => {
+                let value = read_text_field(&mut field, 1024).await?;
+                if !value.trim().is_empty() {
+                    voice_url = Some(value);
+                }
+            }
+            "duration_seconds" | "duration" => {
+                let value = read_text_field(&mut field, 16).await?;
+                duration = value.parse().ok();
+            }
+            "voice_file" | "audio" => {
+                let content_type = field
+                    .content_type()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+
+                // Accept audio files
+                if !content_type.starts_with("audio/") && !content_type.contains("webm") && !content_type.contains("mp4") {
+                    return Err(AppError::bad_request("File must be an audio file"));
+                }
+
+                let bytes = read_binary_field(&mut field, 5 * 1024 * 1024).await?; // 5MB max
+
+                // Save the file
+                let upload_dir = &state.config.upload_dir;
+                let voice_dir = Path::new(upload_dir).join("voice");
+                fs::create_dir_all(&voice_dir)
+                    .await
+                    .map_err(|_| AppError::internal("Failed to create voice directory"))?;
+
+                let ext = if content_type.contains("webm") { "webm" }
+                    else if content_type.contains("mp4") || content_type.contains("m4a") { "m4a" }
+                    else { "mp3" };
+                let filename = format!(
+                    "voice_{}_{}.{}",
+                    user_id,
+                    Utc::now().timestamp(),
+                    ext
+                );
+                let path = voice_dir.join(&filename);
+
+                fs::write(&path, bytes)
+                    .await
+                    .map_err(|_| AppError::internal("Failed to save voice file"))?;
+
+                voice_url = Some(format!("/uploads/voice/{}", filename));
+            }
+            _ => {}
+        }
+    }
+
+    let url = voice_url.ok_or_else(|| AppError::bad_request("Voice file or URL is required"))?;
+    let dur = duration.unwrap_or(15); // Default 15 seconds if not provided
+
+    // Validate duration (max 30 seconds)
+    if dur <= 0 || dur > 30 {
+        return Err(AppError::bad_request("Voice intro must be between 1-30 seconds"));
+    }
+
+    // Update user's voice intro
+    sqlx::query(
+        "UPDATE users SET voice_intro_url = $1, voice_intro_duration = $2, updated_at = NOW() WHERE id = $3"
+    )
+    .bind(&url)
+    .bind(dur)
+    .bind(user_id)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "voice_intro_url": url,
+        "duration_seconds": dur,
+        "message": "Voice intro uploaded successfully"
+    })))
+}
+
+/// JSON-based voice intro upload (for URL-based uploads)
+pub async fn upload_voice_intro_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<VoiceIntroRequest>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let url = payload.voice_url.ok_or_else(|| AppError::bad_request("voice_url is required"))?;
+    let duration = payload.duration_seconds;
+
+    if duration <= 0 || duration > 30 {
+        return Err(AppError::bad_request("Voice intro must be between 1-30 seconds"));
+    }
+
+    sqlx::query(
+        "UPDATE users SET voice_intro_url = $1, voice_intro_duration = $2, updated_at = NOW() WHERE id = $3"
+    )
+    .bind(&url)
+    .bind(duration)
+    .bind(user_id)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "voice_intro_url": url,
+        "duration_seconds": duration,
+        "message": "Voice intro uploaded successfully"
+    })))
+}
+
+/// Track voice intro playback for ML training
+#[derive(Deserialize)]
+pub struct TrackVoicePlayRequest {
+    pub target_user_id: i32,
+    pub play_duration_seconds: Option<i32>,
+}
+
+pub async fn track_voice_play(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<TrackVoicePlayRequest>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Log the voice play event
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO interaction_events (user_id, target_user_id, event_type, surface, reward, created_at)
+        VALUES ($1, $2, 'voice_play', 'discover', $3, NOW())
+        "#
+    )
+    .bind(user_id)
+    .bind(payload.target_user_id)
+    .bind(payload.play_duration_seconds.map(|d| d as f64 / 30.0).unwrap_or(0.5))
+    .execute(&state.db)
+    .await;
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Voice play tracked"
+    })))
 }
 
 pub async fn profile_status(
@@ -1336,9 +1647,340 @@ pub async fn purchase_pass(
 }
 
 // ============================================================================
+// RevenueCat Webhook & Subscription Sync
+// ============================================================================
+
+/// RevenueCat webhook event types
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RevenueCatEventType {
+    InitialPurchase,
+    Renewal,
+    Cancellation,
+    Uncancellation,
+    NonRenewingPurchase,
+    SubscriptionPaused,
+    Expiration,
+    BillingIssue,
+    ProductChange,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevenueCatWebhookEvent {
+    #[serde(rename = "type")]
+    pub event_type: RevenueCatEventType,
+    pub app_user_id: String,
+    pub product_id: String,
+    pub purchased_at_ms: Option<i64>,
+    pub expiration_at_ms: Option<i64>,
+    pub store: Option<String>,
+    pub environment: Option<String>,
+    pub original_transaction_id: Option<String>,
+    pub price_in_purchased_currency: Option<f64>,
+    pub currency: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevenueCatWebhookPayload {
+    pub event: RevenueCatWebhookEvent,
+    pub api_version: Option<String>,
+}
+
+/// Handle RevenueCat webhook events
+pub async fn revenuecat_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<RevenueCatWebhookPayload>,
+) -> Result<Json<Value>, AppError> {
+    // Verify webhook authorization (RevenueCat sends a shared secret in header)
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    // In production, verify this matches your RevenueCat webhook secret
+    let expected_secret = state.config.revenuecat_webhook_secret.as_deref().unwrap_or("");
+    if !expected_secret.is_empty() && auth_header != format!("Bearer {}", expected_secret) {
+        return Err(AppError::unauthorized("Invalid webhook authorization"));
+    }
+
+    let event = &payload.event;
+    tracing::info!(
+        "RevenueCat webhook: {:?} for user {} product {}",
+        event.event_type,
+        event.app_user_id,
+        event.product_id
+    );
+
+    // Parse user_id from app_user_id (we set this as the user's numeric ID)
+    let user_id: i64 = event.app_user_id.parse().map_err(|_| {
+        AppError::bad_request("Invalid app_user_id format")
+    })?;
+
+    // Map product_id to pass_type
+    let pass_type = product_id_to_pass_type(&event.product_id);
+
+    match event.event_type {
+        RevenueCatEventType::InitialPurchase | RevenueCatEventType::NonRenewingPurchase => {
+            // New subscription - create record
+            create_subscription_from_webhook(&state.db, user_id, event, &pass_type).await?;
+        }
+        RevenueCatEventType::Renewal => {
+            // Subscription renewed - extend or create
+            extend_subscription_from_webhook(&state.db, user_id, event, &pass_type).await?;
+        }
+        RevenueCatEventType::Expiration | RevenueCatEventType::Cancellation => {
+            // Mark subscription as expired/cancelled
+            deactivate_subscription(&state.db, user_id, &event.product_id).await?;
+        }
+        RevenueCatEventType::Uncancellation => {
+            // User uncancelled - reactivate
+            reactivate_subscription(&state.db, user_id, &event.product_id).await?;
+        }
+        RevenueCatEventType::BillingIssue | RevenueCatEventType::SubscriptionPaused => {
+            // Mark subscription as having issues
+            mark_subscription_billing_issue(&state.db, user_id, &event.product_id).await?;
+        }
+        _ => {
+            tracing::info!("Unhandled RevenueCat event type: {:?}", event.event_type);
+        }
+    }
+
+    Ok(Json(json!({ "status": "ok" })))
+}
+
+/// Sync subscription from frontend (called after successful purchase)
+#[derive(Debug, Deserialize)]
+pub struct SyncSubscriptionRequest {
+    pub product_id: String,
+    pub purchase_date: Option<String>,
+    pub expiration_date: Option<String>,
+    pub is_active: bool,
+    pub store: Option<String>,
+    pub original_transaction_id: Option<String>,
+}
+
+pub async fn sync_subscription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<SyncSubscriptionRequest>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let pass_type = product_id_to_pass_type(&payload.product_id);
+
+    // Parse dates
+    let start_date = payload.purchase_date
+        .as_ref()
+        .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+        .map(|dt| dt.naive_utc())
+        .unwrap_or_else(|| Utc::now().naive_utc());
+
+    let end_date = payload.expiration_date
+        .as_ref()
+        .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+        .map(|dt| dt.naive_utc());
+
+    // Upsert subscription
+    sqlx::query(
+        r#"
+        INSERT INTO user_subscriptions (
+            user_id, subscription_type, pass_type, status, start_date, end_date,
+            payment_id, is_active, store, created_at, updated_at
+        ) VALUES (
+            $1, $2, $2, 'active', $3, $4, $5, $6, $7, NOW(), NOW()
+        )
+        ON CONFLICT (user_id, pass_type) WHERE is_active = TRUE
+        DO UPDATE SET
+            start_date = EXCLUDED.start_date,
+            end_date = EXCLUDED.end_date,
+            is_active = EXCLUDED.is_active,
+            store = EXCLUDED.store,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(user_id)
+    .bind(pass_type.as_str())
+    .bind(start_date)
+    .bind(end_date)
+    .bind(&payload.original_transaction_id)
+    .bind(payload.is_active)
+    .bind(&payload.store)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "message": "Subscription synced",
+        "pass_type": pass_type.as_str(),
+        "is_active": payload.is_active,
+    })))
+}
+
+// Helper functions for subscription management
+fn product_id_to_pass_type(product_id: &str) -> PassType {
+    match product_id {
+        "nava_boost_1hr" => PassType::Hourly,
+        "nava_daily_pass" => PassType::Daily,
+        "nava_weekly_sub" => PassType::Weekly,
+        "nava_monthly_sub" => PassType::Monthly,
+        "nava_ultra_3mo" => PassType::Ultra,
+        _ => PassType::Free,
+    }
+}
+
+async fn create_subscription_from_webhook(
+    db: &PgPool,
+    user_id: i64,
+    event: &RevenueCatWebhookEvent,
+    pass_type: &PassType,
+) -> Result<(), AppError> {
+    let start_date = event.purchased_at_ms
+        .map(|ms| chrono::DateTime::from_timestamp_millis(ms).map(|dt| dt.naive_utc()))
+        .flatten()
+        .unwrap_or_else(|| Utc::now().naive_utc());
+
+    let end_date = event.expiration_at_ms
+        .map(|ms| chrono::DateTime::from_timestamp_millis(ms).map(|dt| dt.naive_utc()))
+        .flatten();
+
+    let price_cents = event.price_in_purchased_currency
+        .map(|p| (p * 100.0) as i64)
+        .unwrap_or(0);
+
+    sqlx::query(
+        r#"
+        INSERT INTO user_subscriptions (
+            user_id, subscription_type, pass_type, status, original_price, amount_paid,
+            start_date, end_date, payment_id, is_active, store,
+            enhanced_radius, can_see_city_names, unlimited_swipes, priority_visibility,
+            created_at, updated_at
+        ) VALUES (
+            $1, $2, $2, 'active', $3, $3, $4, $5, $6, TRUE, $7,
+            $8, $9, TRUE, TRUE, NOW(), NOW()
+        )
+        "#,
+    )
+    .bind(user_id)
+    .bind(pass_type.as_str())
+    .bind(rust_decimal::Decimal::new(price_cents, 2))
+    .bind(start_date)
+    .bind(end_date)
+    .bind(&event.original_transaction_id)
+    .bind(&event.store)
+    .bind(pass_type.enhanced_radius_miles())
+    .bind(pass_type.can_see_city_names())
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+async fn extend_subscription_from_webhook(
+    db: &PgPool,
+    user_id: i64,
+    event: &RevenueCatWebhookEvent,
+    pass_type: &PassType,
+) -> Result<(), AppError> {
+    let end_date = event.expiration_at_ms
+        .map(|ms| chrono::DateTime::from_timestamp_millis(ms).map(|dt| dt.naive_utc()))
+        .flatten();
+
+    // Update existing subscription or create new one
+    let result = sqlx::query(
+        r#"
+        UPDATE user_subscriptions
+        SET end_date = $1, is_active = TRUE, status = 'active', updated_at = NOW()
+        WHERE user_id = $2 AND pass_type = $3 AND is_active = TRUE
+        "#,
+    )
+    .bind(end_date)
+    .bind(user_id)
+    .bind(pass_type.as_str())
+    .execute(db)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        // No existing subscription, create new one
+        create_subscription_from_webhook(db, user_id, event, pass_type).await?;
+    }
+
+    Ok(())
+}
+
+async fn deactivate_subscription(
+    db: &PgPool,
+    user_id: i64,
+    product_id: &str,
+) -> Result<(), AppError> {
+    let pass_type = product_id_to_pass_type(product_id);
+
+    sqlx::query(
+        r#"
+        UPDATE user_subscriptions
+        SET is_active = FALSE, status = 'expired', updated_at = NOW()
+        WHERE user_id = $1 AND pass_type = $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(pass_type.as_str())
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+async fn reactivate_subscription(
+    db: &PgPool,
+    user_id: i64,
+    product_id: &str,
+) -> Result<(), AppError> {
+    let pass_type = product_id_to_pass_type(product_id);
+
+    sqlx::query(
+        r#"
+        UPDATE user_subscriptions
+        SET is_active = TRUE, status = 'active', updated_at = NOW()
+        WHERE user_id = $1 AND pass_type = $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(pass_type.as_str())
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+async fn mark_subscription_billing_issue(
+    db: &PgPool,
+    user_id: i64,
+    product_id: &str,
+) -> Result<(), AppError> {
+    let pass_type = product_id_to_pass_type(product_id);
+
+    sqlx::query(
+        r#"
+        UPDATE user_subscriptions
+        SET status = 'billing_issue', updated_at = NOW()
+        WHERE user_id = $1 AND pass_type = $2 AND is_active = TRUE
+        "#,
+    )
+    .bind(user_id)
+    .bind(pass_type.as_str())
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+// ============================================================================
 // Student Verification
 // ============================================================================
 
+/// Send OTP to student email for verification
 pub async fn verify_student(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1360,46 +2002,116 @@ pub async fn verify_student(
         return Err(AppError::bad_request("Email domain not recognized as a valid university"));
     }
 
-    // Generate verification code (mock - in production send email)
-    let verification_code = format!("{:06}", rand::thread_rng().gen_range(100000..999999));
+    // Generate 6-digit OTP
+    let otp_code = format!("{:06}", rand::thread_rng().gen_range(100000..999999));
 
-    // Create verification record
-    let expires_at = Utc::now().naive_utc() + chrono::Duration::days(365);
+    // OTP expires in 10 minutes
+    let otp_expires_at = Utc::now().naive_utc() + chrono::Duration::minutes(10);
+    let verification_expires_at = Utc::now().naive_utc() + chrono::Duration::days(365);
 
+    // First, delete any existing record for this user
+    sqlx::query("DELETE FROM student_verifications WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&state.db)
+        .await?;
+
+    // Insert pending verification record with OTP
     sqlx::query(
         r#"
         INSERT INTO student_verifications (
             user_id, university_name, email, status, verification_method,
             discount_tier, submitted_at, expires_at, verification_code
         ) VALUES ($1, $2, $3, 'pending', 'email', $4, NOW(), $5, $6)
-        ON CONFLICT (user_id) DO UPDATE SET
-            university_name = $2,
-            email = $3,
-            status = 'pending',
-            discount_tier = $4,
-            submitted_at = NOW(),
-            expires_at = $5,
-            verification_code = $6
         "#,
     )
     .bind(user_id)
     .bind(&university_name)
     .bind(&payload.email)
     .bind(tier.as_str())
-    .bind(expires_at)
-    .bind(&verification_code)
+    .bind(verification_expires_at)
+    .bind(&otp_code)
     .execute(&state.db)
     .await?;
 
-    // Mock: Auto-approve for testing
-    sqlx::query(
+    // Send OTP email
+    let email_sent = send_otp_email(&payload.email, &otp_code, &university_name, &state.config).await;
+
+    if let Err(e) = email_sent {
+        tracing::warn!("Failed to send OTP email: {:?}", e);
+        // Still return success but indicate email might not have been sent
+        // In production, you might want to handle this differently
+    }
+
+    Ok(Json(json!({
+        "message": "OTP sent to your email",
+        "email": payload.email,
+        "university_name": university_name,
+        "discount_tier": tier.as_str(),
+        "otp_expires_in_seconds": 600,
+        // Include OTP in dev mode for testing (remove in production)
+        "dev_otp": if state.config.is_dev_mode() { Some(&otp_code) } else { None },
+    })))
+}
+
+/// Verify OTP and complete student verification
+pub async fn verify_student_otp(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<StudentVerifyOtpRequest>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Find pending verification for this user and email
+    let verification = sqlx::query_as::<_, (i64, String, String, String)>(
         r#"
-        UPDATE student_verifications
-        SET status = 'approved', verified_at = NOW()
-        WHERE user_id = $1
+        SELECT id, verification_code, discount_tier, university_name
+        FROM student_verifications
+        WHERE user_id = $1 AND email = $2 AND status = 'pending'
         "#,
     )
     .bind(user_id)
+    .bind(&payload.email)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (verification_id, stored_otp, discount_tier, university_name) = verification
+        .ok_or_else(|| AppError::bad_request("No pending verification found for this email"))?;
+
+    // Verify OTP
+    if payload.otp != stored_otp {
+        return Err(AppError::bad_request("Invalid OTP code"));
+    }
+
+    // Find university by domain and link it
+    let email_domain = payload.email.split('@').last().unwrap_or("");
+    let university_info = sqlx::query_as::<_, (i64, String)>(
+        r#"
+        SELECT id, country_code FROM universities
+        WHERE $1 LIKE '%' || domain
+        ORDER BY LENGTH(domain) DESC
+        LIMIT 1
+        "#
+    )
+    .bind(email_domain)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (university_id, country_code) = university_info.unwrap_or((0, String::new()));
+
+    // Mark as approved with university link
+    sqlx::query(
+        r#"
+        UPDATE student_verifications
+        SET status = 'approved', verified_at = NOW(),
+            university_id = NULLIF($2, 0),
+            country_code = NULLIF($3, '')
+        WHERE id = $1
+        "#,
+    )
+    .bind(verification_id)
+    .bind(university_id)
+    .bind(&country_code)
     .execute(&state.db)
     .await?;
 
@@ -1409,14 +2121,77 @@ pub async fn verify_student(
         .execute(&state.db)
         .await?;
 
+    // Get discount percent
+    let tier = match discount_tier.as_str() {
+        "top_private" => StudentTier::TopPrivate,
+        "top_public" => StudentTier::TopPublic,
+        _ => StudentTier::Regular,
+    };
+
     Ok(Json(json!({
-        "message": "Student verification successful",
+        "message": "Student verification successful!",
         "university_name": university_name,
-        "discount_tier": tier.as_str(),
+        "university_id": if university_id > 0 { Some(university_id) } else { None },
+        "country_code": if !country_code.is_empty() { Some(&country_code) } else { None },
+        "discount_tier": discount_tier,
         "discount_percent": tier.discount_percent(&state.config),
-        "expires_at": format_datetime(expires_at),
-        "verification_code": verification_code, // Only for testing
+        "verified": true,
     })))
+}
+
+/// Send OTP email using SMTP
+async fn send_otp_email(
+    to_email: &str,
+    otp: &str,
+    university_name: &str,
+    config: &crate::config::Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use lettre::{
+        message::header::ContentType,
+        transport::smtp::authentication::Credentials,
+        AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
+    };
+
+    let email_body = format!(
+        r#"
+Hello!
+
+Your NAVA student verification code is:
+
+    {}
+
+This code expires in 10 minutes.
+
+University: {}
+
+If you didn't request this code, please ignore this email.
+
+- The NAVA Team
+        "#,
+        otp, university_name
+    );
+
+    let email = Message::builder()
+        .from(config.smtp_from.parse()?)
+        .to(to_email.parse()?)
+        .subject("NAVA - Your Student Verification Code")
+        .header(ContentType::TEXT_PLAIN)
+        .body(email_body)?;
+
+    let creds = Credentials::new(
+        config.smtp_username.clone(),
+        config.smtp_password.clone(),
+    );
+
+    let mailer: AsyncSmtpTransport<Tokio1Executor> =
+        AsyncSmtpTransport::<Tokio1Executor>::relay(&config.smtp_host)?
+            .credentials(creds)
+            .build();
+
+    mailer.send(email).await?;
+
+    tracing::info!("OTP email sent to {}", to_email);
+    Ok(())
 }
 
 pub async fn student_status(
@@ -1841,6 +2616,7 @@ pub async fn verify_selfie(
 
 pub async fn admin_stats(
     State(state): State<AppState>,
+    _admin: AdminClaims, // Requires admin authorization
 ) -> Result<Json<AdminStats>, AppError> {
     let total_users = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users")
         .fetch_one(&state.db)
@@ -2434,10 +3210,20 @@ fn determine_university_tier(domain: &str, name: Option<&str>) -> (String, Stude
         ("virginia.edu", "University of Virginia"),
         ("unc.edu", "UNC Chapel Hill"),
         ("utexas.edu", "UT Austin"),
+        ("utdallas.edu", "UT Dallas"),
+        ("uta.edu", "UT Arlington"),
+        ("utsa.edu", "UT San Antonio"),
         ("gatech.edu", "Georgia Tech"),
         ("wisc.edu", "University of Wisconsin"),
         ("illinois.edu", "UIUC"),
         ("washington.edu", "University of Washington"),
+        ("purdue.edu", "Purdue University"),
+        ("osu.edu", "Ohio State University"),
+        ("psu.edu", "Penn State"),
+        ("umd.edu", "University of Maryland"),
+        ("umn.edu", "University of Minnesota"),
+        ("ufl.edu", "University of Florida"),
+        ("tamu.edu", "Texas A&M University"),
     ];
 
     for (d, n) in &top_private {
@@ -2709,7 +3495,6 @@ pub async fn log_reward(
     let reward = payload.reward.unwrap_or_else(|| {
         match payload.event_type.as_str() {
             "like" => 1.0,
-            "super_like" => 2.0,
             "match" => 5.0,
             "message" => 3.0,
             "voice_message" => 4.0,
@@ -4564,6 +5349,639 @@ pub async fn get_ml_system_stats(
                 "round_number": rn,
                 "clients_participated": cp
             })).collect::<Vec<_>>()
+        }
+    })))
+}
+
+// ============================================================================
+// University Discovery System
+// ============================================================================
+
+/// University row from database
+#[derive(Debug, sqlx::FromRow, Serialize)]
+pub struct UniversityRow {
+    pub id: i64,
+    pub name: String,
+    pub short_name: Option<String>,
+    pub domain: String,
+    pub country: String,
+    pub country_code: String,
+    pub state_province: Option<String>,
+    pub city: Option<String>,
+    pub tier: Option<String>,
+}
+
+/// Search universities by name/short_name
+#[derive(Debug, Deserialize)]
+pub struct UniversitySearchQuery {
+    pub q: String,
+    pub country: Option<String>,
+    pub limit: Option<i32>,
+}
+
+pub async fn search_universities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<UniversitySearchQuery>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Verify user is a verified student
+    let is_verified = sqlx::query_scalar::<_, bool>(
+        "SELECT COALESCE(is_student_verified, FALSE) FROM users WHERE id = $1"
+    )
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    if !is_verified {
+        return Err(AppError::forbidden("Student verification required to search universities"));
+    }
+
+    let search_term = format!("%{}%", params.q.to_lowercase());
+    let limit = params.limit.unwrap_or(20).min(50);
+
+    let universities = if let Some(country) = &params.country {
+        sqlx::query_as::<_, UniversityRow>(
+            r#"
+            SELECT id, name, short_name, domain, country, country_code, state_province, city, tier
+            FROM universities
+            WHERE is_active = TRUE
+              AND country_code = $1
+              AND (LOWER(name) LIKE $2 OR LOWER(short_name) LIKE $2 OR LOWER(domain) LIKE $2)
+            ORDER BY tier DESC, name ASC
+            LIMIT $3
+            "#
+        )
+        .bind(country)
+        .bind(&search_term)
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        sqlx::query_as::<_, UniversityRow>(
+            r#"
+            SELECT id, name, short_name, domain, country, country_code, state_province, city, tier
+            FROM universities
+            WHERE is_active = TRUE
+              AND (LOWER(name) LIKE $1 OR LOWER(short_name) LIKE $1 OR LOWER(domain) LIKE $1)
+            ORDER BY tier DESC, name ASC
+            LIMIT $2
+            "#
+        )
+        .bind(&search_term)
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await?
+    };
+
+    // Get student count per university
+    let university_ids: Vec<i64> = universities.iter().map(|u| u.id).collect();
+    let student_counts: HashMap<i64, i64> = if !university_ids.is_empty() {
+        sqlx::query_as::<_, (i64, i64)>(
+            r#"
+            SELECT sv.university_id, COUNT(*) as count
+            FROM student_verifications sv
+            WHERE sv.university_id = ANY($1) AND sv.status = 'approved'
+            GROUP BY sv.university_id
+            "#
+        )
+        .bind(&university_ids)
+        .fetch_all(&state.db)
+        .await?
+        .into_iter()
+        .collect()
+    } else {
+        HashMap::new()
+    };
+
+    let results: Vec<Value> = universities.iter().map(|u| {
+        json!({
+            "id": u.id,
+            "name": u.name,
+            "short_name": u.short_name,
+            "domain": u.domain,
+            "country": u.country,
+            "country_code": u.country_code,
+            "state": u.state_province,
+            "city": u.city,
+            "tier": u.tier,
+            "student_count": student_counts.get(&u.id).unwrap_or(&0)
+        })
+    }).collect();
+
+    Ok(Json(json!({
+        "universities": results,
+        "count": results.len()
+    })))
+}
+
+/// Get list of countries with universities
+pub async fn get_university_countries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let _ = decode_access_token(&token, &state.config.secret_key)?;
+
+    let countries = sqlx::query_as::<_, (String, String, i64)>(
+        r#"
+        SELECT country, country_code, COUNT(*) as university_count
+        FROM universities
+        WHERE is_active = TRUE
+        GROUP BY country, country_code
+        ORDER BY university_count DESC
+        "#
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    let results: Vec<Value> = countries.iter().map(|(name, code, count)| {
+        json!({
+            "country": name,
+            "country_code": code,
+            "university_count": count
+        })
+    }).collect();
+
+    Ok(Json(json!({ "countries": results })))
+}
+
+/// Query params for university discovery
+#[derive(Debug, Deserialize)]
+pub struct UniversityDiscoverQuery {
+    pub university_id: i64,
+    pub limit: Option<i32>,
+    pub offset: Option<i32>,
+}
+
+/// Check if user has access to discover from a university
+async fn check_university_access(
+    db: &sqlx::PgPool,
+    user_id: i32,
+    target_university_id: i64,
+) -> Result<(bool, String), AppError> {
+    // Get user's own university
+    let user_uni = sqlx::query_as::<_, (Option<i64>, Option<String>)>(
+        r#"
+        SELECT university_id, country_code
+        FROM student_verifications
+        WHERE user_id = $1 AND status = 'approved'
+        "#
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?;
+
+    let (user_university_id, user_country) = match user_uni {
+        Some((uid, cc)) => (uid, cc),
+        None => return Ok((false, "Student verification required".to_string())),
+    };
+
+    // Same university - always allowed
+    if user_university_id == Some(target_university_id) {
+        return Ok((true, "own_university".to_string()));
+    }
+
+    // Get target university's country
+    let target_country = sqlx::query_scalar::<_, String>(
+        "SELECT country_code FROM universities WHERE id = $1"
+    )
+    .bind(target_university_id)
+    .fetch_optional(db)
+    .await?;
+
+    let target_country = match target_country {
+        Some(c) => c,
+        None => return Ok((false, "University not found".to_string())),
+    };
+
+    // Check for active passes
+    let active_pass = sqlx::query_as::<_, (String, Option<String>)>(
+        r#"
+        SELECT pass_type, country_code
+        FROM university_passes
+        WHERE user_id = $1
+          AND status = 'active'
+          AND (end_date IS NULL OR end_date > NOW())
+        ORDER BY
+          CASE pass_type WHEN 'global' THEN 1 WHEN 'country' THEN 2 END
+        LIMIT 1
+        "#
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?;
+
+    if let Some((pass_type, pass_country)) = active_pass {
+        match pass_type.as_str() {
+            "global" => return Ok((true, "global_pass".to_string())),
+            "country" => {
+                if pass_country.as_deref() == Some(&target_country) {
+                    return Ok((true, "country_pass".to_string()));
+                }
+                // Check if same country as user
+                if user_country.as_deref() == Some(&target_country) {
+                    return Ok((true, "same_country".to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Same country without pass - allowed for free
+    if user_country.as_deref() == Some(&target_country) {
+        return Ok((true, "same_country_free".to_string()));
+    }
+
+    Ok((false, format!("Pass required for {} universities", target_country)))
+}
+
+/// Discover profiles from a specific university
+pub async fn discover_university_profiles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<UniversityDiscoverQuery>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Check access
+    let (has_access, access_type) = check_university_access(&state.db, user_id, params.university_id).await?;
+    if !has_access {
+        return Err(AppError::forbidden(&access_type));
+    }
+
+    let limit = params.limit.unwrap_or(20).min(50);
+    let offset = params.offset.unwrap_or(0);
+
+    // Get university info
+    let university = sqlx::query_as::<_, UniversityRow>(
+        "SELECT id, name, short_name, domain, country, country_code, state_province, city, tier FROM universities WHERE id = $1"
+    )
+    .bind(params.university_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::not_found("University not found"))?;
+
+    // Get verified students from this university
+    let profiles = sqlx::query_as::<_, DiscoverUserRow>(
+        r#"
+        SELECT u.id, u.name, u.dob, u.gender, u.bio, u.profile_photo_url, u.profile_photos,
+               u.profile_photo_1, u.profile_photo_2, u.profile_photo_3,
+               u.is_verified, u.attractiveness_score, u.looking_for, u.profession_title,
+               u.height_cm, l.city, l.latitude, l.longitude
+        FROM users u
+        INNER JOIN student_verifications sv ON sv.user_id = u.id
+        LEFT JOIN user_locations l ON l.user_id = u.id
+        WHERE sv.university_id = $1
+          AND sv.status = 'approved'
+          AND u.id != $2
+          AND u.is_active = TRUE
+          AND u.is_profile_complete = TRUE
+          AND NOT EXISTS (
+              SELECT 1 FROM matches m
+              WHERE ((m.user1_id = $2 AND m.user2_id = u.id) OR (m.user1_id = u.id AND m.user2_id = $2))
+              AND (m.user1_liked = TRUE OR m.user2_liked = TRUE)
+          )
+        ORDER BY u.attractiveness_score DESC NULLS LAST, u.created_at DESC
+        LIMIT $3 OFFSET $4
+        "#
+    )
+    .bind(params.university_id)
+    .bind(user_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.db)
+    .await?;
+
+    let results: Vec<DiscoverProfile> = profiles.iter().map(|row| {
+        let mut photos = Vec::new();
+        if let Some(url) = &row.profile_photo_url { photos.push(url.clone()); }
+        if let Some(url) = &row.profile_photo_1 { photos.push(url.clone()); }
+        if let Some(url) = &row.profile_photo_2 { photos.push(url.clone()); }
+        if let Some(url) = &row.profile_photo_3 { photos.push(url.clone()); }
+
+        let age = row.dob.map(|dob| {
+            let today = chrono::Utc::now().date_naive();
+            today.years_since(dob).unwrap_or(0) as i32
+        });
+
+        DiscoverProfile {
+            id: row.id,
+            name: row.name.clone(),
+            age,
+            gender: row.gender.clone(),
+            bio: row.bio.clone(),
+            photos,
+            is_verified: row.is_verified.unwrap_or(false),
+            looking_for: row.looking_for.clone(),
+            profession_title: row.profession_title.clone(),
+            height_cm: row.height_cm,
+            distance_km: None,
+            distance_text: None,
+            city: row.city.clone(),
+            compatibility_score: row.attractiveness_score,
+        }
+    }).collect();
+
+    Ok(Json(json!({
+        "university": {
+            "id": university.id,
+            "name": university.name,
+            "short_name": university.short_name,
+            "country": university.country
+        },
+        "access_type": access_type,
+        "profiles": results,
+        "count": results.len(),
+        "offset": offset,
+        "limit": limit
+    })))
+}
+
+/// Get reels from a specific university
+#[derive(Debug, Deserialize)]
+pub struct UniversityReelsQuery {
+    pub university_id: i64,
+    pub limit: Option<i32>,
+    pub offset: Option<i32>,
+}
+
+pub async fn get_university_reels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<UniversityReelsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Check access
+    let (has_access, access_type) = check_university_access(&state.db, user_id, params.university_id).await?;
+    if !has_access {
+        return Err(AppError::forbidden(&access_type));
+    }
+
+    let limit = params.limit.unwrap_or(20).min(50);
+    let offset = params.offset.unwrap_or(0);
+
+    // Get university info
+    let university = sqlx::query_as::<_, (i64, String, Option<String>, String)>(
+        "SELECT id, name, short_name, country FROM universities WHERE id = $1"
+    )
+    .bind(params.university_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::not_found("University not found"))?;
+
+    // Get reels from verified students at this university
+    let reels = sqlx::query_as::<_, (i64, i64, Option<String>, Option<String>, Option<Value>, Option<NaiveDateTime>, Option<String>, Option<String>, Option<bool>)>(
+        r#"
+        SELECT s.id, s.user_id, s.title, s.poster_url, s.renditions, s.created_at,
+               u.name as user_name, u.profile_photo_url, u.is_verified
+        FROM spots s
+        INNER JOIN users u ON u.id = s.user_id
+        INNER JOIN student_verifications sv ON sv.user_id = s.user_id
+        WHERE sv.university_id = $1
+          AND sv.status = 'approved'
+          AND s.user_id != $2
+          AND (s.expires_at IS NULL OR s.expires_at > NOW())
+        ORDER BY s.created_at DESC
+        LIMIT $3 OFFSET $4
+        "#
+    )
+    .bind(params.university_id)
+    .bind(user_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.db)
+    .await?;
+
+    let results: Vec<Value> = reels.iter().map(|(id, uid, title, poster, renditions, created, name, photo, verified)| {
+        json!({
+            "id": id,
+            "user_id": uid,
+            "title": title,
+            "poster_url": poster,
+            "renditions": renditions,
+            "created_at": created,
+            "user": {
+                "name": name,
+                "profile_photo_url": photo,
+                "is_verified": verified.unwrap_or(false)
+            }
+        })
+    }).collect();
+
+    Ok(Json(json!({
+        "university": {
+            "id": university.0,
+            "name": university.1,
+            "short_name": university.2,
+            "country": university.3
+        },
+        "access_type": access_type,
+        "reels": results,
+        "count": results.len(),
+        "offset": offset,
+        "limit": limit
+    })))
+}
+
+/// Purchase university pass request
+#[derive(Debug, Deserialize)]
+pub struct PurchaseUniversityPassRequest {
+    pub pass_type: String,           // "country" or "global"
+    pub country_code: Option<String>, // Required for country pass
+    pub duration_days: Option<i32>,   // NULL for lifetime
+    pub payment_id: Option<String>,
+}
+
+pub async fn purchase_university_pass(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<PurchaseUniversityPassRequest>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Verify user is a verified student
+    let is_verified = sqlx::query_scalar::<_, bool>(
+        "SELECT COALESCE(is_student_verified, FALSE) FROM users WHERE id = $1"
+    )
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    if !is_verified {
+        return Err(AppError::forbidden("Student verification required to purchase passes"));
+    }
+
+    // Validate pass type
+    if payload.pass_type != "country" && payload.pass_type != "global" {
+        return Err(AppError::bad_request("Invalid pass type. Must be 'country' or 'global'"));
+    }
+
+    // Country pass requires country_code
+    if payload.pass_type == "country" && payload.country_code.is_none() {
+        return Err(AppError::bad_request("country_code required for country pass"));
+    }
+
+    // Calculate pricing
+    let (price, currency) = match payload.pass_type.as_str() {
+        "country" => {
+            match payload.duration_days {
+                Some(7) => (4.99, "USD"),
+                Some(30) => (14.99, "USD"),
+                Some(90) => (34.99, "USD"),
+                _ => (14.99, "USD"), // Default 30 days
+            }
+        }
+        "global" => {
+            match payload.duration_days {
+                Some(7) => (9.99, "USD"),
+                Some(30) => (29.99, "USD"),
+                Some(90) => (69.99, "USD"),
+                Some(365) => (199.99, "USD"),
+                _ => (29.99, "USD"), // Default 30 days
+            }
+        }
+        _ => return Err(AppError::bad_request("Invalid pass type")),
+    };
+
+    let duration = payload.duration_days.unwrap_or(30);
+    let end_date = Utc::now().naive_utc() + chrono::Duration::days(duration as i64);
+
+    // Check for existing active pass of same type
+    let existing = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT id FROM university_passes
+        WHERE user_id = $1 AND pass_type = $2 AND status = 'active'
+          AND (end_date IS NULL OR end_date > NOW())
+          AND ($3::VARCHAR IS NULL OR country_code = $3)
+        "#
+    )
+    .bind(user_id)
+    .bind(&payload.pass_type)
+    .bind(&payload.country_code)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if existing.is_some() {
+        return Err(AppError::bad_request("Active pass already exists"));
+    }
+
+    // Create pass
+    let pass_id = sqlx::query_scalar::<_, i64>(
+        r#"
+        INSERT INTO university_passes (user_id, pass_type, country_code, status, start_date, end_date, amount_paid, payment_id)
+        VALUES ($1, $2, $3, 'active', NOW(), $4, $5, $6)
+        RETURNING id
+        "#
+    )
+    .bind(user_id)
+    .bind(&payload.pass_type)
+    .bind(&payload.country_code)
+    .bind(end_date)
+    .bind(price)
+    .bind(&payload.payment_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "message": "Pass purchased successfully",
+        "pass": {
+            "id": pass_id,
+            "type": payload.pass_type,
+            "country_code": payload.country_code,
+            "duration_days": duration,
+            "end_date": end_date,
+            "price": price,
+            "currency": currency
+        }
+    })))
+}
+
+/// Get user's active passes
+pub async fn get_my_university_passes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Get user's university info
+    let user_university = sqlx::query_as::<_, (Option<i64>, Option<String>, Option<String>)>(
+        r#"
+        SELECT sv.university_id, u.name as university_name, sv.country_code
+        FROM student_verifications sv
+        LEFT JOIN universities u ON u.id = sv.university_id
+        WHERE sv.user_id = $1 AND sv.status = 'approved'
+        "#
+    )
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (uni_id, uni_name, user_country) = user_university.unwrap_or((None, None, None));
+
+    // Get active passes
+    let passes = sqlx::query_as::<_, (i64, String, Option<String>, String, NaiveDateTime, Option<NaiveDateTime>, Option<rust_decimal::Decimal>)>(
+        r#"
+        SELECT id, pass_type, country_code, status, start_date, end_date, amount_paid
+        FROM university_passes
+        WHERE user_id = $1 AND status = 'active' AND (end_date IS NULL OR end_date > NOW())
+        ORDER BY created_at DESC
+        "#
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let pass_list: Vec<Value> = passes.iter().map(|(id, ptype, country, status, start, end, amount)| {
+        json!({
+            "id": id,
+            "pass_type": ptype,
+            "country_code": country,
+            "status": status,
+            "start_date": start,
+            "end_date": end,
+            "amount_paid": amount
+        })
+    }).collect();
+
+    // Determine access level
+    let access_level = if passes.iter().any(|(_, t, _, _, _, _, _)| t == "global") {
+        "global"
+    } else if passes.iter().any(|(_, t, _, _, _, _, _)| t == "country") {
+        "country"
+    } else if uni_id.is_some() {
+        "own_university"
+    } else {
+        "none"
+    };
+
+    Ok(Json(json!({
+        "user_university": {
+            "id": uni_id,
+            "name": uni_name,
+            "country_code": user_country
+        },
+        "access_level": access_level,
+        "passes": pass_list,
+        "pricing": {
+            "country": {
+                "7_days": 4.99,
+                "30_days": 14.99,
+                "90_days": 34.99
+            },
+            "global": {
+                "7_days": 9.99,
+                "30_days": 29.99,
+                "90_days": 69.99,
+                "365_days": 199.99
+            }
         }
     })))
 }

@@ -555,6 +555,12 @@ pub struct StudentVerifyRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct StudentVerifyOtpRequest {
+    pub email: String,
+    pub otp: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CreateCallRequest {
     pub match_id: String,
     pub call_type: Option<String>,

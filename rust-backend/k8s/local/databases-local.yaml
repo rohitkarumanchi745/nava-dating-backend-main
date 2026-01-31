@@ -1,0 +1,164 @@
+# =============================================================================
+# Local Database Stack for K8s (M1 Mac Optimized)
+# =============================================================================
+# PostgreSQL + Redis + Neo4j with reduced resources
+
+---
+# PostgreSQL
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: nava
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: "nava"
+            - name: POSTGRES_PASSWORD
+              value: "nava123"
+            - name: POSTGRES_DB
+              value: "nava_dev"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: postgres-data
+          emptyDir: {}  # Data lost on restart - use PVC for persistence
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: nava
+spec:
+  ports:
+    - port: 5432
+      targetPort: 5432
+  selector:
+    app: postgres
+
+---
+# Redis
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: nava
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "128Mi"
+              cpu: "250m"
+          args: ["--maxmemory", "100mb", "--maxmemory-policy", "allkeys-lru"]
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: nava
+spec:
+  ports:
+    - port: 6379
+      targetPort: 6379
+  selector:
+    app: redis
+
+---
+# Neo4j (Optional - comment out if not needed to save resources)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neo4j
+  namespace: nava
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: neo4j
+  template:
+    metadata:
+      labels:
+        app: neo4j
+    spec:
+      containers:
+        - name: neo4j
+          image: neo4j:5-community
+          ports:
+            - containerPort: 7474  # HTTP
+            - containerPort: 7687  # Bolt
+          env:
+            - name: NEO4J_AUTH
+              value: "neo4j/nava123456"
+            - name: NEO4J_PLUGINS
+              value: '["apoc"]'
+            # Reduced memory for M1 Mac
+            - name: NEO4J_server_memory_heap_initial__size
+              value: "256m"
+            - name: NEO4J_server_memory_heap_max__size
+              value: "512m"
+            - name: NEO4J_server_memory_pagecache_size
+              value: "256m"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: neo4j
+  namespace: nava
+spec:
+  ports:
+    - port: 7474
+      targetPort: 7474
+      name: http
+    - port: 7687
+      targetPort: 7687
+      name: bolt
+  selector:
+    app: neo4j

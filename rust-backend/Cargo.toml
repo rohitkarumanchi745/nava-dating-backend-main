@@ -21,6 +21,9 @@ sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chron
 # Redis
 redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
 
+# Neo4j Graph Database
+neo4rs = "0.8"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -28,6 +31,7 @@ rust_decimal = { version = "1.33", features = ["serde"] }
 
 # Authentication
 jsonwebtoken = "9"
+bcrypt = "0.15"
 
 # Time & UUID
 chrono = { version = "0.4", features = ["serde"] }
@@ -52,6 +56,16 @@ rand = "0.8"
 thiserror = "1.0"
 validator = { version = "0.16", features = ["derive"] }
 
+# HTTP Client (for S3, external APIs)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Crypto (for AWS Signature V4, CloudFront signing)
+sha2 = "0.10"
+hmac = "0.12"
+
+# Email
+lettre = { version = "0.11", features = ["tokio1-native-tls", "builder", "smtp-transport"] }
+
 # GraphQL
 async-graphql = { version = "7.0.13", features = ["chrono", "uuid", "dataloader"] }
 async-graphql-axum = "7.0.13"
@@ -73,3 +87,7 @@ debug = true
 [profile.bench]
 lto = true
 opt-level = 3
+
+[dev-dependencies]
+# Testing dependencies
+tokio-test = "0.4"

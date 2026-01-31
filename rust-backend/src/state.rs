@@ -3,25 +3,64 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use neo4rs::Graph;
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::config::Config;
 use crate::models::CallSession;
+use crate::redis_service::RedisService;
 use crate::vision::VisionAnalyzer;
+use crate::services::graph_service::GraphService;
+use crate::services::payments::PaymentService;
+use crate::services::ads::AdsService;
+use crate::middleware::dual_write::DualWriteManager;
 
 /// Shared application state
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
     pub redis: Option<ConnectionManager>,
+    pub neo4j: Option<Arc<Graph>>,
+    pub graph_service: Option<Arc<GraphService>>,
+    pub dual_write: Arc<DualWriteManager>,
     pub config: Config,
     pub vision: Option<Arc<Mutex<VisionAnalyzer>>>,
     pub chat_rooms: Arc<RwLock<ChatRooms>>,
     pub call_sessions: Arc<RwLock<CallSessions>>,
     pub metrics: Arc<AppMetrics>,
     pub start_time: Instant,
+    // Payment and Ads services
+    pub payment_service: Option<Arc<PaymentService>>,
+    pub ads_service: Option<Arc<AdsService>>,
+}
+
+impl AppState {
+    /// Get Redis service wrapper (if Redis is connected)
+    pub fn redis_service(&self) -> Option<RedisService> {
+        self.redis.as_ref().map(|conn| RedisService::new(conn.clone()))
+    }
+
+    /// Get GraphService for dual-database operations
+    pub fn graph(&self) -> Option<&GraphService> {
+        self.graph_service.as_ref().map(|g| g.as_ref())
+    }
+
+    /// Check if Neo4j is available
+    pub async fn is_neo4j_available(&self) -> bool {
+        self.dual_write.can_write_neo4j().await
+    }
+
+    /// Check if PostgreSQL is available
+    pub async fn is_postgres_available(&self) -> bool {
+        self.dual_write.can_write_postgres().await
+    }
+
+    /// Get database health status
+    pub async fn database_health(&self) -> crate::middleware::dual_write::DualWriteStatus {
+        self.dual_write.status_report().await
+    }
 }
 
 /// Application metrics for monitoring
@@ -88,16 +127,27 @@ impl Default for AppMetrics {
     }
 }
 
-/// Chat room management for WebSocket connections
+/// Chat room management for WebSocket connections (scaled for 10k+ users)
 pub struct ChatRooms {
     /// Map of match_id -> broadcast sender for that room
     rooms: HashMap<String, broadcast::Sender<ChatMessage>>,
+    /// Buffer size for broadcast channels (configurable via config)
+    buffer_size: usize,
 }
 
 impl ChatRooms {
     pub fn new() -> Self {
         Self {
             rooms: HashMap::new(),
+            buffer_size: 100, // Default
+        }
+    }
+
+    /// Create with configurable buffer size for high-traffic scenarios
+    pub fn with_buffer_size(buffer_size: usize) -> Self {
+        Self {
+            rooms: HashMap::new(),
+            buffer_size,
         }
     }
 
@@ -106,7 +156,7 @@ impl ChatRooms {
         if let Some(sender) = self.rooms.get(match_id) {
             sender.clone()
         } else {
-            let (sender, _) = broadcast::channel(100);
+            let (sender, _) = broadcast::channel(self.buffer_size);
             self.rooms.insert(match_id.to_string(), sender.clone());
             sender
         }
@@ -119,6 +169,16 @@ impl ChatRooms {
                 self.rooms.remove(match_id);
             }
         }
+    }
+
+    /// Get count of active rooms (for monitoring)
+    pub fn room_count(&self) -> usize {
+        self.rooms.len()
+    }
+
+    /// Get total subscribers across all rooms (for monitoring)
+    pub fn total_subscribers(&self) -> usize {
+        self.rooms.values().map(|s| s.receiver_count()).sum()
     }
 }
 
@@ -138,12 +198,14 @@ pub struct ChatMessage {
     pub timestamp: String,
 }
 
-/// Call session management
+/// Call session management (scaled for concurrent video calls)
 pub struct CallSessions {
     /// Map of call_id -> call session
     sessions: HashMap<String, CallSession>,
     /// Map of call_id -> broadcast sender for signaling
     signals: HashMap<String, broadcast::Sender<CallSignal>>,
+    /// Buffer size for call signal channels
+    buffer_size: usize,
 }
 
 impl CallSessions {
@@ -151,6 +213,16 @@ impl CallSessions {
         Self {
             sessions: HashMap::new(),
             signals: HashMap::new(),
+            buffer_size: 50, // Default
+        }
+    }
+
+    /// Create with configurable buffer size
+    pub fn with_buffer_size(buffer_size: usize) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            signals: HashMap::new(),
+            buffer_size,
         }
     }
 
@@ -158,7 +230,7 @@ impl CallSessions {
     pub fn create(&mut self, session: CallSession) -> broadcast::Sender<CallSignal> {
         let call_id = session.call_id.clone();
         self.sessions.insert(call_id.clone(), session);
-        let (sender, _) = broadcast::channel(50);
+        let (sender, _) = broadcast::channel(self.buffer_size);
         self.signals.insert(call_id, sender.clone());
         sender
     }

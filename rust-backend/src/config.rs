@@ -7,21 +7,37 @@ pub struct Config {
     pub database_url: String,
     pub redis_url: String,
     pub environment: String,  // development, staging, production
+    pub instance_id: String,  // Unique instance ID for horizontal scaling
 
-    // Database Pool
+    // Database Pool (scaled for 10k+ users)
     pub db_max_connections: u32,
     pub db_min_connections: u32,
     pub db_acquire_timeout_secs: u64,
     pub db_idle_timeout_secs: u64,
+    pub db_max_lifetime_secs: u64,  // Connection max lifetime for PgBouncer compatibility
+
+    // Read Replica Support
+    pub db_read_replica_url: Option<String>,
+    pub db_read_replica_enabled: bool,
 
     // Authentication
     pub secret_key: String,
     pub access_token_expire_minutes: i64,
     pub call_token_expire_minutes: i64,
 
-    // Rate Limiting
+    // Rate Limiting (scaled for high traffic)
     pub rate_limit_requests_per_minute: u32,
     pub rate_limit_burst: u32,
+    pub rate_limit_premium_multiplier: f32,  // Premium users get higher limits
+
+    // WebSocket Scaling
+    pub ws_chat_buffer_size: usize,
+    pub ws_call_buffer_size: usize,
+    pub ws_max_connections_per_user: u32,
+
+    // Worker Pool
+    pub worker_threads: Option<usize>,  // None = auto-detect CPU cores
+    pub blocking_threads: usize,
 
     // Vision
     pub vision_enabled: bool,
@@ -85,6 +101,51 @@ pub struct Config {
 
     // Request Timeouts
     pub request_timeout_secs: u64,
+
+    // SMTP Email
+    pub smtp_host: String,
+    pub smtp_username: String,
+    pub smtp_password: String,
+    pub smtp_from: String,
+
+    // RevenueCat (In-App Purchases)
+    pub revenuecat_webhook_secret: Option<String>,
+
+    // Payment Gateways
+    // Razorpay (India)
+    pub razorpay_key_id: String,
+    pub razorpay_key_secret: String,
+    pub razorpay_webhook_secret: String,
+
+    // Stripe (Global - USA, EU, etc.)
+    pub stripe_secret_key: String,
+    pub stripe_publishable_key: String,
+    pub stripe_webhook_secret: String,
+
+    // Payment Settings
+    pub payment_default_currency: String,
+    pub payment_test_mode: bool,
+
+    // Ads Configuration
+    pub ads_enabled: bool,
+    pub admob_app_id: String,
+    pub admob_banner_unit_id: String,
+    pub admob_interstitial_unit_id: String,
+    pub admob_rewarded_unit_id: String,
+    pub facebook_ads_app_id: String,
+    pub unity_ads_game_id: String,
+    pub ads_free_user_interstitial_interval: i32,
+    pub ads_rewarded_cooldown_minutes: i32,
+
+    // CORS Configuration
+    pub cors_allowed_origins: Vec<String>,
+
+    // Health Check & Load Balancer
+    pub health_check_path: String,
+    pub ready_check_enabled: bool,
+
+    // Connection Pooling (for PgBouncer)
+    pub pgbouncer_mode: bool,  // Enables PgBouncer-compatible settings
 }
 
 impl Config {
@@ -155,55 +216,104 @@ impl Config {
         let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
         let environment = env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string());
 
-        // Database Pool
+        // Instance ID for horizontal scaling (auto-generate if not set)
+        let instance_id = env::var("INSTANCE_ID").unwrap_or_else(|_| {
+            format!("nava-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0000"))
+        });
+
+        // Determine if production for auto-scaling defaults
+        let is_prod = environment == "production";
+
+        // Database Pool - SCALED FOR 10K+ USERS
+        // Production: 300 max connections (with PgBouncer can handle 10k+ concurrent)
+        // Development: 100 connections
         let db_max_connections = env::var("DB_MAX_CONNECTIONS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(100);
+            .unwrap_or(if is_prod { 300 } else { 100 });
         let db_min_connections = env::var("DB_MIN_CONNECTIONS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(10);
+            .unwrap_or(if is_prod { 50 } else { 10 });
         let db_acquire_timeout_secs = env::var("DB_ACQUIRE_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(30);
+            .unwrap_or(if is_prod { 10 } else { 30 });  // Faster timeout in prod
         let db_idle_timeout_secs = env::var("DB_IDLE_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(600);
+            .unwrap_or(300);  // 5 minutes
+        let db_max_lifetime_secs = env::var("DB_MAX_LIFETIME_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1800);  // 30 minutes - important for PgBouncer
 
-        // Rate Limiting
+        // Read Replica Support
+        let db_read_replica_url = env::var("DB_READ_REPLICA_URL").ok();
+        let db_read_replica_enabled = env::var("DB_READ_REPLICA_ENABLED")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+
+        // Rate Limiting - SCALED FOR HIGH TRAFFIC
+        // Production: 120 req/min + 30 burst = 150 total per user
         let rate_limit_requests_per_minute = env::var("RATE_LIMIT_RPM")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(60);
+            .unwrap_or(if is_prod { 120 } else { 60 });
         let rate_limit_burst = env::var("RATE_LIMIT_BURST")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(10);
+            .unwrap_or(if is_prod { 30 } else { 10 });
+        let rate_limit_premium_multiplier = env::var("RATE_LIMIT_PREMIUM_MULTIPLIER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2.0_f32);  // Premium users get 2x rate limit
 
-        // Pass Pricing (cents)
+        // WebSocket Scaling
+        let ws_chat_buffer_size = env::var("WS_CHAT_BUFFER_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if is_prod { 500 } else { 100 });
+        let ws_call_buffer_size = env::var("WS_CALL_BUFFER_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if is_prod { 200 } else { 50 });
+        let ws_max_connections_per_user = env::var("WS_MAX_CONNECTIONS_PER_USER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);  // Max 5 devices per user
+
+        // Worker Pool Configuration
+        let worker_threads = env::var("WORKER_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok());  // None = auto-detect
+        let blocking_threads = env::var("BLOCKING_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512);  // For blocking I/O operations
+
+        // Pass Pricing (cents) - Competitive pricing for young professionals
         let pass_price_hourly = env::var("PASS_PRICE_HOURLY")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1200);
+            .unwrap_or(299);      // $2.99 - Quick boost/spotlight
         let pass_price_daily = env::var("PASS_PRICE_DAILY")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(2000);
+            .unwrap_or(499);      // $4.99 - Day pass
         let pass_price_weekly = env::var("PASS_PRICE_WEEKLY")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(9900);
+            .unwrap_or(999);      // $9.99/week
         let pass_price_monthly = env::var("PASS_PRICE_MONTHLY")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(29900);
+            .unwrap_or(1999);     // $19.99/month (most popular)
         let pass_price_ultra = env::var("PASS_PRICE_ULTRA")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(49900);
+            .unwrap_or(4999);     // $49.99 - 3 months (best value)
 
         // Student Discounts (decimal: 0.30 = 30%)
         let student_discount_ivy = env::var("STUDENT_DISCOUNT_IVY")
@@ -291,20 +401,99 @@ impl Config {
             .and_then(|value| value.parse::<f64>().ok())
             .unwrap_or(1.0);
 
+        // SMTP Email
+        let smtp_host = env::var("SMTP_HOST").unwrap_or_else(|_| "smtp.gmail.com".to_string());
+        let smtp_username = env::var("SMTP_USERNAME").unwrap_or_default();
+        let smtp_password = env::var("SMTP_PASSWORD").unwrap_or_default();
+        let smtp_from = env::var("SMTP_FROM").unwrap_or_else(|_| "NAVA <noreply@nava.app>".to_string());
+
+        // RevenueCat
+        let revenuecat_webhook_secret = env::var("REVENUECAT_WEBHOOK_SECRET").ok();
+
+        // Payment Gateways - Razorpay (India)
+        let razorpay_key_id = env::var("RAZORPAY_KEY_ID").unwrap_or_default();
+        let razorpay_key_secret = env::var("RAZORPAY_KEY_SECRET").unwrap_or_default();
+        let razorpay_webhook_secret = env::var("RAZORPAY_WEBHOOK_SECRET").unwrap_or_default();
+
+        // Payment Gateways - Stripe (Global)
+        let stripe_secret_key = env::var("STRIPE_SECRET_KEY").unwrap_or_default();
+        let stripe_publishable_key = env::var("STRIPE_PUBLISHABLE_KEY").unwrap_or_default();
+        let stripe_webhook_secret = env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default();
+
+        // Payment Settings
+        let payment_default_currency = env::var("PAYMENT_DEFAULT_CURRENCY")
+            .unwrap_or_else(|_| "USD".to_string());
+        let payment_test_mode = env::var("PAYMENT_TEST_MODE")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(!is_prod);  // Default to test mode in dev
+
+        // Ads Configuration
+        let ads_enabled = env::var("ADS_ENABLED")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+        let admob_app_id = env::var("ADMOB_APP_ID").unwrap_or_default();
+        let admob_banner_unit_id = env::var("ADMOB_BANNER_UNIT_ID").unwrap_or_default();
+        let admob_interstitial_unit_id = env::var("ADMOB_INTERSTITIAL_UNIT_ID").unwrap_or_default();
+        let admob_rewarded_unit_id = env::var("ADMOB_REWARDED_UNIT_ID").unwrap_or_default();
+        let facebook_ads_app_id = env::var("FACEBOOK_ADS_APP_ID").unwrap_or_default();
+        let unity_ads_game_id = env::var("UNITY_ADS_GAME_ID").unwrap_or_default();
+        let ads_free_user_interstitial_interval = env::var("ADS_FREE_USER_INTERSTITIAL_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);  // Show interstitial every 5 actions for free users
+        let ads_rewarded_cooldown_minutes = env::var("ADS_REWARDED_COOLDOWN_MINUTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);  // 30 min cooldown between rewarded ads
+
+        // CORS Configuration
+        let cors_allowed_origins = env::var("CORS_ALLOWED_ORIGINS")
+            .unwrap_or_else(|_| "*".to_string())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // Health Check & Load Balancer
+        let health_check_path = env::var("HEALTH_CHECK_PATH")
+            .unwrap_or_else(|_| "/health".to_string());
+        let ready_check_enabled = env::var("READY_CHECK_ENABLED")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+
+        // PgBouncer Compatibility Mode
+        let pgbouncer_mode = env::var("PGBOUNCER_MODE")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(is_prod);  // Auto-enable in production
+
         Self {
             bind_addr,
             database_url,
             redis_url,
             environment,
+            instance_id,
             db_max_connections,
             db_min_connections,
             db_acquire_timeout_secs,
             db_idle_timeout_secs,
+            db_max_lifetime_secs,
+            db_read_replica_url,
+            db_read_replica_enabled,
             secret_key,
             access_token_expire_minutes,
             call_token_expire_minutes,
             rate_limit_requests_per_minute,
             rate_limit_burst,
+            rate_limit_premium_multiplier,
+            ws_chat_buffer_size,
+            ws_call_buffer_size,
+            ws_max_connections_per_user,
+            worker_threads,
+            blocking_threads,
             vision_enabled,
             vision_model_dir,
             vision_nsfw_model,
@@ -348,7 +537,37 @@ impl Config {
             fl_clip_norm,
             shutdown_timeout_secs,
             request_timeout_secs,
+            smtp_host,
+            smtp_username,
+            smtp_password,
+            smtp_from,
+            revenuecat_webhook_secret,
+            razorpay_key_id,
+            razorpay_key_secret,
+            razorpay_webhook_secret,
+            stripe_secret_key,
+            stripe_publishable_key,
+            stripe_webhook_secret,
+            payment_default_currency,
+            payment_test_mode,
+            ads_enabled,
+            admob_app_id,
+            admob_banner_unit_id,
+            admob_interstitial_unit_id,
+            admob_rewarded_unit_id,
+            facebook_ads_app_id,
+            unity_ads_game_id,
+            ads_free_user_interstitial_interval,
+            ads_rewarded_cooldown_minutes,
+            cors_allowed_origins,
+            health_check_path,
+            ready_check_enabled,
+            pgbouncer_mode,
         }
+    }
+
+    pub fn is_dev_mode(&self) -> bool {
+        self.environment != "production"
     }
 
     pub fn is_production(&self) -> bool {

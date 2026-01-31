@@ -51,22 +51,30 @@ COPY --from=builder /app/migrations /app/migrations
 # Create directories for uploads and models
 RUN mkdir -p /app/uploads /app/models && chown -R appuser:appuser /app
 
-# Environment defaults (production-ready)
+# Environment defaults (production-ready for 10k+ users)
 ENV BIND_ADDR=0.0.0.0:8080 \
-    RUST_LOG=info,sqlx=warn \
+    RUST_LOG=info,telugu_dating_backend=info,sqlx=warn \
     UPLOAD_DIR=/app/uploads \
+    VISION_MODEL_DIR=/app/models \
     ENVIRONMENT=production \
-    DB_MAX_CONNECTIONS=100 \
-    DB_MIN_CONNECTIONS=10 \
+    DB_MAX_CONNECTIONS=300 \
+    DB_MIN_CONNECTIONS=50 \
+    DB_ACQUIRE_TIMEOUT_SECS=10 \
+    PGBOUNCER_MODE=true \
+    RATE_LIMIT_RPM=120 \
+    RATE_LIMIT_BURST=30 \
+    WS_CHAT_BUFFER_SIZE=500 \
+    WS_CALL_BUFFER_SIZE=200 \
     REQUEST_TIMEOUT_SECS=30 \
     SHUTDOWN_TIMEOUT_SECS=30
 
 # Expose port
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+# Health check (K8s handles probes, but useful for local testing)
+# In K8s, disable with: docker run --health-cmd=none
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -sf http://localhost:8080/ready || exit 1
 
 # Run as non-root user
 USER appuser

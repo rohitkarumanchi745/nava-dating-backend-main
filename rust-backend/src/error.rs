@@ -59,9 +59,67 @@ impl IntoResponse for AppError {
 
 impl From<sqlx::Error> for AppError {
     fn from(err: sqlx::Error) -> Self {
-        // Log the actual error for debugging
-        eprintln!("Database error: {:?}", err);
-        // Return a more detailed message (safe for development, adjust for production)
-        AppError::internal(format!("Database error: {}", err))
+        // Log the actual error for debugging (full details in server logs)
+        tracing::error!("Database error: {:?}", err);
+
+        // In production, return generic message to avoid leaking schema details
+        // In development, include error details for debugging
+        let is_production = std::env::var("ENVIRONMENT")
+            .map(|e| e == "production")
+            .unwrap_or(false);
+
+        if is_production {
+            // Generic message for production - no internal details exposed
+            AppError::internal("A database error occurred. Please try again later.")
+        } else {
+            // Detailed message for development
+            AppError::internal(format!("Database error: {}", err))
+        }
+    }
+}
+
+// Type alias for Result with AppError
+pub type Result<T> = std::result::Result<T, AppError>;
+
+// Error variants for graph service
+#[derive(Debug)]
+pub enum GraphError {
+    Database(String),
+    Internal(String),
+    NotFound(String),
+    BadRequest(String),
+}
+
+impl From<GraphError> for AppError {
+    fn from(err: GraphError) -> Self {
+        match err {
+            GraphError::Database(msg) => AppError::internal(format!("Database error: {}", msg)),
+            GraphError::Internal(msg) => AppError::internal(msg),
+            GraphError::NotFound(msg) => AppError::not_found(msg),
+            GraphError::BadRequest(msg) => AppError::bad_request(msg),
+        }
+    }
+}
+
+// Error type wrappers used by graph_service
+impl AppError {
+    /// Create a database error
+    pub fn Database(msg: String) -> Self {
+        AppError::internal(format!("Database error: {}", msg))
+    }
+
+    /// Create an internal error (alias)
+    pub fn Internal(msg: String) -> Self {
+        AppError::internal(msg)
+    }
+
+    /// Create a not found error (alias)
+    pub fn NotFound(msg: String) -> Self {
+        AppError::not_found(msg)
+    }
+
+    /// Create a bad request error (alias)
+    pub fn BadRequest(msg: String) -> Self {
+        AppError::bad_request(msg)
     }
 }

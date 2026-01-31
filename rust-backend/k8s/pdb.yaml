@@ -1,0 +1,44 @@
+# =============================================================================
+# NAVA Backend - Pod Disruption Budget
+# =============================================================================
+# Ensures high availability during voluntary disruptions (upgrades, scaling)
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nava-backend-pdb
+  labels:
+    app: nava-backend
+spec:
+  # At least 2 pods must always be running
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: nava-backend
+
+---
+# =============================================================================
+# Alternative PDB Configuration Options
+# =============================================================================
+#
+# Option 1: Percentage-based (recommended for variable replica counts)
+# apiVersion: policy/v1
+# kind: PodDisruptionBudget
+# metadata:
+#   name: nava-backend-pdb
+# spec:
+#   minAvailable: "50%"  # At least 50% of pods must be running
+#   selector:
+#     matchLabels:
+#       app: nava-backend
+#
+# Option 2: Max unavailable (for more aggressive updates)
+# apiVersion: policy/v1
+# kind: PodDisruptionBudget
+# metadata:
+#   name: nava-backend-pdb
+# spec:
+#   maxUnavailable: 1  # Only 1 pod can be unavailable at a time
+#   selector:
+#     matchLabels:
+#       app: nava-backend

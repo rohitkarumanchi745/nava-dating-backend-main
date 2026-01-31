@@ -31,3 +31,12 @@ rust-backend/models/
 
 # Rust build artifacts
 rust-backend/target/
+
+# Node.js
+node_modules/
+.npm/
+*.tsbuildinfo
+
+# Ambassador Dashboard
+ambassador-dashboard/node_modules/
+ambassador-dashboard/dist/

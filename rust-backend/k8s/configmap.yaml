@@ -1,0 +1,84 @@
+# =============================================================================
+# NAVA Backend - Kubernetes ConfigMap
+# =============================================================================
+# Non-sensitive configuration values
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nava-config
+  labels:
+    app: nava-backend
+data:
+  # Server
+  BIND_ADDR: "0.0.0.0:8080"
+  RUST_LOG: "info,sqlx=warn,tower_http=info"
+
+  # Database Pool (scaled for 10k+ users)
+  DB_MAX_CONNECTIONS: "300"
+  DB_MIN_CONNECTIONS: "50"
+  DB_ACQUIRE_TIMEOUT_SECS: "10"
+  DB_IDLE_TIMEOUT_SECS: "300"
+  DB_MAX_LIFETIME_SECS: "1800"
+  PGBOUNCER_MODE: "true"
+
+  # Rate Limiting
+  RATE_LIMIT_RPM: "120"
+  RATE_LIMIT_BURST: "30"
+  RATE_LIMIT_PREMIUM_MULTIPLIER: "2.0"
+
+  # WebSocket Scaling
+  WS_CHAT_BUFFER_SIZE: "500"
+  WS_CALL_BUFFER_SIZE: "200"
+  WS_MAX_CONNECTIONS_PER_USER: "5"
+
+  # Worker Configuration
+  BLOCKING_THREADS: "512"
+
+  # Timeouts
+  REQUEST_TIMEOUT_SECS: "30"
+  SHUTDOWN_TIMEOUT_SECS: "30"
+
+  # Vision Models
+  VISION_ENABLED: "true"
+  VISION_MODEL_DIR: "/app/models"
+  SELFIE_MATCH_THRESHOLD: "0.45"
+  SELFIE_LIVENESS_THRESHOLD: "0.5"
+
+  # Discovery
+  DISCOVER_LIMIT: "20"
+  DEFAULT_MAX_DISTANCE_KM: "50"
+  FREE_SPOTS_LIMIT: "2"
+  SPOT_EXPIRY_DAYS: "15"
+
+  # Pricing (cents)
+  PASS_PRICE_HOURLY: "299"
+  PASS_PRICE_DAILY: "499"
+  PASS_PRICE_WEEKLY: "999"
+  PASS_PRICE_MONTHLY: "1999"
+  PASS_PRICE_ULTRA: "4999"
+
+  # Student Discounts
+  STUDENT_DISCOUNT_IVY: "0.30"
+  STUDENT_DISCOUNT_TOP50: "0.20"
+  STUDENT_DISCOUNT_STATE: "0.15"
+  STUDENT_DISCOUNT_OTHER: "0.10"
+  STUDENT_DISCOUNT_GRADUATE: "0.15"
+  STUDENT_DISCOUNT_ALUMNI: "0.05"
+
+  # LLM & Federated Learning
+  LLM_ENABLED: "true"
+  LLM_BATCH_SIZE: "10"
+  LLM_MAX_RETRIES: "3"
+  FL_ENABLED: "true"
+  FL_MIN_CLIENTS: "10"
+  FL_CLIENT_FRACTION: "0.1"
+  FL_LOCAL_EPOCHS: "1"
+  FL_LEARNING_RATE: "0.01"
+  FL_DP_ENABLED: "true"
+  FL_NOISE_MULTIPLIER: "1.0"
+  FL_CLIP_NORM: "1.0"
+
+  # Health Checks
+  HEALTH_CHECK_PATH: "/health"
+  READY_CHECK_ENABLED: "true"

@@ -3,8 +3,13 @@ mod config;
 mod error;
 mod graphql;
 mod handlers;
+mod jobs;
+mod middleware;
 mod models;
+mod redis_service;
+mod services;
 mod state;
+mod storage;
 mod vision;
 mod websocket;
 
@@ -13,12 +18,15 @@ use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::{
     extract::Request,
     http::HeaderMap,
-    middleware::{self, Next},
+    middleware as axum_middleware,
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Router,
 };
+use axum_middleware::Next;
 use config::Config;
+// neo4rs Bolt imports commented out - using HTTP API for Neo4j 5.x compatibility
+// use neo4rs::{Graph, ConfigBuilder as Neo4jConfigBuilder};
 use redis::Client as RedisClient;
 use sqlx::postgres::PgPoolOptions;
 use state::{AppState, AppMetrics, CallSessions, ChatRooms};
@@ -26,7 +34,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::sync::atomic::Ordering;
 use tokio::sync::{Mutex, RwLock};
-use tower::ServiceBuilder;
 use tower_http::{
     compression::CompressionLayer,
     cors::{Any, CorsLayer},
@@ -36,21 +43,36 @@ use tower_http::{
 };
 use tracing::{error, info, warn, Span};
 use vision::VisionAnalyzer;
+use services::graph_service::GraphService;
+use services::payments::PaymentService;
+use services::ads::AdsService;
+use middleware::dual_write::DualWriteManager;
+use middleware::security::security_headers_middleware;
+use handlers::graph_handlers::graph_routes;
+use jobs::sync_job::{SyncJobRunner, SyncJobConfig};
 
 use auth::decode_access_token;
+use redis_service::RedisService;
 use graphql::{build_schema, AppSchema};
 
 use handlers::{
+    // Health & Probes
+    health, health_detailed, readiness_probe, liveness_probe,
     // Auth
-    health, send_otp, verify_otp,
+    send_otp, verify_otp,
     // Profile
     profile_me, profile_status, update_bio, update_profile, update_preferences,
+    // Voice Intro
+    upload_voice_intro, upload_voice_intro_json, track_voice_play,
     // Discovery & Matching
     discover, get_match, get_matches, like_user, pass_user,
     // Location
     get_my_location, get_nearby, purchase_pass, search_locations, update_location,
     // Student
-    student_status, verify_student,
+    student_status, verify_student, verify_student_otp,
+    // University Discovery
+    search_universities, get_university_countries, discover_university_profiles,
+    get_university_reels, purchase_university_pass, get_my_university_passes,
     // Calls
     create_call,
     // Spots
@@ -76,6 +98,22 @@ use handlers::{
     // Federated Learning
     register_fl_client, get_fl_round, submit_fl_update, start_fl_round,
     aggregate_fl_round, get_active_fl_model, report_local_data, get_ml_system_stats,
+    // RevenueCat Subscriptions
+    sync_subscription, revenuecat_webhook,
+    // Web Payments (Razorpay + Stripe)
+    payments::{
+        create_order as payment_create_order,
+        verify_payment, list_products, get_subscriptions,
+        cancel_subscription, razorpay_webhook, stripe_webhook,
+    },
+    // Ads
+    ads::{request_ad, record_impression, rewarded_complete, get_rewards_balance},
+    // Ambassador Program
+    ambassador::{
+        ambassador_login, get_ambassador_profile, get_performance, get_daily_breakdown,
+        get_hourly_breakdown, get_leaderboard, get_subscribers, get_active_subscribers,
+        admin_get_daily_signups, record_referral, verify_referral,
+    },
 };
 
 async fn metrics_middleware(
@@ -92,6 +130,109 @@ async fn metrics_middleware(
     }
 
     response
+}
+
+/// Rate limiting middleware using Redis
+async fn rate_limit_middleware(
+    State(state): axum::extract::State<AppState>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    // Get identifier (IP or user ID)
+    let identifier = if let Some(auth_header) = headers.get("authorization") {
+        if let Ok(auth_str) = auth_header.to_str() {
+            let token = auth_str.trim_start_matches("Bearer ").trim();
+            if !token.is_empty() {
+                if let Ok(user_id) = decode_access_token(token, &state.config.secret_key) {
+                    format!("user:{}", user_id)
+                } else {
+                    get_client_ip(&headers)
+                }
+            } else {
+                get_client_ip(&headers)
+            }
+        } else {
+            get_client_ip(&headers)
+        }
+    } else {
+        get_client_ip(&headers)
+    };
+
+    // Check rate limit if Redis is available
+    if let Some(ref redis) = state.redis {
+        let redis_service = RedisService::new(redis.clone());
+        match redis_service
+            .check_rate_limit(
+                &identifier,
+                state.config.rate_limit_requests_per_minute + state.config.rate_limit_burst,
+                60,
+            )
+            .await
+        {
+            Ok((allowed, remaining, reset_in)) => {
+                if !allowed {
+                    // Return 429 Too Many Requests
+                    let response = axum::http::Response::builder()
+                        .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
+                        .header("X-RateLimit-Limit", state.config.rate_limit_requests_per_minute.to_string())
+                        .header("X-RateLimit-Remaining", "0")
+                        .header("X-RateLimit-Reset", reset_in.to_string())
+                        .header("Retry-After", reset_in.to_string())
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(r#"{"error":"Too many requests. Please slow down."}"#))
+                        .unwrap_or_else(|_| {
+                            axum::http::Response::new(axum::body::Body::from(r#"{"error":"Rate limited"}"#))
+                        });
+
+                    return response.into_response();
+                }
+
+                // Add rate limit headers to successful response
+                let mut response = next.run(request).await;
+                let headers = response.headers_mut();
+                // These header value parses should never fail for numeric strings
+                if let Ok(v) = state.config.rate_limit_requests_per_minute.to_string().parse() {
+                    headers.insert("X-RateLimit-Limit", v);
+                }
+                if let Ok(v) = remaining.to_string().parse() {
+                    headers.insert("X-RateLimit-Remaining", v);
+                }
+                if let Ok(v) = reset_in.to_string().parse() {
+                    headers.insert("X-RateLimit-Reset", v);
+                }
+                return response;
+            }
+            Err(e) => {
+                warn!("Rate limit check failed: {}. Allowing request.", e);
+            }
+        }
+    }
+
+    // If Redis is unavailable, allow the request
+    next.run(request).await
+}
+
+/// Extract client IP from headers
+fn get_client_ip(headers: &HeaderMap) -> String {
+    // Check X-Forwarded-For first (for proxies/load balancers)
+    if let Some(xff) = headers.get("x-forwarded-for") {
+        if let Ok(xff_str) = xff.to_str() {
+            if let Some(ip) = xff_str.split(',').next() {
+                return format!("ip:{}", ip.trim());
+            }
+        }
+    }
+
+    // Check X-Real-IP
+    if let Some(real_ip) = headers.get("x-real-ip") {
+        if let Ok(ip) = real_ip.to_str() {
+            return format!("ip:{}", ip.trim());
+        }
+    }
+
+    // Fallback
+    "ip:unknown".to_string()
 }
 
 use axum::extract::State;
@@ -168,13 +309,20 @@ async fn main() {
         config.environment
     );
 
-    // Database connection pool with production settings
-    let db = PgPoolOptions::new()
+    // Database connection pool with production settings (scaled for 10k+ users)
+    let mut pool_options = PgPoolOptions::new()
         .max_connections(config.db_max_connections)
         .min_connections(config.db_min_connections)
         .acquire_timeout(Duration::from_secs(config.db_acquire_timeout_secs))
         .idle_timeout(Duration::from_secs(config.db_idle_timeout_secs))
-        .test_before_acquire(true)
+        .max_lifetime(Duration::from_secs(config.db_max_lifetime_secs));
+
+    // PgBouncer compatibility: disable test_before_acquire for transaction pooling
+    if !config.pgbouncer_mode {
+        pool_options = pool_options.test_before_acquire(true);
+    }
+
+    let db = pool_options
         .connect(&config.database_url)
         .await
         .unwrap_or_else(|err| {
@@ -182,8 +330,41 @@ async fn main() {
             std::process::exit(1);
         });
 
-    info!("Connected to database (pool: {}-{} connections)",
-          config.db_min_connections, config.db_max_connections);
+    info!(
+        "Connected to database (pool: {}-{} connections, pgbouncer: {}, instance: {})",
+        config.db_min_connections,
+        config.db_max_connections,
+        config.pgbouncer_mode,
+        config.instance_id
+    );
+
+    // Read replica pool (optional, for read-heavy workloads)
+    let db_read_replica = if config.db_read_replica_enabled {
+        if let Some(ref replica_url) = config.db_read_replica_url {
+            match PgPoolOptions::new()
+                .max_connections(config.db_max_connections / 2)  // Half the connections for reads
+                .min_connections(config.db_min_connections / 2)
+                .acquire_timeout(Duration::from_secs(config.db_acquire_timeout_secs))
+                .idle_timeout(Duration::from_secs(config.db_idle_timeout_secs))
+                .connect(replica_url)
+                .await
+            {
+                Ok(pool) => {
+                    info!("Connected to read replica database");
+                    Some(pool)
+                }
+                Err(err) => {
+                    warn!("Failed to connect to read replica: {err}. Using primary for reads.");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let _ = db_read_replica;  // Will be used in future read-heavy queries
 
     // Redis connection (optional but recommended for production)
     let redis = match RedisClient::open(config.redis_url.as_str()) {
@@ -224,21 +405,181 @@ async fn main() {
         None
     };
 
+    // Neo4j connection (optional - for graph-powered features)
+    // Using HTTP API for Neo4j 5.x compatibility (Bolt protocol has auth issues with neo4rs)
+    let neo4j_uri = std::env::var("NEO4J_URI").ok();
+    let neo4j_user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".to_string());
+    let neo4j_password = std::env::var("NEO4J_PASSWORD").ok();
+
+    let (neo4j, graph_service) = if let (Some(uri), Some(password)) = (neo4j_uri, neo4j_password) {
+        // Parse host from URI
+        let uri_clean = uri.replace("bolt://", "").replace("neo4j://", "");
+        let host = uri_clean.split(':').next().unwrap_or("127.0.0.1");
+
+        // Create HTTP-based Neo4j service (works with Neo4j 5.x)
+        let service = GraphService::with_http(host, &neo4j_user, &password, db.clone());
+
+        // Test connection
+        if service.health_check().await.neo4j_healthy {
+            info!("Connected to Neo4j at {} via HTTP API", uri);
+            (None, Some(Arc::new(service)))
+        } else {
+            warn!("Failed to connect to Neo4j HTTP API. Continuing without graph features.");
+            (None, None)
+        }
+    } else {
+        info!("Neo4j not configured. Graph features disabled.");
+        (None, None)
+    };
+
+    // Initialize dual-write manager for fault tolerance
+    let dual_write = Arc::new(DualWriteManager::new());
+
+    // Create WebSocket managers with scaled buffer sizes from config
+    let chat_rooms = ChatRooms::with_buffer_size(config.ws_chat_buffer_size);
+    let call_sessions = CallSessions::with_buffer_size(config.ws_call_buffer_size);
+
+    info!(
+        "WebSocket buffers configured (chat: {}, call: {})",
+        config.ws_chat_buffer_size, config.ws_call_buffer_size
+    );
+
+    // Initialize Payment Service (Razorpay + Stripe)
+    let payment_service = {
+        let razorpay_key_id = if !config.razorpay_key_id.is_empty() {
+            Some(config.razorpay_key_id.clone())
+        } else {
+            None
+        };
+        let razorpay_key_secret = if !config.razorpay_key_secret.is_empty() {
+            Some(config.razorpay_key_secret.clone())
+        } else {
+            None
+        };
+        let stripe_secret = if !config.stripe_secret_key.is_empty() {
+            Some(config.stripe_secret_key.clone())
+        } else {
+            None
+        };
+        let stripe_publishable = if !config.stripe_publishable_key.is_empty() {
+            Some(config.stripe_publishable_key.clone())
+        } else {
+            None
+        };
+        let stripe_webhook = if !config.stripe_webhook_secret.is_empty() {
+            Some(config.stripe_webhook_secret.clone())
+        } else {
+            None
+        };
+
+        let service = PaymentService::new(
+            razorpay_key_id,
+            razorpay_key_secret,
+            stripe_secret,
+            stripe_publishable,
+            stripe_webhook,
+        );
+
+        if service.has_razorpay() || service.has_stripe() {
+            info!(
+                "Payment service initialized (Razorpay: {}, Stripe: {})",
+                service.has_razorpay(),
+                service.has_stripe()
+            );
+            Some(Arc::new(service))
+        } else {
+            warn!("No payment gateways configured. Payment features disabled.");
+            None
+        }
+    };
+
+    // Initialize Ads Service
+    let ads_service = if config.ads_enabled {
+        info!("Ads service initialized");
+        Some(Arc::new(AdsService::new(db.clone())))
+    } else {
+        info!("Ads service disabled");
+        None
+    };
+
     let state = AppState {
         db,
         redis,
+        neo4j,
+        graph_service,
+        dual_write: dual_write.clone(),
         config,
         vision,
-        chat_rooms: Arc::new(RwLock::new(ChatRooms::new())),
-        call_sessions: Arc::new(RwLock::new(CallSessions::new())),
+        chat_rooms: Arc::new(RwLock::new(chat_rooms)),
+        call_sessions: Arc::new(RwLock::new(call_sessions)),
         metrics: Arc::new(AppMetrics::new()),
         start_time: Instant::now(),
+        payment_service,
+        ads_service,
     };
+
+    // Run startup sync if Neo4j is connected
+    if state.graph_service.is_some() {
+        if let Err(e) = jobs::sync_job::run_startup_sync(&state).await {
+            warn!("Startup sync failed: {}. Will sync in background.", e);
+        }
+
+        // Start background sync jobs
+        let sync_runner = SyncJobRunner::new(Arc::new(state.clone()), SyncJobConfig::default());
+        tokio::spawn(async move {
+            sync_runner.start().await;
+        });
+        info!("Background sync jobs started");
+    }
+
+    // Start instance heartbeat for horizontal scaling (if Redis is available)
+    if let Some(ref redis_conn) = state.redis {
+        let redis_service = RedisService::new(redis_conn.clone());
+        let instance_id = state.config.instance_id.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = redis_service.register_instance(&instance_id).await {
+                    warn!("Failed to register instance heartbeat: {}", e);
+                }
+                // Heartbeat every 15 seconds (TTL is 30 seconds)
+                tokio::time::sleep(Duration::from_secs(15)).await;
+            }
+        });
+        info!("Instance heartbeat started (id: {})", state.config.instance_id);
+    }
 
     // Build GraphQL schema
     let schema = build_schema(state.clone());
     let is_dev = !state.config.is_production();
     info!("GraphQL schema built (playground: {})", if is_dev { "enabled" } else { "disabled" });
+
+    // Build CORS layer based on environment
+    let cors_layer = if is_dev {
+        // Development: allow all origins
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    } else {
+        // Production: restrict to configured origins
+        let origins = state.config.cors_allowed_origins.clone();
+        if origins.len() == 1 && origins[0] == "*" {
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        } else {
+            let allowed: Vec<axum::http::HeaderValue> = origins
+                .iter()
+                .filter_map(|o| o.parse().ok())
+                .collect();
+            CorsLayer::new()
+                .allow_origin(allowed)
+                .allow_methods(Any)
+                .allow_headers(Any)
+                .allow_credentials(true)
+        }
+    };
 
     let gql_state = GraphQLState {
         schema,
@@ -259,9 +600,11 @@ async fn main() {
 
     // Build the application with middleware stack
     let app = Router::new()
-        // Health & Metrics
+        // Health & Metrics (enhanced for load balancers)
         .route("/health", get(health))
-        .route("/ready", get(readiness_check))
+        .route("/health/detailed", get(health_detailed))  // Detailed health for monitoring
+        .route("/ready", get(readiness_probe))            // K8s readiness probe
+        .route("/live", get(liveness_probe))              // K8s liveness probe
         .route("/metrics", get(prometheus_metrics))
         // Auth
         .route("/send-otp", post(send_otp))
@@ -272,6 +615,10 @@ async fn main() {
         .route("/profile/status", get(profile_status))
         .route("/profile/me", get(profile_me))
         .route("/preferences", post(update_preferences))
+        // Voice Intro
+        .route("/voice-intro", post(upload_voice_intro))
+        .route("/voice-intro/url", post(upload_voice_intro_json))
+        .route("/voice-intro/track", post(track_voice_play))
         // Discovery & Matching
         .route("/discover", get(discover))
         .route("/profiles/discover", get(discover))
@@ -287,9 +634,45 @@ async fn main() {
         .route("/location/nearby", get(get_nearby))
         .route("/location/purchase-pass", post(purchase_pass))
         .route("/me/location", get(get_my_location))
+        // Subscriptions (RevenueCat)
+        .route("/subscriptions/sync", post(sync_subscription))
+        .route("/webhooks/revenuecat", post(revenuecat_webhook))
+        // Web Payments (Razorpay + Stripe) - bypasses 30% App Store fees!
+        .route("/api/payments/create-order", post(payment_create_order))
+        .route("/api/payments/verify", post(verify_payment))
+        .route("/api/payments/products", get(list_products))
+        .route("/api/payments/subscriptions", get(get_subscriptions))
+        .route("/api/payments/subscriptions/cancel", post(cancel_subscription))
+        .route("/webhook/razorpay", post(razorpay_webhook))
+        .route("/webhook/stripe", post(stripe_webhook))
+        // Ads Monetization
+        .route("/api/ads/request", get(request_ad))
+        .route("/api/ads/impression", post(record_impression))
+        .route("/api/ads/rewarded-complete", post(rewarded_complete))
+        .route("/api/ads/rewards-balance", get(get_rewards_balance))
+        // Ambassador Program
+        .route("/api/ambassador/login", post(ambassador_login))
+        .route("/api/ambassador/me", get(get_ambassador_profile))
+        .route("/api/ambassador/performance", get(get_performance))
+        .route("/api/ambassador/daily", get(get_daily_breakdown))
+        .route("/api/ambassador/hourly", get(get_hourly_breakdown))
+        .route("/api/ambassador/leaderboard", get(get_leaderboard))
+        .route("/api/ambassador/subscribers", get(get_subscribers))
+        .route("/api/ambassador/subscribers/active", get(get_active_subscribers))
+        .route("/api/admin/ambassadors/daily", get(admin_get_daily_signups))
+        .route("/api/referral/record", post(record_referral))
+        .route("/api/referral/verify", post(verify_referral))
         // Student
         .route("/student/verify", post(verify_student))
+        .route("/student/verify-otp", post(verify_student_otp))
         .route("/student/status", get(student_status))
+        // University Discovery
+        .route("/universities/search", get(search_universities))
+        .route("/universities/countries", get(get_university_countries))
+        .route("/universities/discover", get(discover_university_profiles))
+        .route("/universities/reels", get(get_university_reels))
+        .route("/universities/passes", get(get_my_university_passes))
+        .route("/universities/passes", post(purchase_university_pass))
         // Calls
         .route("/calls", post(create_call))
         // Spots
@@ -346,16 +729,13 @@ async fn main() {
         // ML System Stats
         .route("/ml/stats", get(get_ml_system_stats))
         .with_state(state.clone())
+        // Graph-powered endpoints (Neo4j + PostgreSQL fallback)
+        .nest("/api/graph", graph_routes().with_state(Arc::new(state.clone())))
         // Merge GraphQL routes
         .merge(graphql_routes)
         // Middleware stack (order matters - bottom runs first)
         // CORS layer (must be applied first to handle preflight requests)
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(cors_layer)
         // Request tracing
         .layer(
             TraceLayer::new_for_http()
@@ -381,7 +761,11 @@ async fn main() {
         // Request ID propagation
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(middleware::from_fn_with_state(state.clone(), metrics_middleware));
+        .layer(axum_middleware::from_fn_with_state(state.clone(), metrics_middleware))
+        // Rate limiting (Redis-based)
+        .layer(axum_middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
+        // Security headers (HSTS, X-Frame-Options, etc.)
+        .layer(axum_middleware::from_fn(security_headers_middleware));
 
     info!("Starting server on {}", bind_addr);
     let listener = tokio::net::TcpListener::bind(&bind_addr)
@@ -432,30 +816,6 @@ async fn main() {
     tokio::time::sleep(Duration::from_secs(shutdown_timeout)).await;
 
     info!("Server shutdown complete");
-}
-
-// Readiness check - verifies database connectivity
-async fn readiness_check(
-    State(state): State<AppState>,
-) -> axum::response::Result<axum::Json<serde_json::Value>, error::AppError> {
-    // Check database
-    sqlx::query("SELECT 1")
-        .fetch_one(&state.db)
-        .await
-        .map_err(|_| error::AppError::internal("Database not ready"))?;
-
-    // Check Redis if available
-    let redis_status = if state.redis.is_some() {
-        "connected"
-    } else {
-        "disabled"
-    };
-
-    Ok(axum::Json(serde_json::json!({
-        "status": "ready",
-        "database": "connected",
-        "redis": redis_status
-    })))
 }
 
 // Prometheus-compatible metrics endpoint

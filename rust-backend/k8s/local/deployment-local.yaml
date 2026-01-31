@@ -1,0 +1,118 @@
+# =============================================================================
+# NAVA Backend - Local Kubernetes Deployment (M1 Mac: 16GB RAM, 256GB Storage)
+# =============================================================================
+# Optimized for local development - single replica, reduced resources
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nava-backend
+  namespace: nava
+  labels:
+    app: nava-backend
+    environment: local
+spec:
+  replicas: 1  # Single replica for local development
+  selector:
+    matchLabels:
+      app: nava-backend
+  template:
+    metadata:
+      labels:
+        app: nava-backend
+        environment: local
+    spec:
+      containers:
+        - name: nava-backend
+          image: nava/backend:latest
+          imagePullPolicy: Never  # Use local image
+          ports:
+            - containerPort: 8080
+              name: http
+
+          env:
+            - name: ENVIRONMENT
+              value: "development"
+            - name: INSTANCE_ID
+              value: "local-1"
+            - name: DATABASE_URL
+              value: "postgresql://nava:nava123@host.docker.internal:5432/nava_dev"
+            - name: REDIS_URL
+              value: "redis://host.docker.internal:6379"
+            - name: SECRET_KEY
+              value: "local-dev-secret-key-not-for-production-use-only"
+            - name: RUST_LOG
+              value: "debug,telugu_dating_backend=debug,sqlx=info"
+
+            # Reduced settings for local
+            - name: DB_MAX_CONNECTIONS
+              value: "20"
+            - name: DB_MIN_CONNECTIONS
+              value: "5"
+            - name: RATE_LIMIT_RPM
+              value: "1000"  # High limit for testing
+            - name: RATE_LIMIT_BURST
+              value: "100"
+
+          # Reduced resources for M1 Mac (16GB total)
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+
+          # Health probes with longer timeouts for local
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+
+          volumeMounts:
+            - name: uploads
+              mountPath: /app/uploads
+
+      volumes:
+        - name: uploads
+          emptyDir: {}  # Ephemeral storage for local dev
+
+---
+# Service with NodePort for easy local access
+apiVersion: v1
+kind: Service
+metadata:
+  name: nava-backend
+  namespace: nava
+  labels:
+    app: nava-backend
+spec:
+  type: NodePort
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 30080  # Access via localhost:30080
+      protocol: TCP
+      name: http
+  selector:
+    app: nava-backend
+
+---
+# Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nava
+  labels:
+    name: nava

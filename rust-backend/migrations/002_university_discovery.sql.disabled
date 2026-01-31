@@ -1,0 +1,1376 @@
+-- Migration: Global University Discovery System
+-- Comprehensive country-wise university database for NAVA global platform
+
+-- ============================================================================
+-- Universities Registry (Global Database)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS universities (
+    id BIGSERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    short_name VARCHAR(100),
+    domain VARCHAR(255) NOT NULL,
+    country VARCHAR(100) NOT NULL,
+    country_code VARCHAR(3) NOT NULL,
+    state_province VARCHAR(100),
+    city VARCHAR(100),
+    tier VARCHAR(20) DEFAULT 'regular',
+    is_active BOOLEAN DEFAULT TRUE,
+    student_population INTEGER,
+    ranking_national INTEGER,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_universities_domain ON universities(domain);
+CREATE INDEX IF NOT EXISTS idx_universities_country ON universities(country_code, is_active);
+CREATE INDEX IF NOT EXISTS idx_universities_name ON universities(name);
+CREATE INDEX IF NOT EXISTS idx_universities_tier ON universities(tier, country_code);
+
+-- ============================================================================
+-- Update student_verifications with university link
+-- ============================================================================
+ALTER TABLE student_verifications
+ADD COLUMN IF NOT EXISTS university_id BIGINT REFERENCES universities(id),
+ADD COLUMN IF NOT EXISTS country_code VARCHAR(3);
+
+CREATE INDEX IF NOT EXISTS idx_student_verifications_uni ON student_verifications(university_id, status);
+CREATE INDEX IF NOT EXISTS idx_student_verifications_country ON student_verifications(country_code, status);
+
+-- ============================================================================
+-- University Discovery Passes
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS university_passes (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    pass_type VARCHAR(20) NOT NULL,
+    country_code VARCHAR(3),
+    status VARCHAR(20) DEFAULT 'active',
+    start_date TIMESTAMP DEFAULT NOW(),
+    end_date TIMESTAMP,
+    amount_paid DECIMAL(10,2),
+    currency VARCHAR(3) DEFAULT 'USD',
+    payment_id VARCHAR(255),
+    created_at TIMESTAMP DEFAULT NOW(),
+    CONSTRAINT valid_pass_type CHECK (pass_type IN ('country', 'global'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_university_passes_user ON university_passes(user_id, status, end_date);
+CREATE INDEX IF NOT EXISTS idx_university_passes_country ON university_passes(country_code, status);
+
+-- ============================================================================
+-- UNITED STATES (USA) - Comprehensive List
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+-- Ivy League
+('Harvard University', 'Harvard', 'harvard.edu', 'United States', 'USA', 'Massachusetts', 'Cambridge', 'top_private', 1),
+('Yale University', 'Yale', 'yale.edu', 'United States', 'USA', 'Connecticut', 'New Haven', 'top_private', 5),
+('Princeton University', 'Princeton', 'princeton.edu', 'United States', 'USA', 'New Jersey', 'Princeton', 'top_private', 1),
+('Columbia University', 'Columbia', 'columbia.edu', 'United States', 'USA', 'New York', 'New York', 'top_private', 12),
+('University of Pennsylvania', 'UPenn', 'upenn.edu', 'United States', 'USA', 'Pennsylvania', 'Philadelphia', 'top_private', 6),
+('Brown University', 'Brown', 'brown.edu', 'United States', 'USA', 'Rhode Island', 'Providence', 'top_private', 13),
+('Dartmouth College', 'Dartmouth', 'dartmouth.edu', 'United States', 'USA', 'New Hampshire', 'Hanover', 'top_private', 12),
+('Cornell University', 'Cornell', 'cornell.edu', 'United States', 'USA', 'New York', 'Ithaca', 'top_private', 17),
+-- Top Private
+('Stanford University', 'Stanford', 'stanford.edu', 'United States', 'USA', 'California', 'Stanford', 'top_private', 3),
+('Massachusetts Institute of Technology', 'MIT', 'mit.edu', 'United States', 'USA', 'Massachusetts', 'Cambridge', 'top_private', 2),
+('Duke University', 'Duke', 'duke.edu', 'United States', 'USA', 'North Carolina', 'Durham', 'top_private', 10),
+('Northwestern University', 'Northwestern', 'northwestern.edu', 'United States', 'USA', 'Illinois', 'Evanston', 'top_private', 9),
+('University of Chicago', 'UChicago', 'uchicago.edu', 'United States', 'USA', 'Illinois', 'Chicago', 'top_private', 6),
+('Carnegie Mellon University', 'CMU', 'cmu.edu', 'United States', 'USA', 'Pennsylvania', 'Pittsburgh', 'top_private', 22),
+('New York University', 'NYU', 'nyu.edu', 'United States', 'USA', 'New York', 'New York', 'top_private', 25),
+('Johns Hopkins University', 'JHU', 'jhu.edu', 'United States', 'USA', 'Maryland', 'Baltimore', 'top_private', 7),
+('Rice University', 'Rice', 'rice.edu', 'United States', 'USA', 'Texas', 'Houston', 'top_private', 15),
+('Vanderbilt University', 'Vanderbilt', 'vanderbilt.edu', 'United States', 'USA', 'Tennessee', 'Nashville', 'top_private', 13),
+('University of Notre Dame', 'Notre Dame', 'nd.edu', 'United States', 'USA', 'Indiana', 'Notre Dame', 'top_private', 18),
+('Emory University', 'Emory', 'emory.edu', 'United States', 'USA', 'Georgia', 'Atlanta', 'top_private', 22),
+('Georgetown University', 'Georgetown', 'georgetown.edu', 'United States', 'USA', 'Washington DC', 'Washington', 'top_private', 22),
+('University of Southern California', 'USC', 'usc.edu', 'United States', 'USA', 'California', 'Los Angeles', 'top_private', 25),
+('Boston University', 'BU', 'bu.edu', 'United States', 'USA', 'Massachusetts', 'Boston', 'top_private', 41),
+('Boston College', 'BC', 'bc.edu', 'United States', 'USA', 'Massachusetts', 'Chestnut Hill', 'top_private', 36),
+('Wake Forest University', 'Wake Forest', 'wfu.edu', 'United States', 'USA', 'North Carolina', 'Winston-Salem', 'top_private', 29),
+('Tufts University', 'Tufts', 'tufts.edu', 'United States', 'USA', 'Massachusetts', 'Medford', 'top_private', 32),
+-- Top Public - California
+('University of California Berkeley', 'UC Berkeley', 'berkeley.edu', 'United States', 'USA', 'California', 'Berkeley', 'top_public', 20),
+('University of California Los Angeles', 'UCLA', 'ucla.edu', 'United States', 'USA', 'California', 'Los Angeles', 'top_public', 20),
+('University of California San Diego', 'UCSD', 'ucsd.edu', 'United States', 'USA', 'California', 'San Diego', 'top_public', 34),
+('University of California Davis', 'UC Davis', 'ucdavis.edu', 'United States', 'USA', 'California', 'Davis', 'top_public', 38),
+('University of California Irvine', 'UCI', 'uci.edu', 'United States', 'USA', 'California', 'Irvine', 'top_public', 34),
+('University of California Santa Barbara', 'UCSB', 'ucsb.edu', 'United States', 'USA', 'California', 'Santa Barbara', 'top_public', 32),
+('University of California Santa Cruz', 'UCSC', 'ucsc.edu', 'United States', 'USA', 'California', 'Santa Cruz', 'top_public', 83),
+('University of California Riverside', 'UCR', 'ucr.edu', 'United States', 'USA', 'California', 'Riverside', 'top_public', 83),
+('University of California Merced', 'UC Merced', 'ucmerced.edu', 'United States', 'USA', 'California', 'Merced', 'regular', 97),
+('California State University Long Beach', 'CSULB', 'csulb.edu', 'United States', 'USA', 'California', 'Long Beach', 'regular', NULL),
+('San Diego State University', 'SDSU', 'sdsu.edu', 'United States', 'USA', 'California', 'San Diego', 'regular', NULL),
+('San Jose State University', 'SJSU', 'sjsu.edu', 'United States', 'USA', 'California', 'San Jose', 'regular', NULL),
+('California Polytechnic State University', 'Cal Poly', 'calpoly.edu', 'United States', 'USA', 'California', 'San Luis Obispo', 'regular', NULL),
+-- Top Public - Texas
+('University of Texas at Austin', 'UT Austin', 'utexas.edu', 'United States', 'USA', 'Texas', 'Austin', 'top_public', 38),
+('Texas A&M University', 'Texas A&M', 'tamu.edu', 'United States', 'USA', 'Texas', 'College Station', 'top_public', 47),
+('University of Texas at Dallas', 'UT Dallas', 'utdallas.edu', 'United States', 'USA', 'Texas', 'Richardson', 'top_public', 115),
+('University of Texas at Arlington', 'UTA', 'uta.edu', 'United States', 'USA', 'Texas', 'Arlington', 'regular', NULL),
+('University of Texas at San Antonio', 'UTSA', 'utsa.edu', 'United States', 'USA', 'Texas', 'San Antonio', 'regular', NULL),
+('University of Houston', 'UH', 'uh.edu', 'United States', 'USA', 'Texas', 'Houston', 'regular', NULL),
+('Texas Tech University', 'Texas Tech', 'ttu.edu', 'United States', 'USA', 'Texas', 'Lubbock', 'regular', NULL),
+('University of North Texas', 'UNT', 'unt.edu', 'United States', 'USA', 'Texas', 'Denton', 'regular', NULL),
+-- Top Public - Other States
+('University of Michigan', 'UMich', 'umich.edu', 'United States', 'USA', 'Michigan', 'Ann Arbor', 'top_public', 21),
+('University of Virginia', 'UVA', 'virginia.edu', 'United States', 'USA', 'Virginia', 'Charlottesville', 'top_public', 24),
+('University of North Carolina at Chapel Hill', 'UNC', 'unc.edu', 'United States', 'USA', 'North Carolina', 'Chapel Hill', 'top_public', 22),
+('Georgia Institute of Technology', 'Georgia Tech', 'gatech.edu', 'United States', 'USA', 'Georgia', 'Atlanta', 'top_public', 33),
+('University of Illinois Urbana-Champaign', 'UIUC', 'illinois.edu', 'United States', 'USA', 'Illinois', 'Champaign', 'top_public', 35),
+('University of Wisconsin-Madison', 'UW Madison', 'wisc.edu', 'United States', 'USA', 'Wisconsin', 'Madison', 'top_public', 35),
+('University of Washington', 'UW', 'washington.edu', 'United States', 'USA', 'Washington', 'Seattle', 'top_public', 40),
+('Ohio State University', 'OSU', 'osu.edu', 'United States', 'USA', 'Ohio', 'Columbus', 'top_public', 43),
+('Penn State University', 'Penn State', 'psu.edu', 'United States', 'USA', 'Pennsylvania', 'University Park', 'top_public', 60),
+('University of Florida', 'UF', 'ufl.edu', 'United States', 'USA', 'Florida', 'Gainesville', 'top_public', 29),
+('University of Maryland', 'UMD', 'umd.edu', 'United States', 'USA', 'Maryland', 'College Park', 'top_public', 55),
+('Purdue University', 'Purdue', 'purdue.edu', 'United States', 'USA', 'Indiana', 'West Lafayette', 'top_public', 43),
+('University of Minnesota', 'UMN', 'umn.edu', 'United States', 'USA', 'Minnesota', 'Minneapolis', 'top_public', 53),
+('Michigan State University', 'MSU', 'msu.edu', 'United States', 'USA', 'Michigan', 'East Lansing', 'top_public', 60),
+('Indiana University Bloomington', 'IU', 'indiana.edu', 'United States', 'USA', 'Indiana', 'Bloomington', 'regular', 72),
+('University of Arizona', 'UArizona', 'arizona.edu', 'United States', 'USA', 'Arizona', 'Tucson', 'regular', 97),
+('Arizona State University', 'ASU', 'asu.edu', 'United States', 'USA', 'Arizona', 'Tempe', 'regular', 105),
+('University of Colorado Boulder', 'CU Boulder', 'colorado.edu', 'United States', 'USA', 'Colorado', 'Boulder', 'regular', 89),
+('University of Iowa', 'UIowa', 'uiowa.edu', 'United States', 'USA', 'Iowa', 'Iowa City', 'regular', 83),
+('Rutgers University', 'Rutgers', 'rutgers.edu', 'United States', 'USA', 'New Jersey', 'New Brunswick', 'regular', 55),
+('University of Pittsburgh', 'Pitt', 'pitt.edu', 'United States', 'USA', 'Pennsylvania', 'Pittsburgh', 'regular', 59),
+('University of Utah', 'UUtah', 'utah.edu', 'United States', 'USA', 'Utah', 'Salt Lake City', 'regular', 105),
+('University of Oregon', 'UOregon', 'uoregon.edu', 'United States', 'USA', 'Oregon', 'Eugene', 'regular', 98),
+('Oregon State University', 'OSU Oregon', 'oregonstate.edu', 'United States', 'USA', 'Oregon', 'Corvallis', 'regular', NULL),
+('Florida State University', 'FSU', 'fsu.edu', 'United States', 'USA', 'Florida', 'Tallahassee', 'regular', 53),
+('University of South Florida', 'USF', 'usf.edu', 'United States', 'USA', 'Florida', 'Tampa', 'regular', NULL),
+('Virginia Tech', 'VT', 'vt.edu', 'United States', 'USA', 'Virginia', 'Blacksburg', 'regular', 62),
+('North Carolina State University', 'NC State', 'ncsu.edu', 'United States', 'USA', 'North Carolina', 'Raleigh', 'regular', 60),
+('University of Georgia', 'UGA', 'uga.edu', 'United States', 'USA', 'Georgia', 'Athens', 'regular', 47),
+('Clemson University', 'Clemson', 'clemson.edu', 'United States', 'USA', 'South Carolina', 'Clemson', 'regular', 77),
+('University of Tennessee', 'UTK', 'utk.edu', 'United States', 'USA', 'Tennessee', 'Knoxville', 'regular', 103),
+('University of Kentucky', 'UK', 'uky.edu', 'United States', 'USA', 'Kentucky', 'Lexington', 'regular', NULL),
+('University of Alabama', 'UA', 'ua.edu', 'United States', 'USA', 'Alabama', 'Tuscaloosa', 'regular', NULL),
+('Auburn University', 'Auburn', 'auburn.edu', 'United States', 'USA', 'Alabama', 'Auburn', 'regular', 97),
+('Louisiana State University', 'LSU', 'lsu.edu', 'United States', 'USA', 'Louisiana', 'Baton Rouge', 'regular', NULL),
+('University of Oklahoma', 'OU', 'ou.edu', 'United States', 'USA', 'Oklahoma', 'Norman', 'regular', NULL),
+('Oklahoma State University', 'OK State', 'okstate.edu', 'United States', 'USA', 'Oklahoma', 'Stillwater', 'regular', NULL),
+('University of Kansas', 'KU', 'ku.edu', 'United States', 'USA', 'Kansas', 'Lawrence', 'regular', NULL),
+('Kansas State University', 'K-State', 'k-state.edu', 'United States', 'USA', 'Kansas', 'Manhattan', 'regular', NULL),
+('University of Nebraska-Lincoln', 'UNL', 'unl.edu', 'United States', 'USA', 'Nebraska', 'Lincoln', 'regular', NULL),
+('University of Missouri', 'Mizzou', 'missouri.edu', 'United States', 'USA', 'Missouri', 'Columbia', 'regular', NULL),
+('Washington State University', 'WSU', 'wsu.edu', 'United States', 'USA', 'Washington', 'Pullman', 'regular', NULL),
+('University of Nevada Las Vegas', 'UNLV', 'unlv.edu', 'United States', 'USA', 'Nevada', 'Las Vegas', 'regular', NULL),
+('University of New Mexico', 'UNM', 'unm.edu', 'United States', 'USA', 'New Mexico', 'Albuquerque', 'regular', NULL),
+('University of Hawaii at Manoa', 'UH Manoa', 'hawaii.edu', 'United States', 'USA', 'Hawaii', 'Honolulu', 'regular', NULL),
+-- More Top Private Universities
+('California Institute of Technology', 'Caltech', 'caltech.edu', 'United States', 'USA', 'California', 'Pasadena', 'top_private', 6),
+('Villanova University', 'Villanova', 'villanova.edu', 'United States', 'USA', 'Pennsylvania', 'Villanova', 'top_private', 51),
+('Lehigh University', 'Lehigh', 'lehigh.edu', 'United States', 'USA', 'Pennsylvania', 'Bethlehem', 'top_private', 51),
+('Pepperdine University', 'Pepperdine', 'pepperdine.edu', 'United States', 'USA', 'California', 'Malibu', 'top_private', 55),
+('Santa Clara University', 'Santa Clara', 'scu.edu', 'United States', 'USA', 'California', 'Santa Clara', 'top_private', 55),
+('Loyola Marymount University', 'LMU', 'lmu.edu', 'United States', 'USA', 'California', 'Los Angeles', 'top_private', 75),
+('Brandeis University', 'Brandeis', 'brandeis.edu', 'United States', 'USA', 'Massachusetts', 'Waltham', 'top_private', 44),
+('Case Western Reserve University', 'CWRU', 'case.edu', 'United States', 'USA', 'Ohio', 'Cleveland', 'top_private', 44),
+('Tulane University', 'Tulane', 'tulane.edu', 'United States', 'USA', 'Louisiana', 'New Orleans', 'top_private', 44),
+('University of Rochester', 'Rochester', 'rochester.edu', 'United States', 'USA', 'New York', 'Rochester', 'top_private', 47),
+('Northeastern University', 'Northeastern', 'northeastern.edu', 'United States', 'USA', 'Massachusetts', 'Boston', 'top_private', 53),
+('Rensselaer Polytechnic Institute', 'RPI', 'rpi.edu', 'United States', 'USA', 'New York', 'Troy', 'top_private', 55),
+('George Washington University', 'GWU', 'gwu.edu', 'United States', 'USA', 'Washington DC', 'Washington', 'top_private', 67),
+('Syracuse University', 'Syracuse', 'syr.edu', 'United States', 'USA', 'New York', 'Syracuse', 'top_private', 62),
+('Fordham University', 'Fordham', 'fordham.edu', 'United States', 'USA', 'New York', 'New York', 'top_private', 72),
+('Southern Methodist University', 'SMU', 'smu.edu', 'United States', 'USA', 'Texas', 'Dallas', 'top_private', 72),
+('University of Miami', 'Miami', 'miami.edu', 'United States', 'USA', 'Florida', 'Coral Gables', 'top_private', 67),
+('Stevens Institute of Technology', 'Stevens', 'stevens.edu', 'United States', 'USA', 'New Jersey', 'Hoboken', 'top_private', 83),
+('Worcester Polytechnic Institute', 'WPI', 'wpi.edu', 'United States', 'USA', 'Massachusetts', 'Worcester', 'top_private', 72),
+('Drexel University', 'Drexel', 'drexel.edu', 'United States', 'USA', 'Pennsylvania', 'Philadelphia', 'regular', 105),
+('University of San Diego', 'USD', 'sandiego.edu', 'United States', 'USA', 'California', 'San Diego', 'regular', 93),
+('Marquette University', 'Marquette', 'marquette.edu', 'United States', 'USA', 'Wisconsin', 'Milwaukee', 'regular', 88),
+('University of Denver', 'DU', 'du.edu', 'United States', 'USA', 'Colorado', 'Denver', 'regular', 93),
+('University of San Francisco', 'USF', 'usfca.edu', 'United States', 'USA', 'California', 'San Francisco', 'regular', 105),
+('American University', 'American', 'american.edu', 'United States', 'USA', 'Washington DC', 'Washington', 'regular', 72),
+('Howard University', 'Howard', 'howard.edu', 'United States', 'USA', 'Washington DC', 'Washington', 'regular', 89),
+('Texas Christian University', 'TCU', 'tcu.edu', 'United States', 'USA', 'Texas', 'Fort Worth', 'regular', 89),
+('Baylor University', 'Baylor', 'baylor.edu', 'United States', 'USA', 'Texas', 'Waco', 'regular', 93),
+('Chapman University', 'Chapman', 'chapman.edu', 'United States', 'USA', 'California', 'Orange', 'regular', 124),
+('Gonzaga University', 'Gonzaga', 'gonzaga.edu', 'United States', 'USA', 'Washington', 'Spokane', 'regular', 83),
+('Loyola University Chicago', 'Loyola Chicago', 'luc.edu', 'United States', 'USA', 'Illinois', 'Chicago', 'regular', 103),
+('DePaul University', 'DePaul', 'depaul.edu', 'United States', 'USA', 'Illinois', 'Chicago', 'regular', 124),
+('Creighton University', 'Creighton', 'creighton.edu', 'United States', 'USA', 'Nebraska', 'Omaha', 'regular', 103),
+('Seton Hall University', 'Seton Hall', 'shu.edu', 'United States', 'USA', 'New Jersey', 'South Orange', 'regular', 139),
+('University of Tulsa', 'TU', 'utulsa.edu', 'United States', 'USA', 'Oklahoma', 'Tulsa', 'regular', 115),
+('University of Dayton', 'UD', 'udayton.edu', 'United States', 'USA', 'Ohio', 'Dayton', 'regular', 124),
+('Santa Clara University', 'SCU', 'scu.edu', 'United States', 'USA', 'California', 'Santa Clara', 'top_private', 55),
+('Bucknell University', 'Bucknell', 'bucknell.edu', 'United States', 'USA', 'Pennsylvania', 'Lewisburg', 'top_private', 35),
+('Colgate University', 'Colgate', 'colgate.edu', 'United States', 'USA', 'New York', 'Hamilton', 'top_private', 25),
+('Davidson College', 'Davidson', 'davidson.edu', 'United States', 'USA', 'North Carolina', 'Davidson', 'top_private', 17),
+('Hamilton College', 'Hamilton', 'hamilton.edu', 'United States', 'USA', 'New York', 'Clinton', 'top_private', 14),
+('Middlebury College', 'Middlebury', 'middlebury.edu', 'United States', 'USA', 'Vermont', 'Middlebury', 'top_private', 14),
+('Amherst College', 'Amherst', 'amherst.edu', 'United States', 'USA', 'Massachusetts', 'Amherst', 'top_private', 2),
+('Williams College', 'Williams', 'williams.edu', 'United States', 'USA', 'Massachusetts', 'Williamstown', 'top_private', 1),
+('Swarthmore College', 'Swarthmore', 'swarthmore.edu', 'United States', 'USA', 'Pennsylvania', 'Swarthmore', 'top_private', 3),
+('Bowdoin College', 'Bowdoin', 'bowdoin.edu', 'United States', 'USA', 'Maine', 'Brunswick', 'top_private', 6),
+('Pomona College', 'Pomona', 'pomona.edu', 'United States', 'USA', 'California', 'Claremont', 'top_private', 4),
+('Claremont McKenna College', 'CMC', 'cmc.edu', 'United States', 'USA', 'California', 'Claremont', 'top_private', 8),
+('Harvey Mudd College', 'Harvey Mudd', 'hmc.edu', 'United States', 'USA', 'California', 'Claremont', 'top_private', 25),
+('Carleton College', 'Carleton', 'carleton.edu', 'United States', 'USA', 'Minnesota', 'Northfield', 'top_private', 6),
+('Wellesley College', 'Wellesley', 'wellesley.edu', 'United States', 'USA', 'Massachusetts', 'Wellesley', 'top_private', 5),
+('Vassar College', 'Vassar', 'vassar.edu', 'United States', 'USA', 'New York', 'Poughkeepsie', 'top_private', 12),
+('Grinnell College', 'Grinnell', 'grinnell.edu', 'United States', 'USA', 'Iowa', 'Grinnell', 'top_private', 14),
+('Haverford College', 'Haverford', 'haverford.edu', 'United States', 'USA', 'Pennsylvania', 'Haverford', 'top_private', 17),
+('Smith College', 'Smith', 'smith.edu', 'United States', 'USA', 'Massachusetts', 'Northampton', 'top_private', 14),
+('Colby College', 'Colby', 'colby.edu', 'United States', 'USA', 'Maine', 'Waterville', 'top_private', 20),
+('Bates College', 'Bates', 'bates.edu', 'United States', 'USA', 'Maine', 'Lewiston', 'top_private', 20),
+('Oberlin College', 'Oberlin', 'oberlin.edu', 'United States', 'USA', 'Ohio', 'Oberlin', 'top_private', 35),
+('Scripps College', 'Scripps', 'scrippscollege.edu', 'United States', 'USA', 'California', 'Claremont', 'top_private', 28),
+('Barnard College', 'Barnard', 'barnard.edu', 'United States', 'USA', 'New York', 'New York', 'top_private', 14),
+('Mount Holyoke College', 'Mount Holyoke', 'mtholyoke.edu', 'United States', 'USA', 'Massachusetts', 'South Hadley', 'top_private', 35),
+('Bryn Mawr College', 'Bryn Mawr', 'brynmawr.edu', 'United States', 'USA', 'Pennsylvania', 'Bryn Mawr', 'top_private', 35),
+('Trinity College', 'Trinity CT', 'trincoll.edu', 'United States', 'USA', 'Connecticut', 'Hartford', 'top_private', 44),
+('Connecticut College', 'Conn', 'conncoll.edu', 'United States', 'USA', 'Connecticut', 'New London', 'top_private', 44),
+('Wesleyan University', 'Wesleyan', 'wesleyan.edu', 'United States', 'USA', 'Connecticut', 'Middletown', 'top_private', 11),
+('Lafayette College', 'Lafayette', 'lafayette.edu', 'United States', 'USA', 'Pennsylvania', 'Easton', 'top_private', 35),
+('Union College', 'Union', 'union.edu', 'United States', 'USA', 'New York', 'Schenectady', 'top_private', 44),
+('Dickinson College', 'Dickinson', 'dickinson.edu', 'United States', 'USA', 'Pennsylvania', 'Carlisle', 'top_private', 51),
+('Franklin and Marshall College', 'F&M', 'fandm.edu', 'United States', 'USA', 'Pennsylvania', 'Lancaster', 'top_private', 44),
+('Gettysburg College', 'Gettysburg', 'gettysburg.edu', 'United States', 'USA', 'Pennsylvania', 'Gettysburg', 'top_private', 51),
+('Kenyon College', 'Kenyon', 'kenyon.edu', 'United States', 'USA', 'Ohio', 'Gambier', 'top_private', 28),
+('Denison University', 'Denison', 'denison.edu', 'United States', 'USA', 'Ohio', 'Granville', 'top_private', 44),
+('College of the Holy Cross', 'Holy Cross', 'holycross.edu', 'United States', 'USA', 'Massachusetts', 'Worcester', 'top_private', 28),
+('Whitman College', 'Whitman', 'whitman.edu', 'United States', 'USA', 'Washington', 'Walla Walla', 'top_private', 44),
+('Reed College', 'Reed', 'reed.edu', 'United States', 'USA', 'Oregon', 'Portland', 'top_private', 51),
+('Macalester College', 'Macalester', 'macalester.edu', 'United States', 'USA', 'Minnesota', 'Saint Paul', 'top_private', 28),
+('Colorado College', 'CC', 'coloradocollege.edu', 'United States', 'USA', 'Colorado', 'Colorado Springs', 'top_private', 25),
+('Occidental College', 'Oxy', 'oxy.edu', 'United States', 'USA', 'California', 'Los Angeles', 'top_private', 35),
+('Rhodes College', 'Rhodes', 'rhodes.edu', 'United States', 'USA', 'Tennessee', 'Memphis', 'top_private', 51),
+('Sewanee University of the South', 'Sewanee', 'sewanee.edu', 'United States', 'USA', 'Tennessee', 'Sewanee', 'top_private', 44),
+('Furman University', 'Furman', 'furman.edu', 'United States', 'USA', 'South Carolina', 'Greenville', 'top_private', 51),
+('University of Richmond', 'Richmond', 'richmond.edu', 'United States', 'USA', 'Virginia', 'Richmond', 'top_private', 25),
+('Washington and Lee University', 'W&L', 'wlu.edu', 'United States', 'USA', 'Virginia', 'Lexington', 'top_private', 11),
+-- More Public Universities
+('Stony Brook University', 'Stony Brook', 'stonybrook.edu', 'United States', 'USA', 'New York', 'Stony Brook', 'top_public', 77),
+('University at Buffalo', 'UB', 'buffalo.edu', 'United States', 'USA', 'New York', 'Buffalo', 'regular', 89),
+('University of Connecticut', 'UConn', 'uconn.edu', 'United States', 'USA', 'Connecticut', 'Storrs', 'top_public', 58),
+('University of Delaware', 'UDel', 'udel.edu', 'United States', 'USA', 'Delaware', 'Newark', 'regular', 89),
+('University of Massachusetts Amherst', 'UMass', 'umass.edu', 'United States', 'USA', 'Massachusetts', 'Amherst', 'top_public', 67),
+('Colorado State University', 'CSU', 'colostate.edu', 'United States', 'USA', 'Colorado', 'Fort Collins', 'regular', 148),
+('Iowa State University', 'ISU', 'iastate.edu', 'United States', 'USA', 'Iowa', 'Ames', 'regular', 115),
+('University of Arkansas', 'UA', 'uark.edu', 'United States', 'USA', 'Arkansas', 'Fayetteville', 'regular', 160),
+('University of South Carolina', 'USC SC', 'sc.edu', 'United States', 'USA', 'South Carolina', 'Columbia', 'regular', 117),
+('Temple University', 'Temple', 'temple.edu', 'United States', 'USA', 'Pennsylvania', 'Philadelphia', 'regular', 89),
+('University of Central Florida', 'UCF', 'ucf.edu', 'United States', 'USA', 'Florida', 'Orlando', 'regular', 137),
+('Florida International University', 'FIU', 'fiu.edu', 'United States', 'USA', 'Florida', 'Miami', 'regular', 151),
+('Florida Atlantic University', 'FAU', 'fau.edu', 'United States', 'USA', 'Florida', 'Boca Raton', 'regular', 171),
+('University of North Carolina Charlotte', 'UNCC', 'charlotte.edu', 'United States', 'USA', 'North Carolina', 'Charlotte', 'regular', 176),
+('George Mason University', 'GMU', 'gmu.edu', 'United States', 'USA', 'Virginia', 'Fairfax', 'regular', 137),
+('Old Dominion University', 'ODU', 'odu.edu', 'United States', 'USA', 'Virginia', 'Norfolk', 'regular', 263),
+('James Madison University', 'JMU', 'jmu.edu', 'United States', 'USA', 'Virginia', 'Harrisonburg', 'regular', 176),
+('University of Rhode Island', 'URI', 'uri.edu', 'United States', 'USA', 'Rhode Island', 'Kingston', 'regular', 176),
+('University of Vermont', 'UVM', 'uvm.edu', 'United States', 'USA', 'Vermont', 'Burlington', 'regular', 137),
+('University of New Hampshire', 'UNH', 'unh.edu', 'United States', 'USA', 'New Hampshire', 'Durham', 'regular', 137),
+('University of Maine', 'UMaine', 'umaine.edu', 'United States', 'USA', 'Maine', 'Orono', 'regular', 197),
+('West Virginia University', 'WVU', 'wvu.edu', 'United States', 'USA', 'West Virginia', 'Morgantown', 'regular', 197),
+('University of Wyoming', 'UW', 'uwyo.edu', 'United States', 'USA', 'Wyoming', 'Laramie', 'regular', 197),
+('University of Montana', 'UM', 'umt.edu', 'United States', 'USA', 'Montana', 'Missoula', 'regular', 197),
+('University of Idaho', 'UI', 'uidaho.edu', 'United States', 'USA', 'Idaho', 'Moscow', 'regular', 197),
+('Boise State University', 'BSU', 'boisestate.edu', 'United States', 'USA', 'Idaho', 'Boise', 'regular', 263),
+('University of North Dakota', 'UND', 'und.edu', 'United States', 'USA', 'North Dakota', 'Grand Forks', 'regular', 263),
+('South Dakota State University', 'SDSU SD', 'sdstate.edu', 'United States', 'USA', 'South Dakota', 'Brookings', 'regular', 263),
+('Northern Arizona University', 'NAU', 'nau.edu', 'United States', 'USA', 'Arizona', 'Flagstaff', 'regular', 263),
+('University of Nevada Reno', 'UNR', 'unr.edu', 'United States', 'USA', 'Nevada', 'Reno', 'regular', 197),
+('California State University Fullerton', 'CSUF', 'fullerton.edu', 'United States', 'USA', 'California', 'Fullerton', 'regular', NULL),
+('California State University Northridge', 'CSUN', 'csun.edu', 'United States', 'USA', 'California', 'Northridge', 'regular', NULL),
+('California State University Los Angeles', 'CSULA', 'calstatela.edu', 'United States', 'USA', 'California', 'Los Angeles', 'regular', NULL),
+('San Francisco State University', 'SFSU', 'sfsu.edu', 'United States', 'USA', 'California', 'San Francisco', 'regular', NULL),
+('Sacramento State University', 'Sac State', 'csus.edu', 'United States', 'USA', 'California', 'Sacramento', 'regular', NULL),
+('Fresno State University', 'Fresno State', 'fresnostate.edu', 'United States', 'USA', 'California', 'Fresno', 'regular', NULL),
+('University of Texas at El Paso', 'UTEP', 'utep.edu', 'United States', 'USA', 'Texas', 'El Paso', 'regular', NULL),
+('Texas State University', 'Texas State', 'txstate.edu', 'United States', 'USA', 'Texas', 'San Marcos', 'regular', NULL),
+('Sam Houston State University', 'SHSU', 'shsu.edu', 'United States', 'USA', 'Texas', 'Huntsville', 'regular', NULL),
+('Georgia State University', 'GSU', 'gsu.edu', 'United States', 'USA', 'Georgia', 'Atlanta', 'regular', 197),
+('Kennesaw State University', 'KSU', 'kennesaw.edu', 'United States', 'USA', 'Georgia', 'Kennesaw', 'regular', 263),
+('University of Memphis', 'UMemphis', 'memphis.edu', 'United States', 'USA', 'Tennessee', 'Memphis', 'regular', 263),
+('Middle Tennessee State University', 'MTSU', 'mtsu.edu', 'United States', 'USA', 'Tennessee', 'Murfreesboro', 'regular', NULL),
+('University of Cincinnati', 'UC', 'uc.edu', 'United States', 'USA', 'Ohio', 'Cincinnati', 'regular', 143),
+('University of Akron', 'UA Ohio', 'uakron.edu', 'United States', 'USA', 'Ohio', 'Akron', 'regular', NULL),
+('Kent State University', 'Kent State', 'kent.edu', 'United States', 'USA', 'Ohio', 'Kent', 'regular', 197),
+('Bowling Green State University', 'BGSU', 'bgsu.edu', 'United States', 'USA', 'Ohio', 'Bowling Green', 'regular', NULL),
+('Ohio University', 'Ohio U', 'ohio.edu', 'United States', 'USA', 'Ohio', 'Athens', 'regular', 197),
+('Ball State University', 'Ball State', 'bsu.edu', 'United States', 'USA', 'Indiana', 'Muncie', 'regular', 263),
+('Illinois State University', 'ISU IL', 'ilstu.edu', 'United States', 'USA', 'Illinois', 'Normal', 'regular', 197),
+('Northern Illinois University', 'NIU', 'niu.edu', 'United States', 'USA', 'Illinois', 'DeKalb', 'regular', 263),
+('Southern Illinois University Carbondale', 'SIU', 'siu.edu', 'United States', 'USA', 'Illinois', 'Carbondale', 'regular', 263),
+('University of Illinois Chicago', 'UIC', 'uic.edu', 'United States', 'USA', 'Illinois', 'Chicago', 'regular', 97),
+('University of Wisconsin-Milwaukee', 'UWM', 'uwm.edu', 'United States', 'USA', 'Wisconsin', 'Milwaukee', 'regular', 263),
+('Wayne State University', 'Wayne State', 'wayne.edu', 'United States', 'USA', 'Michigan', 'Detroit', 'regular', 197),
+('Central Michigan University', 'CMU MI', 'cmich.edu', 'United States', 'USA', 'Michigan', 'Mount Pleasant', 'regular', NULL),
+('Western Michigan University', 'WMU', 'wmich.edu', 'United States', 'USA', 'Michigan', 'Kalamazoo', 'regular', NULL),
+('University of Massachusetts Boston', 'UMass Boston', 'umb.edu', 'United States', 'USA', 'Massachusetts', 'Boston', 'regular', 197),
+('University of Massachusetts Lowell', 'UMass Lowell', 'uml.edu', 'United States', 'USA', 'Massachusetts', 'Lowell', 'regular', 176),
+('University at Albany SUNY', 'UAlbany', 'albany.edu', 'United States', 'USA', 'New York', 'Albany', 'regular', 176),
+('Binghamton University SUNY', 'Binghamton', 'binghamton.edu', 'United States', 'USA', 'New York', 'Binghamton', 'top_public', 79),
+('CUNY City College', 'CCNY', 'ccny.cuny.edu', 'United States', 'USA', 'New York', 'New York', 'regular', NULL),
+('CUNY Hunter College', 'Hunter', 'hunter.cuny.edu', 'United States', 'USA', 'New York', 'New York', 'regular', NULL),
+('CUNY Baruch College', 'Baruch', 'baruch.cuny.edu', 'United States', 'USA', 'New York', 'New York', 'regular', NULL),
+('CUNY Queens College', 'Queens', 'qc.cuny.edu', 'United States', 'USA', 'New York', 'Queens', 'regular', NULL),
+('CUNY Brooklyn College', 'Brooklyn', 'brooklyn.cuny.edu', 'United States', 'USA', 'New York', 'Brooklyn', 'regular', NULL)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- CHINA (CHN) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+-- C9 League (Chinese Ivy League)
+('Tsinghua University', 'Tsinghua', 'tsinghua.edu.cn', 'China', 'CHN', 'Beijing', 'Beijing', 'top_public', 1),
+('Peking University', 'PKU', 'pku.edu.cn', 'China', 'CHN', 'Beijing', 'Beijing', 'top_public', 2),
+('Fudan University', 'Fudan', 'fudan.edu.cn', 'China', 'CHN', 'Shanghai', 'Shanghai', 'top_public', 3),
+('Shanghai Jiao Tong University', 'SJTU', 'sjtu.edu.cn', 'China', 'CHN', 'Shanghai', 'Shanghai', 'top_public', 4),
+('Zhejiang University', 'ZJU', 'zju.edu.cn', 'China', 'CHN', 'Zhejiang', 'Hangzhou', 'top_public', 5),
+('Nanjing University', 'NJU', 'nju.edu.cn', 'China', 'CHN', 'Jiangsu', 'Nanjing', 'top_public', 6),
+('University of Science and Technology of China', 'USTC', 'ustc.edu.cn', 'China', 'CHN', 'Anhui', 'Hefei', 'top_public', 7),
+('Harbin Institute of Technology', 'HIT', 'hit.edu.cn', 'China', 'CHN', 'Heilongjiang', 'Harbin', 'top_public', 8),
+('Xian Jiaotong University', 'XJTU', 'xjtu.edu.cn', 'China', 'CHN', 'Shaanxi', 'Xian', 'top_public', 9),
+-- Other Top Chinese Universities
+('Wuhan University', 'WHU', 'whu.edu.cn', 'China', 'CHN', 'Hubei', 'Wuhan', 'top_public', 10),
+('Sun Yat-sen University', 'SYSU', 'sysu.edu.cn', 'China', 'CHN', 'Guangdong', 'Guangzhou', 'top_public', 11),
+('Huazhong University of Science and Technology', 'HUST', 'hust.edu.cn', 'China', 'CHN', 'Hubei', 'Wuhan', 'top_public', 12),
+('Tongji University', 'Tongji', 'tongji.edu.cn', 'China', 'CHN', 'Shanghai', 'Shanghai', 'top_public', 13),
+('Nankai University', 'Nankai', 'nankai.edu.cn', 'China', 'CHN', 'Tianjin', 'Tianjin', 'top_public', 14),
+('Tianjin University', 'TJU', 'tju.edu.cn', 'China', 'CHN', 'Tianjin', 'Tianjin', 'top_public', 15),
+('Southeast University', 'SEU', 'seu.edu.cn', 'China', 'CHN', 'Jiangsu', 'Nanjing', 'top_public', 16),
+('Beijing Institute of Technology', 'BIT', 'bit.edu.cn', 'China', 'CHN', 'Beijing', 'Beijing', 'top_public', 17),
+('Beihang University', 'BUAA', 'buaa.edu.cn', 'China', 'CHN', 'Beijing', 'Beijing', 'top_public', 18),
+('Sichuan University', 'SCU', 'scu.edu.cn', 'China', 'CHN', 'Sichuan', 'Chengdu', 'top_public', 19),
+('South China University of Technology', 'SCUT', 'scut.edu.cn', 'China', 'CHN', 'Guangdong', 'Guangzhou', 'top_public', 20),
+('Xiamen University', 'XMU', 'xmu.edu.cn', 'China', 'CHN', 'Fujian', 'Xiamen', 'top_public', 21),
+('Renmin University of China', 'RUC', 'ruc.edu.cn', 'China', 'CHN', 'Beijing', 'Beijing', 'top_public', 22),
+('Dalian University of Technology', 'DUT', 'dlut.edu.cn', 'China', 'CHN', 'Liaoning', 'Dalian', 'top_public', 23),
+('Jilin University', 'JLU', 'jlu.edu.cn', 'China', 'CHN', 'Jilin', 'Changchun', 'top_public', 24),
+('Shandong University', 'SDU', 'sdu.edu.cn', 'China', 'CHN', 'Shandong', 'Jinan', 'top_public', 25),
+('Central South University', 'CSU', 'csu.edu.cn', 'China', 'CHN', 'Hunan', 'Changsha', 'top_public', 26),
+('Northwestern Polytechnical University', 'NPU', 'nwpu.edu.cn', 'China', 'CHN', 'Shaanxi', 'Xian', 'top_public', 27),
+('Hunan University', 'HNU', 'hnu.edu.cn', 'China', 'CHN', 'Hunan', 'Changsha', 'top_public', 28),
+('East China Normal University', 'ECNU', 'ecnu.edu.cn', 'China', 'CHN', 'Shanghai', 'Shanghai', 'top_public', 29),
+('Beijing Normal University', 'BNU', 'bnu.edu.cn', 'China', 'CHN', 'Beijing', 'Beijing', 'top_public', 30),
+('Ocean University of China', 'OUC', 'ouc.edu.cn', 'China', 'CHN', 'Shandong', 'Qingdao', 'regular', 31),
+('University of Electronic Science and Technology of China', 'UESTC', 'uestc.edu.cn', 'China', 'CHN', 'Sichuan', 'Chengdu', 'top_public', 32),
+('Chongqing University', 'CQU', 'cqu.edu.cn', 'China', 'CHN', 'Chongqing', 'Chongqing', 'regular', 33),
+('Lanzhou University', 'LZU', 'lzu.edu.cn', 'China', 'CHN', 'Gansu', 'Lanzhou', 'regular', 34),
+('China Agricultural University', 'CAU', 'cau.edu.cn', 'China', 'CHN', 'Beijing', 'Beijing', 'regular', 35),
+('Northeast University', 'NEU', 'neu.edu.cn', 'China', 'CHN', 'Liaoning', 'Shenyang', 'regular', 36),
+('Southern University of Science and Technology', 'SUSTech', 'sustech.edu.cn', 'China', 'CHN', 'Guangdong', 'Shenzhen', 'top_public', 37),
+('Shenzhen University', 'SZU', 'szu.edu.cn', 'China', 'CHN', 'Guangdong', 'Shenzhen', 'regular', 38)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- INDIA (IND) - IITs, IIMs, NITs, Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+-- IITs (Indian Institutes of Technology)
+('Indian Institute of Technology Bombay', 'IIT Bombay', 'iitb.ac.in', 'India', 'IND', 'Maharashtra', 'Mumbai', 'top_public', 1),
+('Indian Institute of Technology Delhi', 'IIT Delhi', 'iitd.ac.in', 'India', 'IND', 'Delhi', 'New Delhi', 'top_public', 2),
+('Indian Institute of Technology Madras', 'IIT Madras', 'iitm.ac.in', 'India', 'IND', 'Tamil Nadu', 'Chennai', 'top_public', 3),
+('Indian Institute of Technology Kanpur', 'IIT Kanpur', 'iitk.ac.in', 'India', 'IND', 'Uttar Pradesh', 'Kanpur', 'top_public', 4),
+('Indian Institute of Technology Kharagpur', 'IIT Kharagpur', 'iitkgp.ac.in', 'India', 'IND', 'West Bengal', 'Kharagpur', 'top_public', 5),
+('Indian Institute of Technology Roorkee', 'IIT Roorkee', 'iitr.ac.in', 'India', 'IND', 'Uttarakhand', 'Roorkee', 'top_public', 6),
+('Indian Institute of Technology Guwahati', 'IIT Guwahati', 'iitg.ac.in', 'India', 'IND', 'Assam', 'Guwahati', 'top_public', 7),
+('Indian Institute of Technology Hyderabad', 'IIT Hyderabad', 'iith.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_public', 8),
+('Indian Institute of Technology BHU', 'IIT BHU', 'iitbhu.ac.in', 'India', 'IND', 'Uttar Pradesh', 'Varanasi', 'top_public', 9),
+('Indian Institute of Technology Indore', 'IIT Indore', 'iiti.ac.in', 'India', 'IND', 'Madhya Pradesh', 'Indore', 'top_public', 10),
+('Indian Institute of Technology Gandhinagar', 'IIT Gandhinagar', 'iitgn.ac.in', 'India', 'IND', 'Gujarat', 'Gandhinagar', 'top_public', 11),
+('Indian Institute of Technology Patna', 'IIT Patna', 'iitp.ac.in', 'India', 'IND', 'Bihar', 'Patna', 'top_public', 12),
+('Indian Institute of Technology Ropar', 'IIT Ropar', 'iitrpr.ac.in', 'India', 'IND', 'Punjab', 'Ropar', 'top_public', 13),
+('Indian Institute of Technology Bhubaneswar', 'IIT Bhubaneswar', 'iitbbs.ac.in', 'India', 'IND', 'Odisha', 'Bhubaneswar', 'top_public', 14),
+('Indian Institute of Technology Jodhpur', 'IIT Jodhpur', 'iitj.ac.in', 'India', 'IND', 'Rajasthan', 'Jodhpur', 'top_public', 15),
+('Indian Institute of Technology Mandi', 'IIT Mandi', 'iitmandi.ac.in', 'India', 'IND', 'Himachal Pradesh', 'Mandi', 'top_public', 16),
+('Indian Institute of Technology Tirupati', 'IIT Tirupati', 'iittp.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Tirupati', 'top_public', 17),
+('Indian Institute of Technology Palakkad', 'IIT Palakkad', 'iitpkd.ac.in', 'India', 'IND', 'Kerala', 'Palakkad', 'top_public', 18),
+('Indian Institute of Technology Dharwad', 'IIT Dharwad', 'iitdh.ac.in', 'India', 'IND', 'Karnataka', 'Dharwad', 'top_public', 19),
+('Indian Institute of Technology Bhilai', 'IIT Bhilai', 'iitbhilai.ac.in', 'India', 'IND', 'Chhattisgarh', 'Bhilai', 'top_public', 20),
+('Indian Institute of Technology Goa', 'IIT Goa', 'iitgoa.ac.in', 'India', 'IND', 'Goa', 'Ponda', 'top_public', 21),
+('Indian Institute of Technology Jammu', 'IIT Jammu', 'iitjammu.ac.in', 'India', 'IND', 'Jammu', 'Jammu', 'top_public', 22),
+-- IISc
+('Indian Institute of Science', 'IISc', 'iisc.ac.in', 'India', 'IND', 'Karnataka', 'Bangalore', 'top_public', 1),
+-- IIMs (Indian Institutes of Management)
+('Indian Institute of Management Ahmedabad', 'IIM-A', 'iima.ac.in', 'India', 'IND', 'Gujarat', 'Ahmedabad', 'top_private', 1),
+('Indian Institute of Management Bangalore', 'IIM-B', 'iimb.ac.in', 'India', 'IND', 'Karnataka', 'Bangalore', 'top_private', 2),
+('Indian Institute of Management Calcutta', 'IIM-C', 'iimcal.ac.in', 'India', 'IND', 'West Bengal', 'Kolkata', 'top_private', 3),
+('Indian Institute of Management Lucknow', 'IIM-L', 'iiml.ac.in', 'India', 'IND', 'Uttar Pradesh', 'Lucknow', 'top_private', 4),
+('Indian Institute of Management Kozhikode', 'IIM-K', 'iimk.ac.in', 'India', 'IND', 'Kerala', 'Kozhikode', 'top_private', 5),
+('Indian Institute of Management Indore', 'IIM-I', 'iimidr.ac.in', 'India', 'IND', 'Madhya Pradesh', 'Indore', 'top_private', 6),
+-- NITs (National Institutes of Technology)
+('National Institute of Technology Tiruchirappalli', 'NIT Trichy', 'nitt.edu', 'India', 'IND', 'Tamil Nadu', 'Tiruchirappalli', 'top_public', 1),
+('National Institute of Technology Karnataka', 'NIT Surathkal', 'nitk.ac.in', 'India', 'IND', 'Karnataka', 'Surathkal', 'top_public', 2),
+('National Institute of Technology Warangal', 'NIT Warangal', 'nitw.ac.in', 'India', 'IND', 'Telangana', 'Warangal', 'top_public', 3),
+('National Institute of Technology Rourkela', 'NIT Rourkela', 'nitrkl.ac.in', 'India', 'IND', 'Odisha', 'Rourkela', 'top_public', 4),
+('National Institute of Technology Calicut', 'NIT Calicut', 'nitc.ac.in', 'India', 'IND', 'Kerala', 'Calicut', 'top_public', 5),
+('Visvesvaraya National Institute of Technology', 'VNIT Nagpur', 'vnit.ac.in', 'India', 'IND', 'Maharashtra', 'Nagpur', 'top_public', 6),
+('Motilal Nehru National Institute of Technology', 'MNNIT Allahabad', 'mnnit.ac.in', 'India', 'IND', 'Uttar Pradesh', 'Allahabad', 'top_public', 7),
+-- Other Top Indian Universities
+('BITS Pilani', 'BITS', 'bits-pilani.ac.in', 'India', 'IND', 'Rajasthan', 'Pilani', 'top_private', 1),
+('BITS Pilani Goa Campus', 'BITS Goa', 'bits-pilani.ac.in', 'India', 'IND', 'Goa', 'Zuarinagar', 'top_private', 2),
+('BITS Pilani Hyderabad Campus', 'BITS Hyderabad', 'bits-pilani.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_private', 3),
+('Delhi University', 'DU', 'du.ac.in', 'India', 'IND', 'Delhi', 'New Delhi', 'top_public', 1),
+('Jawaharlal Nehru University', 'JNU', 'jnu.ac.in', 'India', 'IND', 'Delhi', 'New Delhi', 'top_public', 2),
+('Anna University', 'Anna', 'annauniv.edu', 'India', 'IND', 'Tamil Nadu', 'Chennai', 'top_public', 3),
+('University of Hyderabad', 'UoH', 'uohyd.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_public', 4),
+('Banaras Hindu University', 'BHU', 'bhu.ac.in', 'India', 'IND', 'Uttar Pradesh', 'Varanasi', 'top_public', 5),
+('Jadavpur University', 'JU', 'jaduniv.edu.in', 'India', 'IND', 'West Bengal', 'Kolkata', 'top_public', 6),
+('Manipal Academy of Higher Education', 'MAHE', 'manipal.edu', 'India', 'IND', 'Karnataka', 'Manipal', 'top_private', 7),
+('Vellore Institute of Technology', 'VIT', 'vit.ac.in', 'India', 'IND', 'Tamil Nadu', 'Vellore', 'top_private', 8),
+('SRM Institute of Science and Technology', 'SRM', 'srmist.edu.in', 'India', 'IND', 'Tamil Nadu', 'Chennai', 'top_private', 9),
+('Amity University', 'Amity', 'amity.edu', 'India', 'IND', 'Uttar Pradesh', 'Noida', 'regular', 10),
+('Christ University', 'Christ', 'christuniversity.in', 'India', 'IND', 'Karnataka', 'Bangalore', 'regular', 11),
+('International Institute of Information Technology Hyderabad', 'IIIT-H', 'iiit.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_public', 1),
+('International Institute of Information Technology Bangalore', 'IIIT-B', 'iiitb.ac.in', 'India', 'IND', 'Karnataka', 'Bangalore', 'top_public', 2),
+-- More IIMs
+('Indian Institute of Management Shillong', 'IIM-S', 'iimshillong.ac.in', 'India', 'IND', 'Meghalaya', 'Shillong', 'top_private', 7),
+('Indian Institute of Management Ranchi', 'IIM-R', 'iimranchi.ac.in', 'India', 'IND', 'Jharkhand', 'Ranchi', 'top_private', 8),
+('Indian Institute of Management Raipur', 'IIM-Raipur', 'iimraipur.ac.in', 'India', 'IND', 'Chhattisgarh', 'Raipur', 'top_private', 9),
+('Indian Institute of Management Kashipur', 'IIM-Kashipur', 'iimkashipur.ac.in', 'India', 'IND', 'Uttarakhand', 'Kashipur', 'top_private', 10),
+('Indian Institute of Management Tiruchirappalli', 'IIM-Trichy', 'iimtrichy.ac.in', 'India', 'IND', 'Tamil Nadu', 'Tiruchirappalli', 'top_private', 11),
+('Indian Institute of Management Udaipur', 'IIM-U', 'iimu.ac.in', 'India', 'IND', 'Rajasthan', 'Udaipur', 'top_private', 12),
+('Indian Institute of Management Nagpur', 'IIM-N', 'iimnagpur.ac.in', 'India', 'IND', 'Maharashtra', 'Nagpur', 'top_private', 13),
+('Indian Institute of Management Visakhapatnam', 'IIM-V', 'iimv.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Visakhapatnam', 'top_private', 14),
+('Indian Institute of Management Bodh Gaya', 'IIM-BG', 'iimbg.ac.in', 'India', 'IND', 'Bihar', 'Bodh Gaya', 'top_private', 15),
+('Indian Institute of Management Amritsar', 'IIM-Amritsar', 'iimamritsar.ac.in', 'India', 'IND', 'Punjab', 'Amritsar', 'top_private', 16),
+('Indian Institute of Management Sambalpur', 'IIM-Sambalpur', 'iimsambalpur.ac.in', 'India', 'IND', 'Odisha', 'Sambalpur', 'top_private', 17),
+('Indian Institute of Management Sirmaur', 'IIM-Sirmaur', 'iimsirmaur.ac.in', 'India', 'IND', 'Himachal Pradesh', 'Sirmaur', 'top_private', 18),
+('Indian Institute of Management Jammu', 'IIM-Jammu', 'iimj.ac.in', 'India', 'IND', 'Jammu', 'Jammu', 'top_private', 19),
+('Indian Institute of Management Rohtak', 'IIM-Rohtak', 'iimrohtak.ac.in', 'India', 'IND', 'Haryana', 'Rohtak', 'top_private', 20),
+-- More NITs
+('National Institute of Technology Durgapur', 'NIT Durgapur', 'nitdgp.ac.in', 'India', 'IND', 'West Bengal', 'Durgapur', 'top_public', 8),
+('National Institute of Technology Silchar', 'NIT Silchar', 'nits.ac.in', 'India', 'IND', 'Assam', 'Silchar', 'top_public', 9),
+('National Institute of Technology Jamshedpur', 'NIT Jamshedpur', 'nitjsr.ac.in', 'India', 'IND', 'Jharkhand', 'Jamshedpur', 'top_public', 10),
+('National Institute of Technology Kurukshetra', 'NIT Kurukshetra', 'nitkkr.ac.in', 'India', 'IND', 'Haryana', 'Kurukshetra', 'top_public', 11),
+('National Institute of Technology Hamirpur', 'NIT Hamirpur', 'nith.ac.in', 'India', 'IND', 'Himachal Pradesh', 'Hamirpur', 'top_public', 12),
+('National Institute of Technology Srinagar', 'NIT Srinagar', 'nitsri.ac.in', 'India', 'IND', 'Jammu', 'Srinagar', 'top_public', 13),
+('National Institute of Technology Jalandhar', 'NIT Jalandhar', 'nitj.ac.in', 'India', 'IND', 'Punjab', 'Jalandhar', 'top_public', 14),
+('National Institute of Technology Patna', 'NIT Patna', 'nitp.ac.in', 'India', 'IND', 'Bihar', 'Patna', 'top_public', 15),
+('National Institute of Technology Raipur', 'NIT Raipur', 'nitrr.ac.in', 'India', 'IND', 'Chhattisgarh', 'Raipur', 'top_public', 16),
+('National Institute of Technology Agartala', 'NIT Agartala', 'nita.ac.in', 'India', 'IND', 'Tripura', 'Agartala', 'top_public', 17),
+('National Institute of Technology Goa', 'NIT Goa', 'nitgoa.ac.in', 'India', 'IND', 'Goa', 'Ponda', 'top_public', 18),
+('National Institute of Technology Meghalaya', 'NIT Meghalaya', 'nitm.ac.in', 'India', 'IND', 'Meghalaya', 'Shillong', 'regular', 19),
+('National Institute of Technology Manipur', 'NIT Manipur', 'nitmanipur.ac.in', 'India', 'IND', 'Manipur', 'Imphal', 'regular', 20),
+('National Institute of Technology Mizoram', 'NIT Mizoram', 'nitmz.ac.in', 'India', 'IND', 'Mizoram', 'Aizawl', 'regular', 21),
+('National Institute of Technology Nagaland', 'NIT Nagaland', 'nitnagaland.ac.in', 'India', 'IND', 'Nagaland', 'Dimapur', 'regular', 22),
+('National Institute of Technology Arunachal Pradesh', 'NIT AP', 'nitap.ac.in', 'India', 'IND', 'Arunachal Pradesh', 'Yupia', 'regular', 23),
+('National Institute of Technology Sikkim', 'NIT Sikkim', 'nitsikkim.ac.in', 'India', 'IND', 'Sikkim', 'Ravangla', 'regular', 24),
+('National Institute of Technology Uttarakhand', 'NIT Uttarakhand', 'nituk.ac.in', 'India', 'IND', 'Uttarakhand', 'Srinagar Garhwal', 'regular', 25),
+('National Institute of Technology Andhra Pradesh', 'NIT Andhra', 'nitandhra.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Tadepalligudem', 'regular', 26),
+('National Institute of Technology Delhi', 'NIT Delhi', 'nitdelhi.ac.in', 'India', 'IND', 'Delhi', 'New Delhi', 'top_public', 27),
+('National Institute of Technology Puducherry', 'NIT Puducherry', 'nitpy.ac.in', 'India', 'IND', 'Puducherry', 'Karaikal', 'regular', 28),
+-- Top Private Universities
+('Indian School of Business', 'ISB', 'isb.edu', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_private', 1),
+('Shiv Nadar University', 'SNU', 'snu.edu.in', 'India', 'IND', 'Uttar Pradesh', 'Greater Noida', 'top_private', 10),
+('Ashoka University', 'Ashoka', 'ashoka.edu.in', 'India', 'IND', 'Haryana', 'Sonipat', 'top_private', 11),
+('OP Jindal Global University', 'JGU', 'jgu.edu.in', 'India', 'IND', 'Haryana', 'Sonipat', 'top_private', 12),
+('FLAME University', 'FLAME', 'flame.edu.in', 'India', 'IND', 'Maharashtra', 'Pune', 'top_private', 13),
+('Symbiosis International University', 'SIU', 'siu.edu.in', 'India', 'IND', 'Maharashtra', 'Pune', 'top_private', 14),
+('Kalinga Institute of Industrial Technology', 'KIIT', 'kiit.ac.in', 'India', 'IND', 'Odisha', 'Bhubaneswar', 'regular', 15),
+('XLRI - Xavier School of Management', 'XLRI', 'xlri.ac.in', 'India', 'IND', 'Jharkhand', 'Jamshedpur', 'top_private', 3),
+('SP Jain Institute of Management', 'SPJIMR', 'spjimr.org', 'India', 'IND', 'Maharashtra', 'Mumbai', 'top_private', 4),
+('MDI Gurgaon', 'MDI', 'mdi.ac.in', 'India', 'IND', 'Haryana', 'Gurgaon', 'top_private', 5),
+('NMIMS University', 'NMIMS', 'nmims.edu', 'India', 'IND', 'Maharashtra', 'Mumbai', 'top_private', 16),
+('MICA Ahmedabad', 'MICA', 'mica.ac.in', 'India', 'IND', 'Gujarat', 'Ahmedabad', 'top_private', 17),
+('Institute of Management Technology', 'IMT Ghaziabad', 'imt.edu', 'India', 'IND', 'Uttar Pradesh', 'Ghaziabad', 'top_private', 18),
+('Great Lakes Institute of Management', 'GLIM', 'greatlakes.edu.in', 'India', 'IND', 'Tamil Nadu', 'Chennai', 'top_private', 19),
+('Thapar Institute of Engineering and Technology', 'Thapar', 'thapar.edu', 'India', 'IND', 'Punjab', 'Patiala', 'top_private', 20),
+('Lovely Professional University', 'LPU', 'lpu.in', 'India', 'IND', 'Punjab', 'Phagwara', 'regular', 21),
+('Chandigarh University', 'CU', 'cuchd.in', 'India', 'IND', 'Punjab', 'Mohali', 'regular', 22),
+('Bennett University', 'Bennett', 'bennett.edu.in', 'India', 'IND', 'Uttar Pradesh', 'Greater Noida', 'regular', 23),
+('Chitkara University', 'Chitkara', 'chitkara.edu.in', 'India', 'IND', 'Punjab', 'Rajpura', 'regular', 24),
+('Sharda University', 'Sharda', 'sharda.ac.in', 'India', 'IND', 'Uttar Pradesh', 'Greater Noida', 'regular', 25),
+('Bharati Vidyapeeth University', 'BVP', 'bvu.edu.in', 'India', 'IND', 'Maharashtra', 'Pune', 'regular', 26),
+('IILM University', 'IILM', 'iilm.edu', 'India', 'IND', 'Haryana', 'Gurgaon', 'regular', 27),
+('Nirma University', 'Nirma', 'nirmauni.ac.in', 'India', 'IND', 'Gujarat', 'Ahmedabad', 'regular', 28),
+('DAIICT', 'DAIICT', 'daiict.ac.in', 'India', 'IND', 'Gujarat', 'Gandhinagar', 'top_private', 29),
+('Pandit Deendayal Energy University', 'PDEU', 'pdpu.ac.in', 'India', 'IND', 'Gujarat', 'Gandhinagar', 'regular', 30),
+('IIIT Delhi', 'IIIT-D', 'iiitd.ac.in', 'India', 'IND', 'Delhi', 'New Delhi', 'top_public', 3),
+('IIIT Allahabad', 'IIIT-A', 'iiita.ac.in', 'India', 'IND', 'Uttar Pradesh', 'Allahabad', 'top_public', 4),
+('IIIT Gwalior', 'ABV-IIITM', 'iiitm.ac.in', 'India', 'IND', 'Madhya Pradesh', 'Gwalior', 'top_public', 5),
+('IIIT Jabalpur', 'IIITDMJ', 'iiitdmj.ac.in', 'India', 'IND', 'Madhya Pradesh', 'Jabalpur', 'top_public', 6),
+('IIIT Kancheepuram', 'IIITDM', 'iiitdm.ac.in', 'India', 'IND', 'Tamil Nadu', 'Chennai', 'top_public', 7),
+('IIIT Kottayam', 'IIIT Kottayam', 'iiitkottayam.ac.in', 'India', 'IND', 'Kerala', 'Kottayam', 'regular', 8),
+('IIIT Lucknow', 'IIIT Lucknow', 'iiitl.ac.in', 'India', 'IND', 'Uttar Pradesh', 'Lucknow', 'regular', 9),
+('IIIT Nagpur', 'IIIT Nagpur', 'iiitn.ac.in', 'India', 'IND', 'Maharashtra', 'Nagpur', 'regular', 10),
+('IIIT Pune', 'IIIT Pune', 'iiitp.ac.in', 'India', 'IND', 'Maharashtra', 'Pune', 'regular', 11),
+('IIIT Ranchi', 'IIIT Ranchi', 'iiitranchi.ac.in', 'India', 'IND', 'Jharkhand', 'Ranchi', 'regular', 12),
+('IIIT Sri City', 'IIIT Sri City', 'iiits.in', 'India', 'IND', 'Andhra Pradesh', 'Sri City', 'regular', 13),
+('IIIT Una', 'IIIT Una', 'iiitu.ac.in', 'India', 'IND', 'Himachal Pradesh', 'Una', 'regular', 14),
+('IIIT Vadodara', 'IIIT Vadodara', 'iiitvadodara.ac.in', 'India', 'IND', 'Gujarat', 'Vadodara', 'regular', 15),
+-- Other State Universities
+('Savitribai Phule Pune University', 'SPPU', 'unipune.ac.in', 'India', 'IND', 'Maharashtra', 'Pune', 'top_public', 8),
+('Osmania University', 'OU', 'osmania.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 9),
+('University of Mumbai', 'MU', 'mu.ac.in', 'India', 'IND', 'Maharashtra', 'Mumbai', 'top_public', 10),
+('University of Calcutta', 'CU', 'caluniv.ac.in', 'India', 'IND', 'West Bengal', 'Kolkata', 'top_public', 11),
+('University of Madras', 'UNOM', 'unom.ac.in', 'India', 'IND', 'Tamil Nadu', 'Chennai', 'top_public', 12),
+('Panjab University', 'PU', 'puchd.ac.in', 'India', 'IND', 'Chandigarh', 'Chandigarh', 'top_public', 13),
+('Aligarh Muslim University', 'AMU', 'amu.ac.in', 'India', 'IND', 'Uttar Pradesh', 'Aligarh', 'top_public', 14),
+('Gujarat University', 'GU', 'gujaratuniversity.ac.in', 'India', 'IND', 'Gujarat', 'Ahmedabad', 'regular', 15),
+('Jamia Millia Islamia', 'JMI', 'jmi.ac.in', 'India', 'IND', 'Delhi', 'New Delhi', 'top_public', 16),
+('Indian Statistical Institute', 'ISI', 'isical.ac.in', 'India', 'IND', 'West Bengal', 'Kolkata', 'top_public', 1),
+('Chennai Mathematical Institute', 'CMI', 'cmi.ac.in', 'India', 'IND', 'Tamil Nadu', 'Chennai', 'top_public', 2),
+('Institute of Chemical Technology', 'ICT', 'ictmumbai.edu.in', 'India', 'IND', 'Maharashtra', 'Mumbai', 'top_public', 3),
+('Cochin University of Science and Technology', 'CUSAT', 'cusat.ac.in', 'India', 'IND', 'Kerala', 'Kochi', 'regular', 17),
+('PSG College of Technology', 'PSG Tech', 'psgtech.edu', 'India', 'IND', 'Tamil Nadu', 'Coimbatore', 'regular', 18),
+('Coimbatore Institute of Technology', 'CIT', 'cit.edu.in', 'India', 'IND', 'Tamil Nadu', 'Coimbatore', 'regular', 19),
+('College of Engineering Pune', 'COEP', 'coep.org.in', 'India', 'IND', 'Maharashtra', 'Pune', 'top_public', 20),
+('VJTI Mumbai', 'VJTI', 'vjti.ac.in', 'India', 'IND', 'Maharashtra', 'Mumbai', 'top_public', 21),
+('Birla Institute of Technology Mesra', 'BIT Mesra', 'bitmesra.ac.in', 'India', 'IND', 'Jharkhand', 'Ranchi', 'top_private', 22),
+('PEC Chandigarh', 'PEC', 'pec.ac.in', 'India', 'IND', 'Chandigarh', 'Chandigarh', 'top_public', 23),
+('Netaji Subhas University of Technology', 'NSUT', 'nsut.ac.in', 'India', 'IND', 'Delhi', 'New Delhi', 'top_public', 24),
+('Delhi Technological University', 'DTU', 'dtu.ac.in', 'India', 'IND', 'Delhi', 'New Delhi', 'top_public', 25),
+('Indraprastha Institute of Information Technology', 'IIIT-D', 'iiitd.edu.in', 'India', 'IND', 'Delhi', 'New Delhi', 'top_public', 26),
+-- Medical & Law Schools
+('All India Institute of Medical Sciences Delhi', 'AIIMS Delhi', 'aiims.edu', 'India', 'IND', 'Delhi', 'New Delhi', 'top_public', 1),
+('AIIMS Jodhpur', 'AIIMS Jodhpur', 'aiimsjodhpur.edu.in', 'India', 'IND', 'Rajasthan', 'Jodhpur', 'top_public', 2),
+('AIIMS Bhopal', 'AIIMS Bhopal', 'aiimsbhopal.edu.in', 'India', 'IND', 'Madhya Pradesh', 'Bhopal', 'top_public', 3),
+('AIIMS Rishikesh', 'AIIMS Rishikesh', 'aiimsrishikesh.edu.in', 'India', 'IND', 'Uttarakhand', 'Rishikesh', 'top_public', 4),
+('AIIMS Patna', 'AIIMS Patna', 'aiimspatna.org', 'India', 'IND', 'Bihar', 'Patna', 'top_public', 5),
+('AIIMS Raipur', 'AIIMS Raipur', 'aiimsraipur.edu.in', 'India', 'IND', 'Chhattisgarh', 'Raipur', 'top_public', 6),
+('AIIMS Bhubaneswar', 'AIIMS Bhubaneswar', 'aiimsbhubaneswar.nic.in', 'India', 'IND', 'Odisha', 'Bhubaneswar', 'top_public', 7),
+('National Law School of India University', 'NLSIU', 'nls.ac.in', 'India', 'IND', 'Karnataka', 'Bangalore', 'top_public', 1),
+('NALSAR University of Law', 'NALSAR', 'nalsar.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_public', 2),
+('National Law University Delhi', 'NLU Delhi', 'nludelhi.ac.in', 'India', 'IND', 'Delhi', 'New Delhi', 'top_public', 3),
+('West Bengal National University of Juridical Sciences', 'NUJS', 'nujs.edu', 'India', 'IND', 'West Bengal', 'Kolkata', 'top_public', 4),
+('National Law Institute University Bhopal', 'NLIU', 'nliu.ac.in', 'India', 'IND', 'Madhya Pradesh', 'Bhopal', 'top_public', 5),
+('Gujarat National Law University', 'GNLU', 'gnlu.ac.in', 'India', 'IND', 'Gujarat', 'Gandhinagar', 'top_public', 6),
+('Rajiv Gandhi National University of Law', 'RGNUL', 'rgnul.ac.in', 'India', 'IND', 'Punjab', 'Patiala', 'top_public', 7),
+('Hidayatullah National Law University', 'HNLU', 'hnlu.ac.in', 'India', 'IND', 'Chhattisgarh', 'Raipur', 'top_public', 8),
+('National University of Advanced Legal Studies', 'NUALS', 'nuals.ac.in', 'India', 'IND', 'Kerala', 'Kochi', 'top_public', 9),
+('Chanakya National Law University', 'CNLU', 'cnlu.ac.in', 'India', 'IND', 'Bihar', 'Patna', 'top_public', 10)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- UNITED KINGDOM (GBR) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+-- Russell Group & Top UK
+('University of Oxford', 'Oxford', 'ox.ac.uk', 'United Kingdom', 'GBR', 'Oxfordshire', 'Oxford', 'top_private', 1),
+('University of Cambridge', 'Cambridge', 'cam.ac.uk', 'United Kingdom', 'GBR', 'Cambridgeshire', 'Cambridge', 'top_private', 2),
+('Imperial College London', 'Imperial', 'imperial.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'top_private', 3),
+('London School of Economics', 'LSE', 'lse.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'top_private', 4),
+('University College London', 'UCL', 'ucl.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'top_public', 5),
+('University of Edinburgh', 'Edinburgh', 'ed.ac.uk', 'United Kingdom', 'GBR', 'Scotland', 'Edinburgh', 'top_public', 6),
+('University of Manchester', 'Manchester', 'manchester.ac.uk', 'United Kingdom', 'GBR', 'Greater Manchester', 'Manchester', 'top_public', 7),
+('Kings College London', 'KCL', 'kcl.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'top_public', 8),
+('University of Bristol', 'Bristol', 'bristol.ac.uk', 'United Kingdom', 'GBR', 'Bristol', 'Bristol', 'top_public', 9),
+('University of Warwick', 'Warwick', 'warwick.ac.uk', 'United Kingdom', 'GBR', 'West Midlands', 'Coventry', 'top_public', 10),
+('University of Glasgow', 'Glasgow', 'glasgow.ac.uk', 'United Kingdom', 'GBR', 'Scotland', 'Glasgow', 'top_public', 11),
+('Durham University', 'Durham', 'dur.ac.uk', 'United Kingdom', 'GBR', 'County Durham', 'Durham', 'top_public', 12),
+('University of Birmingham', 'Birmingham', 'bham.ac.uk', 'United Kingdom', 'GBR', 'West Midlands', 'Birmingham', 'top_public', 13),
+('University of Leeds', 'Leeds', 'leeds.ac.uk', 'United Kingdom', 'GBR', 'West Yorkshire', 'Leeds', 'top_public', 14),
+('University of Southampton', 'Southampton', 'soton.ac.uk', 'United Kingdom', 'GBR', 'Hampshire', 'Southampton', 'top_public', 15),
+('University of Sheffield', 'Sheffield', 'sheffield.ac.uk', 'United Kingdom', 'GBR', 'South Yorkshire', 'Sheffield', 'top_public', 16),
+('University of Nottingham', 'Nottingham', 'nottingham.ac.uk', 'United Kingdom', 'GBR', 'Nottinghamshire', 'Nottingham', 'top_public', 17),
+('University of St Andrews', 'St Andrews', 'st-andrews.ac.uk', 'United Kingdom', 'GBR', 'Scotland', 'St Andrews', 'top_public', 18),
+('Queen Mary University of London', 'QMUL', 'qmul.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'top_public', 19),
+('University of York', 'York', 'york.ac.uk', 'United Kingdom', 'GBR', 'North Yorkshire', 'York', 'top_public', 20),
+('Lancaster University', 'Lancaster', 'lancaster.ac.uk', 'United Kingdom', 'GBR', 'Lancashire', 'Lancaster', 'top_public', 21),
+('University of Exeter', 'Exeter', 'exeter.ac.uk', 'United Kingdom', 'GBR', 'Devon', 'Exeter', 'top_public', 22),
+('University of Bath', 'Bath', 'bath.ac.uk', 'United Kingdom', 'GBR', 'Somerset', 'Bath', 'top_public', 23),
+('University of Liverpool', 'Liverpool', 'liverpool.ac.uk', 'United Kingdom', 'GBR', 'Merseyside', 'Liverpool', 'top_public', 24),
+('Newcastle University', 'Newcastle', 'ncl.ac.uk', 'United Kingdom', 'GBR', 'Tyne and Wear', 'Newcastle', 'top_public', 25),
+('Cardiff University', 'Cardiff', 'cardiff.ac.uk', 'United Kingdom', 'GBR', 'Wales', 'Cardiff', 'top_public', 26),
+('Queens University Belfast', 'QUB', 'qub.ac.uk', 'United Kingdom', 'GBR', 'Northern Ireland', 'Belfast', 'top_public', 27),
+('University of Aberdeen', 'Aberdeen', 'abdn.ac.uk', 'United Kingdom', 'GBR', 'Scotland', 'Aberdeen', 'regular', 28),
+('University of Strathclyde', 'Strathclyde', 'strath.ac.uk', 'United Kingdom', 'GBR', 'Scotland', 'Glasgow', 'regular', 29),
+('Loughborough University', 'Loughborough', 'lboro.ac.uk', 'United Kingdom', 'GBR', 'Leicestershire', 'Loughborough', 'regular', 30),
+('University of Surrey', 'Surrey', 'surrey.ac.uk', 'United Kingdom', 'GBR', 'Surrey', 'Guildford', 'regular', 31),
+('Royal Holloway University of London', 'RHUL', 'rhul.ac.uk', 'United Kingdom', 'GBR', 'Surrey', 'Egham', 'regular', 32),
+('SOAS University of London', 'SOAS', 'soas.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'regular', 33),
+('City University of London', 'City', 'city.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'regular', 34),
+('Brunel University London', 'Brunel', 'brunel.ac.uk', 'United Kingdom', 'GBR', 'London', 'Uxbridge', 'regular', 35),
+-- More UK Universities
+('University of Reading', 'Reading', 'reading.ac.uk', 'United Kingdom', 'GBR', 'Berkshire', 'Reading', 'regular', 36),
+('University of Sussex', 'Sussex', 'sussex.ac.uk', 'United Kingdom', 'GBR', 'East Sussex', 'Brighton', 'regular', 37),
+('University of Essex', 'Essex', 'essex.ac.uk', 'United Kingdom', 'GBR', 'Essex', 'Colchester', 'regular', 38),
+('University of Kent', 'Kent', 'kent.ac.uk', 'United Kingdom', 'GBR', 'Kent', 'Canterbury', 'regular', 39),
+('Aston University', 'Aston', 'aston.ac.uk', 'United Kingdom', 'GBR', 'West Midlands', 'Birmingham', 'regular', 40),
+('University of East Anglia', 'UEA', 'uea.ac.uk', 'United Kingdom', 'GBR', 'Norfolk', 'Norwich', 'top_public', 41),
+('Heriot-Watt University', 'Heriot-Watt', 'hw.ac.uk', 'United Kingdom', 'GBR', 'Scotland', 'Edinburgh', 'regular', 42),
+('University of Dundee', 'Dundee', 'dundee.ac.uk', 'United Kingdom', 'GBR', 'Scotland', 'Dundee', 'regular', 43),
+('University of Stirling', 'Stirling', 'stir.ac.uk', 'United Kingdom', 'GBR', 'Scotland', 'Stirling', 'regular', 44),
+('University of Leicester', 'Leicester', 'le.ac.uk', 'United Kingdom', 'GBR', 'Leicestershire', 'Leicester', 'regular', 45),
+('University of Swansea', 'Swansea', 'swansea.ac.uk', 'United Kingdom', 'GBR', 'Wales', 'Swansea', 'regular', 46),
+('Goldsmiths University of London', 'Goldsmiths', 'gold.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'regular', 47),
+('Birkbeck University of London', 'Birkbeck', 'bbk.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'regular', 48),
+('University of Hull', 'Hull', 'hull.ac.uk', 'United Kingdom', 'GBR', 'East Yorkshire', 'Hull', 'regular', 49),
+('University of Portsmouth', 'Portsmouth', 'port.ac.uk', 'United Kingdom', 'GBR', 'Hampshire', 'Portsmouth', 'regular', 50),
+('Oxford Brookes University', 'Oxford Brookes', 'brookes.ac.uk', 'United Kingdom', 'GBR', 'Oxfordshire', 'Oxford', 'regular', 51),
+('Nottingham Trent University', 'NTU', 'ntu.ac.uk', 'United Kingdom', 'GBR', 'Nottinghamshire', 'Nottingham', 'regular', 52),
+('Manchester Metropolitan University', 'MMU', 'mmu.ac.uk', 'United Kingdom', 'GBR', 'Greater Manchester', 'Manchester', 'regular', 53),
+('University of the Arts London', 'UAL', 'arts.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'top_private', 1),
+('Royal College of Art', 'RCA', 'rca.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'top_private', 2),
+('London Business School', 'LBS', 'london.edu', 'United Kingdom', 'GBR', 'London', 'London', 'top_private', 3),
+('Cranfield University', 'Cranfield', 'cranfield.ac.uk', 'United Kingdom', 'GBR', 'Bedfordshire', 'Cranfield', 'top_private', 4),
+('University of Warwick Business School', 'WBS', 'wbs.ac.uk', 'United Kingdom', 'GBR', 'West Midlands', 'Coventry', 'top_private', 5),
+('Judge Business School Cambridge', 'Cambridge Judge', 'jbs.cam.ac.uk', 'United Kingdom', 'GBR', 'Cambridgeshire', 'Cambridge', 'top_private', 6),
+('Said Business School Oxford', 'Oxford Said', 'sbs.ox.ac.uk', 'United Kingdom', 'GBR', 'Oxfordshire', 'Oxford', 'top_private', 7),
+('Imperial College Business School', 'Imperial Business', 'imperial.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'top_private', 8),
+('Coventry University', 'Coventry', 'coventry.ac.uk', 'United Kingdom', 'GBR', 'West Midlands', 'Coventry', 'regular', 54),
+('De Montfort University', 'DMU', 'dmu.ac.uk', 'United Kingdom', 'GBR', 'Leicestershire', 'Leicester', 'regular', 55),
+('Keele University', 'Keele', 'keele.ac.uk', 'United Kingdom', 'GBR', 'Staffordshire', 'Keele', 'regular', 56),
+('University of Plymouth', 'Plymouth', 'plymouth.ac.uk', 'United Kingdom', 'GBR', 'Devon', 'Plymouth', 'regular', 57),
+('University of Brighton', 'Brighton', 'brighton.ac.uk', 'United Kingdom', 'GBR', 'East Sussex', 'Brighton', 'regular', 58),
+('Leeds Beckett University', 'Leeds Beckett', 'leedsbeckett.ac.uk', 'United Kingdom', 'GBR', 'West Yorkshire', 'Leeds', 'regular', 59),
+('Sheffield Hallam University', 'Sheffield Hallam', 'shu.ac.uk', 'United Kingdom', 'GBR', 'South Yorkshire', 'Sheffield', 'regular', 60),
+('University of Greenwich', 'Greenwich', 'gre.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'regular', 61),
+('University of Westminster', 'Westminster', 'westminster.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'regular', 62),
+('Kingston University', 'Kingston', 'kingston.ac.uk', 'United Kingdom', 'GBR', 'London', 'Kingston', 'regular', 63),
+('University of Hertfordshire', 'Hertfordshire', 'herts.ac.uk', 'United Kingdom', 'GBR', 'Hertfordshire', 'Hatfield', 'regular', 64),
+('Middlesex University', 'Middlesex', 'mdx.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'regular', 65),
+('University of East London', 'UEL', 'uel.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'regular', 66),
+('London South Bank University', 'LSBU', 'lsbu.ac.uk', 'United Kingdom', 'GBR', 'London', 'London', 'regular', 67),
+('Birmingham City University', 'BCU', 'bcu.ac.uk', 'United Kingdom', 'GBR', 'West Midlands', 'Birmingham', 'regular', 68),
+('Edinburgh Napier University', 'Napier', 'napier.ac.uk', 'United Kingdom', 'GBR', 'Scotland', 'Edinburgh', 'regular', 69),
+('Glasgow Caledonian University', 'GCU', 'gcu.ac.uk', 'United Kingdom', 'GBR', 'Scotland', 'Glasgow', 'regular', 70)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- CANADA (CAN) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Toronto', 'UofT', 'utoronto.ca', 'Canada', 'CAN', 'Ontario', 'Toronto', 'top_public', 1),
+('University of British Columbia', 'UBC', 'ubc.ca', 'Canada', 'CAN', 'British Columbia', 'Vancouver', 'top_public', 2),
+('McGill University', 'McGill', 'mcgill.ca', 'Canada', 'CAN', 'Quebec', 'Montreal', 'top_public', 3),
+('McMaster University', 'McMaster', 'mcmaster.ca', 'Canada', 'CAN', 'Ontario', 'Hamilton', 'top_public', 4),
+('University of Montreal', 'UdeM', 'umontreal.ca', 'Canada', 'CAN', 'Quebec', 'Montreal', 'top_public', 5),
+('University of Alberta', 'UAlberta', 'ualberta.ca', 'Canada', 'CAN', 'Alberta', 'Edmonton', 'top_public', 6),
+('University of Waterloo', 'Waterloo', 'uwaterloo.ca', 'Canada', 'CAN', 'Ontario', 'Waterloo', 'top_public', 7),
+('Western University', 'Western', 'uwo.ca', 'Canada', 'CAN', 'Ontario', 'London', 'top_public', 8),
+('University of Ottawa', 'uOttawa', 'uottawa.ca', 'Canada', 'CAN', 'Ontario', 'Ottawa', 'top_public', 9),
+('University of Calgary', 'UCalgary', 'ucalgary.ca', 'Canada', 'CAN', 'Alberta', 'Calgary', 'top_public', 10),
+('Queens University', 'Queens', 'queensu.ca', 'Canada', 'CAN', 'Ontario', 'Kingston', 'top_public', 11),
+('Dalhousie University', 'Dal', 'dal.ca', 'Canada', 'CAN', 'Nova Scotia', 'Halifax', 'top_public', 12),
+('Simon Fraser University', 'SFU', 'sfu.ca', 'Canada', 'CAN', 'British Columbia', 'Burnaby', 'top_public', 13),
+('University of Victoria', 'UVic', 'uvic.ca', 'Canada', 'CAN', 'British Columbia', 'Victoria', 'top_public', 14),
+('Laval University', 'Laval', 'ulaval.ca', 'Canada', 'CAN', 'Quebec', 'Quebec City', 'top_public', 15),
+('York University', 'York', 'yorku.ca', 'Canada', 'CAN', 'Ontario', 'Toronto', 'regular', 16),
+('University of Saskatchewan', 'USask', 'usask.ca', 'Canada', 'CAN', 'Saskatchewan', 'Saskatoon', 'regular', 17),
+('University of Manitoba', 'UManitoba', 'umanitoba.ca', 'Canada', 'CAN', 'Manitoba', 'Winnipeg', 'regular', 18),
+('Carleton University', 'Carleton', 'carleton.ca', 'Canada', 'CAN', 'Ontario', 'Ottawa', 'regular', 19),
+('Concordia University', 'Concordia', 'concordia.ca', 'Canada', 'CAN', 'Quebec', 'Montreal', 'regular', 20),
+('Ryerson University', 'Ryerson', 'ryerson.ca', 'Canada', 'CAN', 'Ontario', 'Toronto', 'regular', 21),
+('University of Guelph', 'Guelph', 'uoguelph.ca', 'Canada', 'CAN', 'Ontario', 'Guelph', 'regular', 22),
+-- More Canadian Universities
+('University of Windsor', 'Windsor', 'uwindsor.ca', 'Canada', 'CAN', 'Ontario', 'Windsor', 'regular', 23),
+('Wilfrid Laurier University', 'Laurier', 'wlu.ca', 'Canada', 'CAN', 'Ontario', 'Waterloo', 'regular', 24),
+('Brock University', 'Brock', 'brocku.ca', 'Canada', 'CAN', 'Ontario', 'St. Catharines', 'regular', 25),
+('University of Regina', 'Regina', 'uregina.ca', 'Canada', 'CAN', 'Saskatchewan', 'Regina', 'regular', 26),
+('Memorial University of Newfoundland', 'Memorial', 'mun.ca', 'Canada', 'CAN', 'Newfoundland', 'St. Johns', 'regular', 27),
+('University of New Brunswick', 'UNB', 'unb.ca', 'Canada', 'CAN', 'New Brunswick', 'Fredericton', 'regular', 28),
+('University of Lethbridge', 'ULethbridge', 'uleth.ca', 'Canada', 'CAN', 'Alberta', 'Lethbridge', 'regular', 29),
+('University of Prince Edward Island', 'UPEI', 'upei.ca', 'Canada', 'CAN', 'Prince Edward Island', 'Charlottetown', 'regular', 30),
+('Thompson Rivers University', 'TRU', 'tru.ca', 'Canada', 'CAN', 'British Columbia', 'Kamloops', 'regular', 31),
+('UQAM', 'UQAM', 'uqam.ca', 'Canada', 'CAN', 'Quebec', 'Montreal', 'regular', 32),
+('HEC Montreal', 'HEC Montreal', 'hec.ca', 'Canada', 'CAN', 'Quebec', 'Montreal', 'top_private', 1),
+('Ivey Business School', 'Ivey', 'ivey.uwo.ca', 'Canada', 'CAN', 'Ontario', 'London', 'top_private', 2),
+('Rotman School of Management', 'Rotman', 'rotman.utoronto.ca', 'Canada', 'CAN', 'Ontario', 'Toronto', 'top_private', 3),
+('Schulich School of Business', 'Schulich', 'schulich.yorku.ca', 'Canada', 'CAN', 'Ontario', 'Toronto', 'top_private', 4),
+('Desautels Faculty of Management', 'Desautels', 'mcgill.ca', 'Canada', 'CAN', 'Quebec', 'Montreal', 'top_private', 5),
+('OCAD University', 'OCAD', 'ocadu.ca', 'Canada', 'CAN', 'Ontario', 'Toronto', 'regular', 33),
+('Emily Carr University of Art and Design', 'Emily Carr', 'ecuad.ca', 'Canada', 'CAN', 'British Columbia', 'Vancouver', 'regular', 34),
+('Kwantlen Polytechnic University', 'KPU', 'kpu.ca', 'Canada', 'CAN', 'British Columbia', 'Surrey', 'regular', 35),
+('Athabasca University', 'Athabasca', 'athabascau.ca', 'Canada', 'CAN', 'Alberta', 'Athabasca', 'regular', 36),
+('Trent University', 'Trent', 'trentu.ca', 'Canada', 'CAN', 'Ontario', 'Peterborough', 'regular', 37),
+('Lakehead University', 'Lakehead', 'lakeheadu.ca', 'Canada', 'CAN', 'Ontario', 'Thunder Bay', 'regular', 38),
+('Nipissing University', 'Nipissing', 'nipissingu.ca', 'Canada', 'CAN', 'Ontario', 'North Bay', 'regular', 39),
+('St. Francis Xavier University', 'StFX', 'stfx.ca', 'Canada', 'CAN', 'Nova Scotia', 'Antigonish', 'regular', 40),
+('Mount Allison University', 'Mount Allison', 'mta.ca', 'Canada', 'CAN', 'New Brunswick', 'Sackville', 'regular', 41),
+('Acadia University', 'Acadia', 'acadiau.ca', 'Canada', 'CAN', 'Nova Scotia', 'Wolfville', 'regular', 42),
+('Saint Marys University', 'SMU', 'smu.ca', 'Canada', 'CAN', 'Nova Scotia', 'Halifax', 'regular', 43),
+('Bishop University', 'Bishop', 'ubishops.ca', 'Canada', 'CAN', 'Quebec', 'Sherbrooke', 'regular', 44),
+('Sherbrooke University', 'Sherbrooke', 'usherbrooke.ca', 'Canada', 'CAN', 'Quebec', 'Sherbrooke', 'top_public', 18)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- AUSTRALIA (AUS) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Melbourne', 'UniMelb', 'unimelb.edu.au', 'Australia', 'AUS', 'Victoria', 'Melbourne', 'top_public', 1),
+('University of Sydney', 'USyd', 'sydney.edu.au', 'Australia', 'AUS', 'New South Wales', 'Sydney', 'top_public', 2),
+('Australian National University', 'ANU', 'anu.edu.au', 'Australia', 'AUS', 'ACT', 'Canberra', 'top_public', 3),
+('University of Queensland', 'UQ', 'uq.edu.au', 'Australia', 'AUS', 'Queensland', 'Brisbane', 'top_public', 4),
+('UNSW Sydney', 'UNSW', 'unsw.edu.au', 'Australia', 'AUS', 'New South Wales', 'Sydney', 'top_public', 5),
+('Monash University', 'Monash', 'monash.edu', 'Australia', 'AUS', 'Victoria', 'Melbourne', 'top_public', 6),
+('University of Western Australia', 'UWA', 'uwa.edu.au', 'Australia', 'AUS', 'Western Australia', 'Perth', 'top_public', 7),
+('University of Adelaide', 'Adelaide', 'adelaide.edu.au', 'Australia', 'AUS', 'South Australia', 'Adelaide', 'top_public', 8),
+('University of Technology Sydney', 'UTS', 'uts.edu.au', 'Australia', 'AUS', 'New South Wales', 'Sydney', 'top_public', 9),
+('Macquarie University', 'Macquarie', 'mq.edu.au', 'Australia', 'AUS', 'New South Wales', 'Sydney', 'top_public', 10),
+('RMIT University', 'RMIT', 'rmit.edu.au', 'Australia', 'AUS', 'Victoria', 'Melbourne', 'regular', 11),
+('University of Newcastle', 'UoN', 'newcastle.edu.au', 'Australia', 'AUS', 'New South Wales', 'Newcastle', 'regular', 12),
+('Deakin University', 'Deakin', 'deakin.edu.au', 'Australia', 'AUS', 'Victoria', 'Geelong', 'regular', 13),
+('Queensland University of Technology', 'QUT', 'qut.edu.au', 'Australia', 'AUS', 'Queensland', 'Brisbane', 'regular', 14),
+('Curtin University', 'Curtin', 'curtin.edu.au', 'Australia', 'AUS', 'Western Australia', 'Perth', 'regular', 15),
+('University of Wollongong', 'UOW', 'uow.edu.au', 'Australia', 'AUS', 'New South Wales', 'Wollongong', 'regular', 16),
+('Griffith University', 'Griffith', 'griffith.edu.au', 'Australia', 'AUS', 'Queensland', 'Brisbane', 'regular', 17),
+('La Trobe University', 'La Trobe', 'latrobe.edu.au', 'Australia', 'AUS', 'Victoria', 'Melbourne', 'regular', 18),
+('Flinders University', 'Flinders', 'flinders.edu.au', 'Australia', 'AUS', 'South Australia', 'Adelaide', 'regular', 19),
+('James Cook University', 'JCU', 'jcu.edu.au', 'Australia', 'AUS', 'Queensland', 'Townsville', 'regular', 20),
+-- More Australian Universities
+('Australian Catholic University', 'ACU', 'acu.edu.au', 'Australia', 'AUS', 'Multiple', 'Sydney', 'regular', 21),
+('University of Tasmania', 'UTAS', 'utas.edu.au', 'Australia', 'AUS', 'Tasmania', 'Hobart', 'regular', 22),
+('University of Canberra', 'UC', 'canberra.edu.au', 'Australia', 'AUS', 'ACT', 'Canberra', 'regular', 23),
+('Bond University', 'Bond', 'bond.edu.au', 'Australia', 'AUS', 'Queensland', 'Gold Coast', 'top_private', 1),
+('Charles Sturt University', 'CSU', 'csu.edu.au', 'Australia', 'AUS', 'New South Wales', 'Bathurst', 'regular', 24),
+('Murdoch University', 'Murdoch', 'murdoch.edu.au', 'Australia', 'AUS', 'Western Australia', 'Perth', 'regular', 25),
+('University of South Australia', 'UniSA', 'unisa.edu.au', 'Australia', 'AUS', 'South Australia', 'Adelaide', 'regular', 26),
+('Western Sydney University', 'WSU', 'westernsydney.edu.au', 'Australia', 'AUS', 'New South Wales', 'Sydney', 'regular', 27),
+('Swinburne University of Technology', 'Swinburne', 'swinburne.edu.au', 'Australia', 'AUS', 'Victoria', 'Melbourne', 'regular', 28),
+('University of New England', 'UNE', 'une.edu.au', 'Australia', 'AUS', 'New South Wales', 'Armidale', 'regular', 29),
+('Victoria University', 'VU', 'vu.edu.au', 'Australia', 'AUS', 'Victoria', 'Melbourne', 'regular', 30),
+('Southern Cross University', 'SCU', 'scu.edu.au', 'Australia', 'AUS', 'New South Wales', 'Lismore', 'regular', 31),
+('CQUniversity', 'CQU', 'cqu.edu.au', 'Australia', 'AUS', 'Queensland', 'Rockhampton', 'regular', 32),
+('Edith Cowan University', 'ECU', 'ecu.edu.au', 'Australia', 'AUS', 'Western Australia', 'Perth', 'regular', 33),
+('Charles Darwin University', 'CDU', 'cdu.edu.au', 'Australia', 'AUS', 'Northern Territory', 'Darwin', 'regular', 34),
+('AGSM at UNSW Business School', 'AGSM', 'agsm.edu.au', 'Australia', 'AUS', 'New South Wales', 'Sydney', 'top_private', 2),
+('Melbourne Business School', 'MBS', 'mbs.edu', 'Australia', 'AUS', 'Victoria', 'Melbourne', 'top_private', 3),
+('Federation University Australia', 'FedUni', 'federation.edu.au', 'Australia', 'AUS', 'Victoria', 'Ballarat', 'regular', 35),
+('University of Southern Queensland', 'USQ', 'usq.edu.au', 'Australia', 'AUS', 'Queensland', 'Toowoomba', 'regular', 36),
+('University of the Sunshine Coast', 'USC', 'usc.edu.au', 'Australia', 'AUS', 'Queensland', 'Sunshine Coast', 'regular', 37),
+('Torrens University Australia', 'Torrens', 'torrens.edu.au', 'Australia', 'AUS', 'Multiple', 'Adelaide', 'regular', 38)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- GERMANY (DEU) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Technical University of Munich', 'TUM', 'tum.de', 'Germany', 'DEU', 'Bavaria', 'Munich', 'top_public', 1),
+('Ludwig Maximilian University of Munich', 'LMU', 'lmu.de', 'Germany', 'DEU', 'Bavaria', 'Munich', 'top_public', 2),
+('Heidelberg University', 'Heidelberg', 'uni-heidelberg.de', 'Germany', 'DEU', 'Baden-Wurttemberg', 'Heidelberg', 'top_public', 3),
+('Humboldt University of Berlin', 'HU Berlin', 'hu-berlin.de', 'Germany', 'DEU', 'Berlin', 'Berlin', 'top_public', 4),
+('Free University of Berlin', 'FU Berlin', 'fu-berlin.de', 'Germany', 'DEU', 'Berlin', 'Berlin', 'top_public', 5),
+('RWTH Aachen University', 'RWTH', 'rwth-aachen.de', 'Germany', 'DEU', 'North Rhine-Westphalia', 'Aachen', 'top_public', 6),
+('University of Freiburg', 'Freiburg', 'uni-freiburg.de', 'Germany', 'DEU', 'Baden-Wurttemberg', 'Freiburg', 'top_public', 7),
+('University of Tubingen', 'Tubingen', 'uni-tuebingen.de', 'Germany', 'DEU', 'Baden-Wurttemberg', 'Tubingen', 'top_public', 8),
+('University of Gottingen', 'Gottingen', 'uni-goettingen.de', 'Germany', 'DEU', 'Lower Saxony', 'Gottingen', 'top_public', 9),
+('Technical University of Berlin', 'TU Berlin', 'tu-berlin.de', 'Germany', 'DEU', 'Berlin', 'Berlin', 'top_public', 10),
+('University of Bonn', 'Bonn', 'uni-bonn.de', 'Germany', 'DEU', 'North Rhine-Westphalia', 'Bonn', 'top_public', 11),
+('University of Cologne', 'Cologne', 'uni-koeln.de', 'Germany', 'DEU', 'North Rhine-Westphalia', 'Cologne', 'top_public', 12),
+('University of Hamburg', 'Hamburg', 'uni-hamburg.de', 'Germany', 'DEU', 'Hamburg', 'Hamburg', 'top_public', 13),
+('University of Frankfurt', 'Frankfurt', 'uni-frankfurt.de', 'Germany', 'DEU', 'Hesse', 'Frankfurt', 'top_public', 14),
+('Karlsruhe Institute of Technology', 'KIT', 'kit.edu', 'Germany', 'DEU', 'Baden-Wurttemberg', 'Karlsruhe', 'top_public', 15),
+('TU Dresden', 'TU Dresden', 'tu-dresden.de', 'Germany', 'DEU', 'Saxony', 'Dresden', 'top_public', 16),
+('University of Stuttgart', 'Stuttgart', 'uni-stuttgart.de', 'Germany', 'DEU', 'Baden-Wurttemberg', 'Stuttgart', 'top_public', 17),
+('University of Mannheim', 'Mannheim', 'uni-mannheim.de', 'Germany', 'DEU', 'Baden-Wurttemberg', 'Mannheim', 'top_public', 18)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- JAPAN (JPN) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Tokyo', 'UTokyo', 'u-tokyo.ac.jp', 'Japan', 'JPN', 'Tokyo', 'Tokyo', 'top_public', 1),
+('Kyoto University', 'Kyodai', 'kyoto-u.ac.jp', 'Japan', 'JPN', 'Kyoto', 'Kyoto', 'top_public', 2),
+('Osaka University', 'Handai', 'osaka-u.ac.jp', 'Japan', 'JPN', 'Osaka', 'Osaka', 'top_public', 3),
+('Tokyo Institute of Technology', 'Tokyo Tech', 'titech.ac.jp', 'Japan', 'JPN', 'Tokyo', 'Tokyo', 'top_public', 4),
+('Tohoku University', 'Tohoku', 'tohoku.ac.jp', 'Japan', 'JPN', 'Miyagi', 'Sendai', 'top_public', 5),
+('Nagoya University', 'Meidai', 'nagoya-u.ac.jp', 'Japan', 'JPN', 'Aichi', 'Nagoya', 'top_public', 6),
+('Hokkaido University', 'Hokudai', 'hokudai.ac.jp', 'Japan', 'JPN', 'Hokkaido', 'Sapporo', 'top_public', 7),
+('Kyushu University', 'Kyudai', 'kyushu-u.ac.jp', 'Japan', 'JPN', 'Fukuoka', 'Fukuoka', 'top_public', 8),
+('Keio University', 'Keio', 'keio.ac.jp', 'Japan', 'JPN', 'Tokyo', 'Tokyo', 'top_private', 1),
+('Waseda University', 'Waseda', 'waseda.jp', 'Japan', 'JPN', 'Tokyo', 'Tokyo', 'top_private', 2),
+('Tsukuba University', 'Tsukuba', 'tsukuba.ac.jp', 'Japan', 'JPN', 'Ibaraki', 'Tsukuba', 'top_public', 9),
+('Hiroshima University', 'Hiroshima', 'hiroshima-u.ac.jp', 'Japan', 'JPN', 'Hiroshima', 'Hiroshima', 'top_public', 10),
+('Kobe University', 'Shindai', 'kobe-u.ac.jp', 'Japan', 'JPN', 'Hyogo', 'Kobe', 'top_public', 11),
+('Tokyo Metropolitan University', 'TMU', 'tmu.ac.jp', 'Japan', 'JPN', 'Tokyo', 'Tokyo', 'regular', 12),
+('Sophia University', 'Sophia', 'sophia.ac.jp', 'Japan', 'JPN', 'Tokyo', 'Tokyo', 'top_private', 3),
+('International Christian University', 'ICU', 'icu.ac.jp', 'Japan', 'JPN', 'Tokyo', 'Tokyo', 'top_private', 4)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- SOUTH KOREA (KOR) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Seoul National University', 'SNU', 'snu.ac.kr', 'South Korea', 'KOR', 'Seoul', 'Seoul', 'top_public', 1),
+('Korea Advanced Institute of Science and Technology', 'KAIST', 'kaist.ac.kr', 'South Korea', 'KOR', 'Daejeon', 'Daejeon', 'top_public', 2),
+('Pohang University of Science and Technology', 'POSTECH', 'postech.ac.kr', 'South Korea', 'KOR', 'Gyeongsang', 'Pohang', 'top_private', 1),
+('Yonsei University', 'Yonsei', 'yonsei.ac.kr', 'South Korea', 'KOR', 'Seoul', 'Seoul', 'top_private', 2),
+('Korea University', 'Korea', 'korea.ac.kr', 'South Korea', 'KOR', 'Seoul', 'Seoul', 'top_private', 3),
+('Sungkyunkwan University', 'SKKU', 'skku.edu', 'South Korea', 'KOR', 'Seoul', 'Seoul', 'top_private', 4),
+('Hanyang University', 'Hanyang', 'hanyang.ac.kr', 'South Korea', 'KOR', 'Seoul', 'Seoul', 'top_private', 5),
+('Sogang University', 'Sogang', 'sogang.ac.kr', 'South Korea', 'KOR', 'Seoul', 'Seoul', 'top_private', 6),
+('Ewha Womans University', 'Ewha', 'ewha.ac.kr', 'South Korea', 'KOR', 'Seoul', 'Seoul', 'top_private', 7),
+('Kyung Hee University', 'KHU', 'khu.ac.kr', 'South Korea', 'KOR', 'Seoul', 'Seoul', 'regular', 8),
+('Chung-Ang University', 'CAU', 'cau.ac.kr', 'South Korea', 'KOR', 'Seoul', 'Seoul', 'regular', 9),
+('Hankuk University of Foreign Studies', 'HUFS', 'hufs.ac.kr', 'South Korea', 'KOR', 'Seoul', 'Seoul', 'regular', 10),
+('Pusan National University', 'PNU', 'pusan.ac.kr', 'South Korea', 'KOR', 'Busan', 'Busan', 'top_public', 3),
+('Ulsan National Institute of Science and Technology', 'UNIST', 'unist.ac.kr', 'South Korea', 'KOR', 'Ulsan', 'Ulsan', 'top_public', 4)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- SINGAPORE (SGP) - Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('National University of Singapore', 'NUS', 'nus.edu.sg', 'Singapore', 'SGP', 'Singapore', 'Singapore', 'top_public', 1),
+('Nanyang Technological University', 'NTU', 'ntu.edu.sg', 'Singapore', 'SGP', 'Singapore', 'Singapore', 'top_public', 2),
+('Singapore Management University', 'SMU', 'smu.edu.sg', 'Singapore', 'SGP', 'Singapore', 'Singapore', 'top_private', 1),
+('Singapore University of Technology and Design', 'SUTD', 'sutd.edu.sg', 'Singapore', 'SGP', 'Singapore', 'Singapore', 'top_public', 3),
+('Singapore Institute of Technology', 'SIT', 'singaporetech.edu.sg', 'Singapore', 'SGP', 'Singapore', 'Singapore', 'regular', 4),
+('Singapore University of Social Sciences', 'SUSS', 'suss.edu.sg', 'Singapore', 'SGP', 'Singapore', 'Singapore', 'regular', 5)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- FRANCE (FRA) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Ecole Polytechnique', 'X', 'polytechnique.edu', 'France', 'FRA', 'Ile-de-France', 'Palaiseau', 'top_public', 1),
+('Ecole Normale Superieure Paris', 'ENS Paris', 'ens.psl.eu', 'France', 'FRA', 'Paris', 'Paris', 'top_public', 2),
+('Sorbonne University', 'Sorbonne', 'sorbonne-universite.fr', 'France', 'FRA', 'Paris', 'Paris', 'top_public', 3),
+('Paris Sciences et Lettres', 'PSL', 'psl.eu', 'France', 'FRA', 'Paris', 'Paris', 'top_public', 4),
+('HEC Paris', 'HEC', 'hec.edu', 'France', 'FRA', 'Ile-de-France', 'Jouy-en-Josas', 'top_private', 1),
+('INSEAD', 'INSEAD', 'insead.edu', 'France', 'FRA', 'Ile-de-France', 'Fontainebleau', 'top_private', 2),
+('Sciences Po', 'Sciences Po', 'sciencespo.fr', 'France', 'FRA', 'Paris', 'Paris', 'top_public', 5),
+('CentraleSupelec', 'CentraleSupelec', 'centralesupelec.fr', 'France', 'FRA', 'Ile-de-France', 'Gif-sur-Yvette', 'top_public', 6),
+('ESSEC Business School', 'ESSEC', 'essec.edu', 'France', 'FRA', 'Ile-de-France', 'Cergy', 'top_private', 3),
+('University of Paris-Saclay', 'Paris-Saclay', 'universite-paris-saclay.fr', 'France', 'FRA', 'Ile-de-France', 'Gif-sur-Yvette', 'top_public', 7),
+('Ecole des Ponts ParisTech', 'Ponts', 'enpc.fr', 'France', 'FRA', 'Ile-de-France', 'Champs-sur-Marne', 'top_public', 8),
+('Universite Grenoble Alpes', 'UGA', 'univ-grenoble-alpes.fr', 'France', 'FRA', 'Auvergne-Rhone-Alpes', 'Grenoble', 'top_public', 9),
+('University of Strasbourg', 'Unistra', 'unistra.fr', 'France', 'FRA', 'Grand Est', 'Strasbourg', 'top_public', 10),
+('Aix-Marseille University', 'AMU', 'univ-amu.fr', 'France', 'FRA', 'Provence', 'Marseille', 'top_public', 11)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- NETHERLANDS (NLD) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Delft University of Technology', 'TU Delft', 'tudelft.nl', 'Netherlands', 'NLD', 'South Holland', 'Delft', 'top_public', 1),
+('University of Amsterdam', 'UvA', 'uva.nl', 'Netherlands', 'NLD', 'North Holland', 'Amsterdam', 'top_public', 2),
+('Eindhoven University of Technology', 'TU/e', 'tue.nl', 'Netherlands', 'NLD', 'North Brabant', 'Eindhoven', 'top_public', 3),
+('Utrecht University', 'UU', 'uu.nl', 'Netherlands', 'NLD', 'Utrecht', 'Utrecht', 'top_public', 4),
+('Leiden University', 'Leiden', 'leidenuniv.nl', 'Netherlands', 'NLD', 'South Holland', 'Leiden', 'top_public', 5),
+('Erasmus University Rotterdam', 'EUR', 'eur.nl', 'Netherlands', 'NLD', 'South Holland', 'Rotterdam', 'top_public', 6),
+('University of Groningen', 'RUG', 'rug.nl', 'Netherlands', 'NLD', 'Groningen', 'Groningen', 'top_public', 7),
+('Vrije Universiteit Amsterdam', 'VU', 'vu.nl', 'Netherlands', 'NLD', 'North Holland', 'Amsterdam', 'top_public', 8),
+('Wageningen University', 'WUR', 'wur.nl', 'Netherlands', 'NLD', 'Gelderland', 'Wageningen', 'top_public', 9),
+('Radboud University', 'Radboud', 'ru.nl', 'Netherlands', 'NLD', 'Gelderland', 'Nijmegen', 'top_public', 10),
+('Maastricht University', 'UM', 'maastrichtuniversity.nl', 'Netherlands', 'NLD', 'Limburg', 'Maastricht', 'top_public', 11),
+('Tilburg University', 'Tilburg', 'tilburguniversity.edu', 'Netherlands', 'NLD', 'North Brabant', 'Tilburg', 'regular', 12),
+('University of Twente', 'UT', 'utwente.nl', 'Netherlands', 'NLD', 'Overijssel', 'Enschede', 'regular', 13)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- SWITZERLAND (CHE) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('ETH Zurich', 'ETH', 'ethz.ch', 'Switzerland', 'CHE', 'Zurich', 'Zurich', 'top_public', 1),
+('EPFL', 'EPFL', 'epfl.ch', 'Switzerland', 'CHE', 'Vaud', 'Lausanne', 'top_public', 2),
+('University of Zurich', 'UZH', 'uzh.ch', 'Switzerland', 'CHE', 'Zurich', 'Zurich', 'top_public', 3),
+('University of Geneva', 'UNIGE', 'unige.ch', 'Switzerland', 'CHE', 'Geneva', 'Geneva', 'top_public', 4),
+('University of Basel', 'Uni Basel', 'unibas.ch', 'Switzerland', 'CHE', 'Basel', 'Basel', 'top_public', 5),
+('University of Bern', 'UniBE', 'unibe.ch', 'Switzerland', 'CHE', 'Bern', 'Bern', 'top_public', 6),
+('University of Lausanne', 'UNIL', 'unil.ch', 'Switzerland', 'CHE', 'Vaud', 'Lausanne', 'top_public', 7),
+('University of St. Gallen', 'HSG', 'unisg.ch', 'Switzerland', 'CHE', 'St. Gallen', 'St. Gallen', 'top_private', 1)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- HONG KONG (HKG) - Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Hong Kong', 'HKU', 'hku.hk', 'Hong Kong', 'HKG', 'Hong Kong', 'Hong Kong', 'top_public', 1),
+('Chinese University of Hong Kong', 'CUHK', 'cuhk.edu.hk', 'Hong Kong', 'HKG', 'Hong Kong', 'Hong Kong', 'top_public', 2),
+('Hong Kong University of Science and Technology', 'HKUST', 'ust.hk', 'Hong Kong', 'HKG', 'Hong Kong', 'Hong Kong', 'top_public', 3),
+('City University of Hong Kong', 'CityU', 'cityu.edu.hk', 'Hong Kong', 'HKG', 'Hong Kong', 'Hong Kong', 'top_public', 4),
+('Hong Kong Polytechnic University', 'PolyU', 'polyu.edu.hk', 'Hong Kong', 'HKG', 'Hong Kong', 'Hong Kong', 'top_public', 5),
+('Hong Kong Baptist University', 'HKBU', 'hkbu.edu.hk', 'Hong Kong', 'HKG', 'Hong Kong', 'Hong Kong', 'regular', 6)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- UAE (ARE) - Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Khalifa University', 'KU', 'ku.ac.ae', 'UAE', 'ARE', 'Abu Dhabi', 'Abu Dhabi', 'top_public', 1),
+('United Arab Emirates University', 'UAEU', 'uaeu.ac.ae', 'UAE', 'ARE', 'Abu Dhabi', 'Al Ain', 'top_public', 2),
+('American University of Sharjah', 'AUS', 'aus.edu', 'UAE', 'ARE', 'Sharjah', 'Sharjah', 'top_private', 1),
+('New York University Abu Dhabi', 'NYUAD', 'nyu.edu', 'UAE', 'ARE', 'Abu Dhabi', 'Abu Dhabi', 'top_private', 2),
+('American University in Dubai', 'AUD', 'aud.edu', 'UAE', 'ARE', 'Dubai', 'Dubai', 'regular', 3)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- BRAZIL (BRA) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Sao Paulo', 'USP', 'usp.br', 'Brazil', 'BRA', 'Sao Paulo', 'Sao Paulo', 'top_public', 1),
+('University of Campinas', 'Unicamp', 'unicamp.br', 'Brazil', 'BRA', 'Sao Paulo', 'Campinas', 'top_public', 2),
+('Federal University of Rio de Janeiro', 'UFRJ', 'ufrj.br', 'Brazil', 'BRA', 'Rio de Janeiro', 'Rio de Janeiro', 'top_public', 3),
+('Federal University of Minas Gerais', 'UFMG', 'ufmg.br', 'Brazil', 'BRA', 'Minas Gerais', 'Belo Horizonte', 'top_public', 4),
+('Federal University of Rio Grande do Sul', 'UFRGS', 'ufrgs.br', 'Brazil', 'BRA', 'Rio Grande do Sul', 'Porto Alegre', 'top_public', 5),
+('Pontifical Catholic University of Rio de Janeiro', 'PUC-Rio', 'puc-rio.br', 'Brazil', 'BRA', 'Rio de Janeiro', 'Rio de Janeiro', 'top_private', 1),
+('Sao Paulo State University', 'UNESP', 'unesp.br', 'Brazil', 'BRA', 'Sao Paulo', 'Sao Paulo', 'top_public', 6),
+('Federal University of Parana', 'UFPR', 'ufpr.br', 'Brazil', 'BRA', 'Parana', 'Curitiba', 'top_public', 7)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- MEXICO (MEX) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('National Autonomous University of Mexico', 'UNAM', 'unam.mx', 'Mexico', 'MEX', 'Mexico City', 'Mexico City', 'top_public', 1),
+('Tecnologico de Monterrey', 'Tec', 'tec.mx', 'Mexico', 'MEX', 'Nuevo Leon', 'Monterrey', 'top_private', 1),
+('Instituto Politecnico Nacional', 'IPN', 'ipn.mx', 'Mexico', 'MEX', 'Mexico City', 'Mexico City', 'top_public', 2),
+('Universidad de Guadalajara', 'UDG', 'udg.mx', 'Mexico', 'MEX', 'Jalisco', 'Guadalajara', 'top_public', 3),
+('Instituto Tecnologico Autonomo de Mexico', 'ITAM', 'itam.mx', 'Mexico', 'MEX', 'Mexico City', 'Mexico City', 'top_private', 2),
+('Universidad Iberoamericana', 'Ibero', 'ibero.mx', 'Mexico', 'MEX', 'Mexico City', 'Mexico City', 'top_private', 3),
+('Benemerita Universidad Autonoma de Puebla', 'BUAP', 'buap.mx', 'Mexico', 'MEX', 'Puebla', 'Puebla', 'top_public', 4)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- ISRAEL (ISR) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Technion - Israel Institute of Technology', 'Technion', 'technion.ac.il', 'Israel', 'ISR', 'Haifa', 'Haifa', 'top_public', 1),
+('Hebrew University of Jerusalem', 'HUJI', 'huji.ac.il', 'Israel', 'ISR', 'Jerusalem', 'Jerusalem', 'top_public', 2),
+('Tel Aviv University', 'TAU', 'tau.ac.il', 'Israel', 'ISR', 'Tel Aviv', 'Tel Aviv', 'top_public', 3),
+('Weizmann Institute of Science', 'Weizmann', 'weizmann.ac.il', 'Israel', 'ISR', 'Central', 'Rehovot', 'top_public', 4),
+('Ben-Gurion University of the Negev', 'BGU', 'bgu.ac.il', 'Israel', 'ISR', 'Southern', 'Beer Sheva', 'top_public', 5),
+('University of Haifa', 'Haifa', 'haifa.ac.il', 'Israel', 'ISR', 'Haifa', 'Haifa', 'regular', 6),
+('Bar-Ilan University', 'BIU', 'biu.ac.il', 'Israel', 'ISR', 'Tel Aviv', 'Ramat Gan', 'regular', 7)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- NEW ZEALAND (NZL) - Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Auckland', 'Auckland', 'auckland.ac.nz', 'New Zealand', 'NZL', 'Auckland', 'Auckland', 'top_public', 1),
+('University of Otago', 'Otago', 'otago.ac.nz', 'New Zealand', 'NZL', 'Otago', 'Dunedin', 'top_public', 2),
+('Victoria University of Wellington', 'VUW', 'vuw.ac.nz', 'New Zealand', 'NZL', 'Wellington', 'Wellington', 'top_public', 3),
+('University of Canterbury', 'Canterbury', 'canterbury.ac.nz', 'New Zealand', 'NZL', 'Canterbury', 'Christchurch', 'top_public', 4),
+('Massey University', 'Massey', 'massey.ac.nz', 'New Zealand', 'NZL', 'Manawatu', 'Palmerston North', 'regular', 5),
+('University of Waikato', 'Waikato', 'waikato.ac.nz', 'New Zealand', 'NZL', 'Waikato', 'Hamilton', 'regular', 6),
+('Lincoln University', 'Lincoln', 'lincoln.ac.nz', 'New Zealand', 'NZL', 'Canterbury', 'Lincoln', 'regular', 7),
+('Auckland University of Technology', 'AUT', 'aut.ac.nz', 'New Zealand', 'NZL', 'Auckland', 'Auckland', 'regular', 8)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- IRELAND (IRL) - Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Trinity College Dublin', 'TCD', 'tcd.ie', 'Ireland', 'IRL', 'Dublin', 'Dublin', 'top_public', 1),
+('University College Dublin', 'UCD', 'ucd.ie', 'Ireland', 'IRL', 'Dublin', 'Dublin', 'top_public', 2),
+('National University of Ireland Galway', 'NUIG', 'nuigalway.ie', 'Ireland', 'IRL', 'Galway', 'Galway', 'top_public', 3),
+('University College Cork', 'UCC', 'ucc.ie', 'Ireland', 'IRL', 'Cork', 'Cork', 'top_public', 4),
+('Dublin City University', 'DCU', 'dcu.ie', 'Ireland', 'IRL', 'Dublin', 'Dublin', 'regular', 5),
+('University of Limerick', 'UL', 'ul.ie', 'Ireland', 'IRL', 'Limerick', 'Limerick', 'regular', 6),
+('Maynooth University', 'MU', 'maynoothuniversity.ie', 'Ireland', 'IRL', 'Kildare', 'Maynooth', 'regular', 7)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- SPAIN (ESP) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Barcelona', 'UB', 'ub.edu', 'Spain', 'ESP', 'Catalonia', 'Barcelona', 'top_public', 1),
+('Autonomous University of Barcelona', 'UAB', 'uab.cat', 'Spain', 'ESP', 'Catalonia', 'Barcelona', 'top_public', 2),
+('Complutense University of Madrid', 'UCM', 'ucm.es', 'Spain', 'ESP', 'Madrid', 'Madrid', 'top_public', 3),
+('Autonomous University of Madrid', 'UAM', 'uam.es', 'Spain', 'ESP', 'Madrid', 'Madrid', 'top_public', 4),
+('Pompeu Fabra University', 'UPF', 'upf.edu', 'Spain', 'ESP', 'Catalonia', 'Barcelona', 'top_public', 5),
+('University of Valencia', 'UV', 'uv.es', 'Spain', 'ESP', 'Valencia', 'Valencia', 'top_public', 6),
+('Polytechnic University of Catalonia', 'UPC', 'upc.edu', 'Spain', 'ESP', 'Catalonia', 'Barcelona', 'top_public', 7),
+('Polytechnic University of Madrid', 'UPM', 'upm.es', 'Spain', 'ESP', 'Madrid', 'Madrid', 'top_public', 8),
+('University of Granada', 'UGR', 'ugr.es', 'Spain', 'ESP', 'Andalusia', 'Granada', 'top_public', 9),
+('University of Seville', 'US', 'us.es', 'Spain', 'ESP', 'Andalusia', 'Seville', 'top_public', 10),
+('Carlos III University of Madrid', 'UC3M', 'uc3m.es', 'Spain', 'ESP', 'Madrid', 'Madrid', 'top_public', 11),
+('IE University', 'IE', 'ie.edu', 'Spain', 'ESP', 'Segovia', 'Segovia', 'top_private', 1),
+('ESADE Business School', 'ESADE', 'esade.edu', 'Spain', 'ESP', 'Catalonia', 'Barcelona', 'top_private', 2),
+('IESE Business School', 'IESE', 'iese.edu', 'Spain', 'ESP', 'Catalonia', 'Barcelona', 'top_private', 3),
+('University of Navarra', 'UNAV', 'unav.edu', 'Spain', 'ESP', 'Navarra', 'Pamplona', 'top_private', 4),
+('Ramon Llull University', 'URL', 'url.edu', 'Spain', 'ESP', 'Catalonia', 'Barcelona', 'regular', 12),
+('University of the Basque Country', 'UPV/EHU', 'ehu.eus', 'Spain', 'ESP', 'Basque Country', 'Bilbao', 'top_public', 13),
+('University of Salamanca', 'USAL', 'usal.es', 'Spain', 'ESP', 'Castile and Leon', 'Salamanca', 'regular', 14),
+('University of Zaragoza', 'UNIZAR', 'unizar.es', 'Spain', 'ESP', 'Aragon', 'Zaragoza', 'regular', 15)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- ITALY (ITA) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Politecnico di Milano', 'PoliMi', 'polimi.it', 'Italy', 'ITA', 'Lombardy', 'Milan', 'top_public', 1),
+('University of Bologna', 'UNIBO', 'unibo.it', 'Italy', 'ITA', 'Emilia-Romagna', 'Bologna', 'top_public', 2),
+('Sapienza University of Rome', 'Sapienza', 'uniroma1.it', 'Italy', 'ITA', 'Lazio', 'Rome', 'top_public', 3),
+('Politecnico di Torino', 'PoliTo', 'polito.it', 'Italy', 'ITA', 'Piedmont', 'Turin', 'top_public', 4),
+('University of Milan', 'UNIMI', 'unimi.it', 'Italy', 'ITA', 'Lombardy', 'Milan', 'top_public', 5),
+('University of Padua', 'UNIPD', 'unipd.it', 'Italy', 'ITA', 'Veneto', 'Padua', 'top_public', 6),
+('University of Pisa', 'UNIPI', 'unipi.it', 'Italy', 'ITA', 'Tuscany', 'Pisa', 'top_public', 7),
+('University of Florence', 'UNIFI', 'unifi.it', 'Italy', 'ITA', 'Tuscany', 'Florence', 'top_public', 8),
+('University of Turin', 'UNITO', 'unito.it', 'Italy', 'ITA', 'Piedmont', 'Turin', 'top_public', 9),
+('University of Naples Federico II', 'UNINA', 'unina.it', 'Italy', 'ITA', 'Campania', 'Naples', 'top_public', 10),
+('Bocconi University', 'Bocconi', 'unibocconi.it', 'Italy', 'ITA', 'Lombardy', 'Milan', 'top_private', 1),
+('LUISS', 'LUISS', 'luiss.it', 'Italy', 'ITA', 'Lazio', 'Rome', 'top_private', 2),
+('Catholic University of Milan', 'Cattolica', 'unicatt.it', 'Italy', 'ITA', 'Lombardy', 'Milan', 'top_private', 3),
+('Scuola Normale Superiore', 'SNS', 'sns.it', 'Italy', 'ITA', 'Tuscany', 'Pisa', 'top_public', 11),
+('SDA Bocconi School of Management', 'SDA Bocconi', 'sdabocconi.it', 'Italy', 'ITA', 'Lombardy', 'Milan', 'top_private', 4),
+('University of Trento', 'UNITN', 'unitn.it', 'Italy', 'ITA', 'Trentino', 'Trento', 'top_public', 12),
+('University of Genoa', 'UNIGE', 'unige.it', 'Italy', 'ITA', 'Liguria', 'Genoa', 'regular', 13),
+('University of Trieste', 'UNITS', 'units.it', 'Italy', 'ITA', 'Friuli-Venezia Giulia', 'Trieste', 'regular', 14),
+('Ca Foscari University of Venice', 'UNIVE', 'unive.it', 'Italy', 'ITA', 'Veneto', 'Venice', 'regular', 15)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- SWEDEN (SWE) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('KTH Royal Institute of Technology', 'KTH', 'kth.se', 'Sweden', 'SWE', 'Stockholm', 'Stockholm', 'top_public', 1),
+('Karolinska Institute', 'KI', 'ki.se', 'Sweden', 'SWE', 'Stockholm', 'Stockholm', 'top_public', 2),
+('Lund University', 'Lund', 'lu.se', 'Sweden', 'SWE', 'Skane', 'Lund', 'top_public', 3),
+('Uppsala University', 'Uppsala', 'uu.se', 'Sweden', 'SWE', 'Uppsala', 'Uppsala', 'top_public', 4),
+('Stockholm University', 'SU', 'su.se', 'Sweden', 'SWE', 'Stockholm', 'Stockholm', 'top_public', 5),
+('Chalmers University of Technology', 'Chalmers', 'chalmers.se', 'Sweden', 'SWE', 'Vastra Gotaland', 'Gothenburg', 'top_public', 6),
+('University of Gothenburg', 'GU', 'gu.se', 'Sweden', 'SWE', 'Vastra Gotaland', 'Gothenburg', 'top_public', 7),
+('Stockholm School of Economics', 'SSE', 'hhs.se', 'Sweden', 'SWE', 'Stockholm', 'Stockholm', 'top_private', 1),
+('Linkoping University', 'LiU', 'liu.se', 'Sweden', 'SWE', 'Ostergotland', 'Linkoping', 'top_public', 8),
+('Umea University', 'Umea', 'umu.se', 'Sweden', 'SWE', 'Vasterbotten', 'Umea', 'regular', 9),
+('Lulea University of Technology', 'LTU', 'ltu.se', 'Sweden', 'SWE', 'Norrbotten', 'Lulea', 'regular', 10),
+('Orebro University', 'Orebro', 'oru.se', 'Sweden', 'SWE', 'Orebro', 'Orebro', 'regular', 11),
+('Swedish University of Agricultural Sciences', 'SLU', 'slu.se', 'Sweden', 'SWE', 'Uppsala', 'Uppsala', 'regular', 12)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- DENMARK (DNK) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Copenhagen', 'KU', 'ku.dk', 'Denmark', 'DNK', 'Capital Region', 'Copenhagen', 'top_public', 1),
+('Technical University of Denmark', 'DTU', 'dtu.dk', 'Denmark', 'DNK', 'Capital Region', 'Lyngby', 'top_public', 2),
+('Aarhus University', 'AU', 'au.dk', 'Denmark', 'DNK', 'Central Jutland', 'Aarhus', 'top_public', 3),
+('Copenhagen Business School', 'CBS', 'cbs.dk', 'Denmark', 'DNK', 'Capital Region', 'Copenhagen', 'top_public', 4),
+('University of Southern Denmark', 'SDU', 'sdu.dk', 'Denmark', 'DNK', 'Southern Denmark', 'Odense', 'top_public', 5),
+('Aalborg University', 'AAU', 'aau.dk', 'Denmark', 'DNK', 'North Jutland', 'Aalborg', 'regular', 6),
+('IT University of Copenhagen', 'ITU', 'itu.dk', 'Denmark', 'DNK', 'Capital Region', 'Copenhagen', 'regular', 7),
+('Roskilde University', 'RUC', 'ruc.dk', 'Denmark', 'DNK', 'Zealand', 'Roskilde', 'regular', 8)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- NORWAY (NOR) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Oslo', 'UiO', 'uio.no', 'Norway', 'NOR', 'Oslo', 'Oslo', 'top_public', 1),
+('Norwegian University of Science and Technology', 'NTNU', 'ntnu.no', 'Norway', 'NOR', 'Trondelag', 'Trondheim', 'top_public', 2),
+('University of Bergen', 'UiB', 'uib.no', 'Norway', 'NOR', 'Vestland', 'Bergen', 'top_public', 3),
+('Norwegian School of Economics', 'NHH', 'nhh.no', 'Norway', 'NOR', 'Vestland', 'Bergen', 'top_public', 4),
+('UiT The Arctic University of Norway', 'UiT', 'uit.no', 'Norway', 'NOR', 'Troms', 'Tromso', 'regular', 5),
+('University of Stavanger', 'UiS', 'uis.no', 'Norway', 'NOR', 'Rogaland', 'Stavanger', 'regular', 6),
+('BI Norwegian Business School', 'BI', 'bi.no', 'Norway', 'NOR', 'Oslo', 'Oslo', 'top_private', 1),
+('Norwegian University of Life Sciences', 'NMBU', 'nmbu.no', 'Norway', 'NOR', 'Viken', 'As', 'regular', 7)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- FINLAND (FIN) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Helsinki', 'UH', 'helsinki.fi', 'Finland', 'FIN', 'Uusimaa', 'Helsinki', 'top_public', 1),
+('Aalto University', 'Aalto', 'aalto.fi', 'Finland', 'FIN', 'Uusimaa', 'Espoo', 'top_public', 2),
+('University of Turku', 'UTU', 'utu.fi', 'Finland', 'FIN', 'Southwest Finland', 'Turku', 'top_public', 3),
+('University of Oulu', 'Oulu', 'oulu.fi', 'Finland', 'FIN', 'North Ostrobothnia', 'Oulu', 'top_public', 4),
+('Tampere University', 'TAU', 'tuni.fi', 'Finland', 'FIN', 'Pirkanmaa', 'Tampere', 'top_public', 5),
+('University of Jyvaskyla', 'JYU', 'jyu.fi', 'Finland', 'FIN', 'Central Finland', 'Jyvaskyla', 'regular', 6),
+('Lappeenranta University of Technology', 'LUT', 'lut.fi', 'Finland', 'FIN', 'South Karelia', 'Lappeenranta', 'regular', 7),
+('Abo Akademi University', 'AAU', 'abo.fi', 'Finland', 'FIN', 'Southwest Finland', 'Turku', 'regular', 8),
+('Hanken School of Economics', 'Hanken', 'hanken.fi', 'Finland', 'FIN', 'Uusimaa', 'Helsinki', 'top_private', 1)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- AUSTRIA (AUT) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Vienna', 'UniWien', 'univie.ac.at', 'Austria', 'AUT', 'Vienna', 'Vienna', 'top_public', 1),
+('Vienna University of Technology', 'TU Wien', 'tuwien.ac.at', 'Austria', 'AUT', 'Vienna', 'Vienna', 'top_public', 2),
+('University of Innsbruck', 'UIBK', 'uibk.ac.at', 'Austria', 'AUT', 'Tyrol', 'Innsbruck', 'top_public', 3),
+('Vienna University of Economics and Business', 'WU', 'wu.ac.at', 'Austria', 'AUT', 'Vienna', 'Vienna', 'top_public', 4),
+('University of Graz', 'UniGraz', 'uni-graz.at', 'Austria', 'AUT', 'Styria', 'Graz', 'top_public', 5),
+('Graz University of Technology', 'TU Graz', 'tugraz.at', 'Austria', 'AUT', 'Styria', 'Graz', 'top_public', 6),
+('Johannes Kepler University Linz', 'JKU', 'jku.at', 'Austria', 'AUT', 'Upper Austria', 'Linz', 'regular', 7),
+('University of Salzburg', 'UniSBG', 'sbg.ac.at', 'Austria', 'AUT', 'Salzburg', 'Salzburg', 'regular', 8),
+('Medical University of Vienna', 'MUW', 'meduniwien.ac.at', 'Austria', 'AUT', 'Vienna', 'Vienna', 'top_public', 9)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- BELGIUM (BEL) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('KU Leuven', 'KU Leuven', 'kuleuven.be', 'Belgium', 'BEL', 'Flemish Brabant', 'Leuven', 'top_public', 1),
+('Ghent University', 'UGent', 'ugent.be', 'Belgium', 'BEL', 'East Flanders', 'Ghent', 'top_public', 2),
+('Universite Libre de Bruxelles', 'ULB', 'ulb.be', 'Belgium', 'BEL', 'Brussels', 'Brussels', 'top_public', 3),
+('Vrije Universiteit Brussel', 'VUB', 'vub.be', 'Belgium', 'BEL', 'Brussels', 'Brussels', 'top_public', 4),
+('UCLouvain', 'UCLouvain', 'uclouvain.be', 'Belgium', 'BEL', 'Walloon Brabant', 'Louvain-la-Neuve', 'top_public', 5),
+('University of Antwerp', 'UAntwerp', 'uantwerpen.be', 'Belgium', 'BEL', 'Antwerp', 'Antwerp', 'top_public', 6),
+('University of Liege', 'ULiege', 'uliege.be', 'Belgium', 'BEL', 'Liege', 'Liege', 'regular', 7),
+('Hasselt University', 'UHasselt', 'uhasselt.be', 'Belgium', 'BEL', 'Limburg', 'Hasselt', 'regular', 8),
+('Vlerick Business School', 'Vlerick', 'vlerick.com', 'Belgium', 'BEL', 'East Flanders', 'Ghent', 'top_private', 1),
+('Solvay Brussels School', 'Solvay', 'solvay.edu', 'Belgium', 'BEL', 'Brussels', 'Brussels', 'top_private', 2)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- POLAND (POL) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Warsaw', 'UW', 'uw.edu.pl', 'Poland', 'POL', 'Masovia', 'Warsaw', 'top_public', 1),
+('Jagiellonian University', 'UJ', 'uj.edu.pl', 'Poland', 'POL', 'Lesser Poland', 'Krakow', 'top_public', 2),
+('Warsaw University of Technology', 'PW', 'pw.edu.pl', 'Poland', 'POL', 'Masovia', 'Warsaw', 'top_public', 3),
+('AGH University of Science and Technology', 'AGH', 'agh.edu.pl', 'Poland', 'POL', 'Lesser Poland', 'Krakow', 'top_public', 4),
+('Adam Mickiewicz University', 'UAM', 'amu.edu.pl', 'Poland', 'POL', 'Greater Poland', 'Poznan', 'top_public', 5),
+('University of Wroclaw', 'UWr', 'uni.wroc.pl', 'Poland', 'POL', 'Lower Silesia', 'Wroclaw', 'top_public', 6),
+('Wroclaw University of Science and Technology', 'PWr', 'pwr.edu.pl', 'Poland', 'POL', 'Lower Silesia', 'Wroclaw', 'top_public', 7),
+('Gdansk University of Technology', 'PG', 'pg.edu.pl', 'Poland', 'POL', 'Pomerania', 'Gdansk', 'top_public', 8),
+('Poznan University of Technology', 'PUT', 'put.poznan.pl', 'Poland', 'POL', 'Greater Poland', 'Poznan', 'regular', 9),
+('Lodz University of Technology', 'PL', 'p.lodz.pl', 'Poland', 'POL', 'Lodz', 'Lodz', 'regular', 10),
+('Warsaw School of Economics', 'SGH', 'sgh.waw.pl', 'Poland', 'POL', 'Masovia', 'Warsaw', 'top_public', 11),
+('Kozminski University', 'Kozminski', 'kozminski.edu.pl', 'Poland', 'POL', 'Masovia', 'Warsaw', 'top_private', 1)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- CZECH REPUBLIC (CZE) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Charles University', 'CUNI', 'cuni.cz', 'Czech Republic', 'CZE', 'Prague', 'Prague', 'top_public', 1),
+('Czech Technical University in Prague', 'CTU', 'cvut.cz', 'Czech Republic', 'CZE', 'Prague', 'Prague', 'top_public', 2),
+('Masaryk University', 'MUNI', 'muni.cz', 'Czech Republic', 'CZE', 'South Moravia', 'Brno', 'top_public', 3),
+('Brno University of Technology', 'VUT', 'vutbr.cz', 'Czech Republic', 'CZE', 'South Moravia', 'Brno', 'top_public', 4),
+('Palacky University Olomouc', 'UPOL', 'upol.cz', 'Czech Republic', 'CZE', 'Olomouc', 'Olomouc', 'regular', 5),
+('University of Chemistry and Technology Prague', 'UCT', 'vscht.cz', 'Czech Republic', 'CZE', 'Prague', 'Prague', 'regular', 6),
+('Prague School of Economics', 'VSE', 'vse.cz', 'Czech Republic', 'CZE', 'Prague', 'Prague', 'regular', 7)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- RUSSIA (RUS) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Lomonosov Moscow State University', 'MSU', 'msu.ru', 'Russia', 'RUS', 'Moscow', 'Moscow', 'top_public', 1),
+('Saint Petersburg State University', 'SPbU', 'spbu.ru', 'Russia', 'RUS', 'Saint Petersburg', 'Saint Petersburg', 'top_public', 2),
+('Moscow Institute of Physics and Technology', 'MIPT', 'mipt.ru', 'Russia', 'RUS', 'Moscow Oblast', 'Dolgoprudny', 'top_public', 3),
+('HSE University', 'HSE', 'hse.ru', 'Russia', 'RUS', 'Moscow', 'Moscow', 'top_public', 4),
+('Novosibirsk State University', 'NSU', 'nsu.ru', 'Russia', 'RUS', 'Novosibirsk Oblast', 'Novosibirsk', 'top_public', 5),
+('Bauman Moscow State Technical University', 'BMSTU', 'bmstu.ru', 'Russia', 'RUS', 'Moscow', 'Moscow', 'top_public', 6),
+('ITMO University', 'ITMO', 'itmo.ru', 'Russia', 'RUS', 'Saint Petersburg', 'Saint Petersburg', 'top_public', 7),
+('Peter the Great St.Petersburg Polytechnic University', 'SPbPU', 'spbstu.ru', 'Russia', 'RUS', 'Saint Petersburg', 'Saint Petersburg', 'top_public', 8),
+('Kazan Federal University', 'KFU', 'kpfu.ru', 'Russia', 'RUS', 'Tatarstan', 'Kazan', 'regular', 9),
+('Ural Federal University', 'UrFU', 'urfu.ru', 'Russia', 'RUS', 'Sverdlovsk Oblast', 'Yekaterinburg', 'regular', 10),
+('Tomsk State University', 'TSU', 'tsu.ru', 'Russia', 'RUS', 'Tomsk Oblast', 'Tomsk', 'regular', 11),
+('Moscow State Institute of International Relations', 'MGIMO', 'mgimo.ru', 'Russia', 'RUS', 'Moscow', 'Moscow', 'top_public', 12),
+('Skolkovo Institute of Science and Technology', 'Skoltech', 'skoltech.ru', 'Russia', 'RUS', 'Moscow Oblast', 'Moscow', 'top_private', 1)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- TURKEY (TUR) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Bogazici University', 'Bogazici', 'boun.edu.tr', 'Turkey', 'TUR', 'Istanbul', 'Istanbul', 'top_public', 1),
+('Middle East Technical University', 'METU', 'metu.edu.tr', 'Turkey', 'TUR', 'Ankara', 'Ankara', 'top_public', 2),
+('Istanbul Technical University', 'ITU', 'itu.edu.tr', 'Turkey', 'TUR', 'Istanbul', 'Istanbul', 'top_public', 3),
+('Bilkent University', 'Bilkent', 'bilkent.edu.tr', 'Turkey', 'TUR', 'Ankara', 'Ankara', 'top_private', 1),
+('Koc University', 'Koc', 'ku.edu.tr', 'Turkey', 'TUR', 'Istanbul', 'Istanbul', 'top_private', 2),
+('Sabanci University', 'Sabanci', 'sabanciuniv.edu', 'Turkey', 'TUR', 'Istanbul', 'Istanbul', 'top_private', 3),
+('Hacettepe University', 'Hacettepe', 'hacettepe.edu.tr', 'Turkey', 'TUR', 'Ankara', 'Ankara', 'top_public', 4),
+('Istanbul University', 'IU', 'istanbul.edu.tr', 'Turkey', 'TUR', 'Istanbul', 'Istanbul', 'top_public', 5),
+('Ankara University', 'AU', 'ankara.edu.tr', 'Turkey', 'TUR', 'Ankara', 'Ankara', 'regular', 6),
+('Ege University', 'Ege', 'ege.edu.tr', 'Turkey', 'TUR', 'Izmir', 'Izmir', 'regular', 7)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- MALAYSIA (MYS) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Malaya', 'UM', 'um.edu.my', 'Malaysia', 'MYS', 'Kuala Lumpur', 'Kuala Lumpur', 'top_public', 1),
+('Universiti Putra Malaysia', 'UPM', 'upm.edu.my', 'Malaysia', 'MYS', 'Selangor', 'Serdang', 'top_public', 2),
+('Universiti Kebangsaan Malaysia', 'UKM', 'ukm.my', 'Malaysia', 'MYS', 'Selangor', 'Bangi', 'top_public', 3),
+('Universiti Sains Malaysia', 'USM', 'usm.my', 'Malaysia', 'MYS', 'Penang', 'Penang', 'top_public', 4),
+('Universiti Teknologi Malaysia', 'UTM', 'utm.my', 'Malaysia', 'MYS', 'Johor', 'Johor Bahru', 'top_public', 5),
+('Monash University Malaysia', 'Monash MY', 'monash.edu.my', 'Malaysia', 'MYS', 'Selangor', 'Subang Jaya', 'top_private', 1),
+('University of Nottingham Malaysia', 'UNM', 'nottingham.edu.my', 'Malaysia', 'MYS', 'Selangor', 'Semenyih', 'top_private', 2),
+('Taylor University', 'Taylor', 'taylors.edu.my', 'Malaysia', 'MYS', 'Selangor', 'Subang Jaya', 'top_private', 3),
+('Multimedia University', 'MMU', 'mmu.edu.my', 'Malaysia', 'MYS', 'Selangor', 'Cyberjaya', 'regular', 6),
+('Asia Pacific University', 'APU', 'apu.edu.my', 'Malaysia', 'MYS', 'Kuala Lumpur', 'Kuala Lumpur', 'regular', 7)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- THAILAND (THA) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Chulalongkorn University', 'Chula', 'chula.ac.th', 'Thailand', 'THA', 'Bangkok', 'Bangkok', 'top_public', 1),
+('Mahidol University', 'Mahidol', 'mahidol.ac.th', 'Thailand', 'THA', 'Nakhon Pathom', 'Salaya', 'top_public', 2),
+('Kasetsart University', 'KU', 'ku.ac.th', 'Thailand', 'THA', 'Bangkok', 'Bangkok', 'top_public', 3),
+('Chiang Mai University', 'CMU', 'cmu.ac.th', 'Thailand', 'THA', 'Chiang Mai', 'Chiang Mai', 'top_public', 4),
+('Thammasat University', 'TU', 'tu.ac.th', 'Thailand', 'THA', 'Bangkok', 'Bangkok', 'top_public', 5),
+('King Mongkuts University of Technology Thonburi', 'KMUTT', 'kmutt.ac.th', 'Thailand', 'THA', 'Bangkok', 'Bangkok', 'top_public', 6),
+('Prince of Songkla University', 'PSU', 'psu.ac.th', 'Thailand', 'THA', 'Songkhla', 'Hat Yai', 'regular', 7),
+('Asian Institute of Technology', 'AIT', 'ait.ac.th', 'Thailand', 'THA', 'Pathum Thani', 'Pathum Thani', 'top_private', 1),
+('Assumption University', 'AU', 'au.edu', 'Thailand', 'THA', 'Samut Prakan', 'Bang Na', 'regular', 8)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- PHILIPPINES (PHL) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of the Philippines Diliman', 'UP Diliman', 'upd.edu.ph', 'Philippines', 'PHL', 'Metro Manila', 'Quezon City', 'top_public', 1),
+('Ateneo de Manila University', 'ADMU', 'ateneo.edu', 'Philippines', 'PHL', 'Metro Manila', 'Quezon City', 'top_private', 1),
+('De La Salle University', 'DLSU', 'dlsu.edu.ph', 'Philippines', 'PHL', 'Metro Manila', 'Manila', 'top_private', 2),
+('University of Santo Tomas', 'UST', 'ust.edu.ph', 'Philippines', 'PHL', 'Metro Manila', 'Manila', 'top_private', 3),
+('University of the Philippines Los Banos', 'UPLB', 'uplb.edu.ph', 'Philippines', 'PHL', 'Laguna', 'Los Banos', 'top_public', 2),
+('Mapua University', 'Mapua', 'mapua.edu.ph', 'Philippines', 'PHL', 'Metro Manila', 'Manila', 'regular', 3),
+('Asian Institute of Management', 'AIM', 'aim.edu', 'Philippines', 'PHL', 'Metro Manila', 'Makati', 'top_private', 4)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- INDONESIA (IDN) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Indonesia', 'UI', 'ui.ac.id', 'Indonesia', 'IDN', 'West Java', 'Depok', 'top_public', 1),
+('Bandung Institute of Technology', 'ITB', 'itb.ac.id', 'Indonesia', 'IDN', 'West Java', 'Bandung', 'top_public', 2),
+('Gadjah Mada University', 'UGM', 'ugm.ac.id', 'Indonesia', 'IDN', 'Yogyakarta', 'Yogyakarta', 'top_public', 3),
+('Bogor Agricultural University', 'IPB', 'ipb.ac.id', 'Indonesia', 'IDN', 'West Java', 'Bogor', 'top_public', 4),
+('Airlangga University', 'UNAIR', 'unair.ac.id', 'Indonesia', 'IDN', 'East Java', 'Surabaya', 'top_public', 5),
+('Sepuluh Nopember Institute of Technology', 'ITS', 'its.ac.id', 'Indonesia', 'IDN', 'East Java', 'Surabaya', 'top_public', 6),
+('Bina Nusantara University', 'BINUS', 'binus.edu', 'Indonesia', 'IDN', 'Jakarta', 'Jakarta', 'top_private', 1),
+('Universitas Pelita Harapan', 'UPH', 'uph.edu', 'Indonesia', 'IDN', 'Banten', 'Tangerang', 'regular', 7),
+('Telkom University', 'Tel-U', 'telkomuniversity.ac.id', 'Indonesia', 'IDN', 'West Java', 'Bandung', 'regular', 8)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- VIETNAM (VNM) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Vietnam National University Hanoi', 'VNU', 'vnu.edu.vn', 'Vietnam', 'VNM', 'Hanoi', 'Hanoi', 'top_public', 1),
+('Vietnam National University Ho Chi Minh City', 'VNU-HCM', 'vnuhcm.edu.vn', 'Vietnam', 'VNM', 'Ho Chi Minh City', 'Ho Chi Minh City', 'top_public', 2),
+('Hanoi University of Science and Technology', 'HUST', 'hust.edu.vn', 'Vietnam', 'VNM', 'Hanoi', 'Hanoi', 'top_public', 3),
+('Ho Chi Minh City University of Technology', 'HCMUT', 'hcmut.edu.vn', 'Vietnam', 'VNM', 'Ho Chi Minh City', 'Ho Chi Minh City', 'top_public', 4),
+('Foreign Trade University', 'FTU', 'ftu.edu.vn', 'Vietnam', 'VNM', 'Hanoi', 'Hanoi', 'regular', 5),
+('Ton Duc Thang University', 'TDTU', 'tdtu.edu.vn', 'Vietnam', 'VNM', 'Ho Chi Minh City', 'Ho Chi Minh City', 'regular', 6),
+('RMIT University Vietnam', 'RMIT VN', 'rmit.edu.vn', 'Vietnam', 'VNM', 'Ho Chi Minh City', 'Ho Chi Minh City', 'top_private', 1)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- ARGENTINA (ARG) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Buenos Aires', 'UBA', 'uba.ar', 'Argentina', 'ARG', 'Buenos Aires', 'Buenos Aires', 'top_public', 1),
+('Instituto Tecnologico de Buenos Aires', 'ITBA', 'itba.edu.ar', 'Argentina', 'ARG', 'Buenos Aires', 'Buenos Aires', 'top_private', 1),
+('Universidad Austral', 'Austral', 'austral.edu.ar', 'Argentina', 'ARG', 'Buenos Aires', 'Pilar', 'top_private', 2),
+('Universidad Torcuato Di Tella', 'UTDT', 'utdt.edu', 'Argentina', 'ARG', 'Buenos Aires', 'Buenos Aires', 'top_private', 3),
+('Universidad de San Andres', 'UdeSA', 'udesa.edu.ar', 'Argentina', 'ARG', 'Buenos Aires', 'Victoria', 'top_private', 4),
+('National University of Cordoba', 'UNC', 'unc.edu.ar', 'Argentina', 'ARG', 'Cordoba', 'Cordoba', 'top_public', 2),
+('National University of La Plata', 'UNLP', 'unlp.edu.ar', 'Argentina', 'ARG', 'Buenos Aires', 'La Plata', 'top_public', 3),
+('IAE Business School', 'IAE', 'iae.edu.ar', 'Argentina', 'ARG', 'Buenos Aires', 'Pilar', 'top_private', 5)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- CHILE (CHL) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Pontificia Universidad Catolica de Chile', 'PUC', 'uc.cl', 'Chile', 'CHL', 'Santiago', 'Santiago', 'top_private', 1),
+('Universidad de Chile', 'UChile', 'uchile.cl', 'Chile', 'CHL', 'Santiago', 'Santiago', 'top_public', 1),
+('Universidad de Concepcion', 'UdeC', 'udec.cl', 'Chile', 'CHL', 'Bio Bio', 'Concepcion', 'top_public', 2),
+('Universidad Adolfo Ibanez', 'UAI', 'uai.cl', 'Chile', 'CHL', 'Santiago', 'Santiago', 'top_private', 2),
+('Universidad Diego Portales', 'UDP', 'udp.cl', 'Chile', 'CHL', 'Santiago', 'Santiago', 'top_private', 3),
+('Universidad Tecnica Federico Santa Maria', 'USM', 'usm.cl', 'Chile', 'CHL', 'Valparaiso', 'Valparaiso', 'top_public', 3),
+('Universidad de los Andes', 'UANDES', 'uandes.cl', 'Chile', 'CHL', 'Santiago', 'Santiago', 'regular', 4)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- COLOMBIA (COL) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Universidad de los Andes Colombia', 'Uniandes', 'uniandes.edu.co', 'Colombia', 'COL', 'Bogota', 'Bogota', 'top_private', 1),
+('Universidad Nacional de Colombia', 'UNAL', 'unal.edu.co', 'Colombia', 'COL', 'Bogota', 'Bogota', 'top_public', 1),
+('Pontificia Universidad Javeriana', 'Javeriana', 'javeriana.edu.co', 'Colombia', 'COL', 'Bogota', 'Bogota', 'top_private', 2),
+('Universidad de Antioquia', 'UdeA', 'udea.edu.co', 'Colombia', 'COL', 'Antioquia', 'Medellin', 'top_public', 2),
+('Universidad del Valle', 'Univalle', 'univalle.edu.co', 'Colombia', 'COL', 'Valle del Cauca', 'Cali', 'top_public', 3),
+('Universidad EAFIT', 'EAFIT', 'eafit.edu.co', 'Colombia', 'COL', 'Antioquia', 'Medellin', 'top_private', 3),
+('Universidad del Norte', 'Uninorte', 'uninorte.edu.co', 'Colombia', 'COL', 'Atlantico', 'Barranquilla', 'regular', 4),
+('Universidad de La Sabana', 'Unisabana', 'unisabana.edu.co', 'Colombia', 'COL', 'Cundinamarca', 'Chia', 'regular', 5)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- SOUTH AFRICA (ZAF) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Cape Town', 'UCT', 'uct.ac.za', 'South Africa', 'ZAF', 'Western Cape', 'Cape Town', 'top_public', 1),
+('University of the Witwatersrand', 'Wits', 'wits.ac.za', 'South Africa', 'ZAF', 'Gauteng', 'Johannesburg', 'top_public', 2),
+('Stellenbosch University', 'SU', 'sun.ac.za', 'South Africa', 'ZAF', 'Western Cape', 'Stellenbosch', 'top_public', 3),
+('University of Pretoria', 'UP', 'up.ac.za', 'South Africa', 'ZAF', 'Gauteng', 'Pretoria', 'top_public', 4),
+('University of KwaZulu-Natal', 'UKZN', 'ukzn.ac.za', 'South Africa', 'ZAF', 'KwaZulu-Natal', 'Durban', 'top_public', 5),
+('University of Johannesburg', 'UJ', 'uj.ac.za', 'South Africa', 'ZAF', 'Gauteng', 'Johannesburg', 'regular', 6),
+('Rhodes University', 'Rhodes', 'ru.ac.za', 'South Africa', 'ZAF', 'Eastern Cape', 'Grahamstown', 'regular', 7),
+('University of the Western Cape', 'UWC', 'uwc.ac.za', 'South Africa', 'ZAF', 'Western Cape', 'Cape Town', 'regular', 8)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- EGYPT (EGY) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('American University in Cairo', 'AUC', 'aucegypt.edu', 'Egypt', 'EGY', 'Cairo', 'Cairo', 'top_private', 1),
+('Cairo University', 'CU', 'cu.edu.eg', 'Egypt', 'EGY', 'Giza', 'Giza', 'top_public', 1),
+('Ain Shams University', 'ASU', 'asu.edu.eg', 'Egypt', 'EGY', 'Cairo', 'Cairo', 'top_public', 2),
+('Alexandria University', 'AU', 'alexu.edu.eg', 'Egypt', 'EGY', 'Alexandria', 'Alexandria', 'top_public', 3),
+('German University in Cairo', 'GUC', 'guc.edu.eg', 'Egypt', 'EGY', 'Cairo', 'Cairo', 'top_private', 2),
+('Zewail City of Science and Technology', 'ZC', 'zewailcity.edu.eg', 'Egypt', 'EGY', 'Giza', 'Giza', 'top_private', 3)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- SAUDI ARABIA (SAU) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('King Abdullah University of Science and Technology', 'KAUST', 'kaust.edu.sa', 'Saudi Arabia', 'SAU', 'Makkah', 'Thuwal', 'top_public', 1),
+('King Saud University', 'KSU', 'ksu.edu.sa', 'Saudi Arabia', 'SAU', 'Riyadh', 'Riyadh', 'top_public', 2),
+('King Fahd University of Petroleum and Minerals', 'KFUPM', 'kfupm.edu.sa', 'Saudi Arabia', 'SAU', 'Eastern', 'Dhahran', 'top_public', 3),
+('King Abdulaziz University', 'KAU', 'kau.edu.sa', 'Saudi Arabia', 'SAU', 'Makkah', 'Jeddah', 'top_public', 4),
+('Prince Sultan University', 'PSU', 'psu.edu.sa', 'Saudi Arabia', 'SAU', 'Riyadh', 'Riyadh', 'top_private', 1),
+('Alfaisal University', 'Alfaisal', 'alfaisal.edu', 'Saudi Arabia', 'SAU', 'Riyadh', 'Riyadh', 'top_private', 2)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- TAIWAN (TWN) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('National Taiwan University', 'NTU', 'ntu.edu.tw', 'Taiwan', 'TWN', 'Taipei', 'Taipei', 'top_public', 1),
+('National Tsing Hua University', 'NTHU', 'nthu.edu.tw', 'Taiwan', 'TWN', 'Hsinchu', 'Hsinchu', 'top_public', 2),
+('National Chiao Tung University', 'NCTU', 'nycu.edu.tw', 'Taiwan', 'TWN', 'Hsinchu', 'Hsinchu', 'top_public', 3),
+('National Cheng Kung University', 'NCKU', 'ncku.edu.tw', 'Taiwan', 'TWN', 'Tainan', 'Tainan', 'top_public', 4),
+('National Yang Ming Chiao Tung University', 'NYCU', 'nycu.edu.tw', 'Taiwan', 'TWN', 'Taipei', 'Taipei', 'top_public', 5),
+('National Taiwan University of Science and Technology', 'NTUST', 'ntust.edu.tw', 'Taiwan', 'TWN', 'Taipei', 'Taipei', 'top_public', 6),
+('National Central University', 'NCU', 'ncu.edu.tw', 'Taiwan', 'TWN', 'Taoyuan', 'Taoyuan', 'regular', 7),
+('National Sun Yat-sen University', 'NSYSU', 'nsysu.edu.tw', 'Taiwan', 'TWN', 'Kaohsiung', 'Kaohsiung', 'regular', 8)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- PAKISTAN (PAK) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Lahore University of Management Sciences', 'LUMS', 'lums.edu.pk', 'Pakistan', 'PAK', 'Punjab', 'Lahore', 'top_private', 1),
+('National University of Sciences and Technology', 'NUST', 'nust.edu.pk', 'Pakistan', 'PAK', 'Islamabad', 'Islamabad', 'top_public', 1),
+('Pakistan Institute of Engineering and Applied Sciences', 'PIEAS', 'pieas.edu.pk', 'Pakistan', 'PAK', 'Islamabad', 'Islamabad', 'top_public', 2),
+('Quaid-i-Azam University', 'QAU', 'qau.edu.pk', 'Pakistan', 'PAK', 'Islamabad', 'Islamabad', 'top_public', 3),
+('Aga Khan University', 'AKU', 'aku.edu', 'Pakistan', 'PAK', 'Sindh', 'Karachi', 'top_private', 2),
+('Institute of Business Administration Karachi', 'IBA', 'iba.edu.pk', 'Pakistan', 'PAK', 'Sindh', 'Karachi', 'top_public', 4),
+('COMSATS University Islamabad', 'COMSATS', 'comsats.edu.pk', 'Pakistan', 'PAK', 'Islamabad', 'Islamabad', 'regular', 5),
+('University of Engineering and Technology Lahore', 'UET', 'uet.edu.pk', 'Pakistan', 'PAK', 'Punjab', 'Lahore', 'regular', 6),
+('GIK Institute', 'GIKI', 'giki.edu.pk', 'Pakistan', 'PAK', 'Khyber Pakhtunkhwa', 'Topi', 'top_public', 5)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- BANGLADESH (BGD) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Bangladesh University of Engineering and Technology', 'BUET', 'buet.ac.bd', 'Bangladesh', 'BGD', 'Dhaka', 'Dhaka', 'top_public', 1),
+('University of Dhaka', 'DU', 'du.ac.bd', 'Bangladesh', 'BGD', 'Dhaka', 'Dhaka', 'top_public', 2),
+('BRAC University', 'BRACU', 'bracu.ac.bd', 'Bangladesh', 'BGD', 'Dhaka', 'Dhaka', 'top_private', 1),
+('North South University', 'NSU', 'northsouth.edu', 'Bangladesh', 'BGD', 'Dhaka', 'Dhaka', 'top_private', 2),
+('Independent University Bangladesh', 'IUB', 'iub.edu.bd', 'Bangladesh', 'BGD', 'Dhaka', 'Dhaka', 'regular', 3),
+('East West University', 'EWU', 'ewubd.edu', 'Bangladesh', 'BGD', 'Dhaka', 'Dhaka', 'regular', 4)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- SRI LANKA (LKA) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('University of Colombo', 'UOC', 'cmb.ac.lk', 'Sri Lanka', 'LKA', 'Western', 'Colombo', 'top_public', 1),
+('University of Peradeniya', 'UOP', 'pdn.ac.lk', 'Sri Lanka', 'LKA', 'Central', 'Peradeniya', 'top_public', 2),
+('University of Moratuwa', 'UOM', 'mrt.ac.lk', 'Sri Lanka', 'LKA', 'Western', 'Moratuwa', 'top_public', 3),
+('University of Sri Jayewardenepura', 'USJ', 'sjp.ac.lk', 'Sri Lanka', 'LKA', 'Western', 'Nugegoda', 'regular', 4),
+('University of Kelaniya', 'UOK', 'kln.ac.lk', 'Sri Lanka', 'LKA', 'Western', 'Kelaniya', 'regular', 5)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- NEPAL (NPL) - Top Universities
+-- ============================================================================
+INSERT INTO universities (name, short_name, domain, country, country_code, state_province, city, tier, ranking_national) VALUES
+('Tribhuvan University', 'TU', 'tribhuvan-university.edu.np', 'Nepal', 'NPL', 'Bagmati', 'Kathmandu', 'top_public', 1),
+('Kathmandu University', 'KU', 'ku.edu.np', 'Nepal', 'NPL', 'Bagmati', 'Dhulikhel', 'top_public', 2),
+('Pokhara University', 'PU', 'pu.edu.np', 'Nepal', 'NPL', 'Gandaki', 'Pokhara', 'regular', 3)
+ON CONFLICT (domain) DO NOTHING;
+
+-- ============================================================================
+-- Create index for efficient country-based queries
+-- ============================================================================
+CREATE INDEX IF NOT EXISTS idx_universities_country_tier ON universities(country_code, tier DESC, ranking_national ASC);

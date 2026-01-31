@@ -1,0 +1,98 @@
+# =============================================================================
+# NAVA Backend - Local Development Stack (M1 Mac: 16GB RAM, 256GB Storage)
+# =============================================================================
+# Run databases locally, deploy app to K8s or run directly
+#
+# Usage:
+#   docker-compose -f docker-compose.local.yml up -d
+#
+# Total Memory Usage: ~2-3GB (leaves plenty for app and macOS)
+
+services:
+  # PostgreSQL - Primary database
+  postgres:
+    image: postgres:15-alpine
+    container_name: nava-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: nava
+      POSTGRES_PASSWORD: nava123
+      POSTGRES_DB: nava_dev
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nava"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis - Cache and sessions
+  redis:
+    image: redis:7-alpine
+    container_name: nava-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 100mb --maxmemory-policy allkeys-lru
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Neo4j - Graph database (optional, comment out to save resources)
+  neo4j:
+    image: neo4j:5-community
+    container_name: nava-neo4j
+    ports:
+      - "7474:7474"  # HTTP
+      - "7687:7687"  # Bolt
+    environment:
+      NEO4J_AUTH: neo4j/nava123456
+      NEO4J_PLUGINS: '["apoc"]'
+      # Reduced memory for M1 Mac
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    volumes:
+      - neo4j_data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  postgres_data:
+  neo4j_data:
+
+# =============================================================================
+# Resource Summary (for 16GB M1 Mac):
+# =============================================================================
+#   PostgreSQL:  256-512 MB
+#   Redis:        64-128 MB
+#   Neo4j:       512MB-1 GB
+#   Docker:        ~1-2 GB (overhead)
+#   --------------------------
+#   Total:         ~2-4 GB
+#
+#   Remaining for macOS + App: ~12-14 GB ✓
+# =============================================================================
