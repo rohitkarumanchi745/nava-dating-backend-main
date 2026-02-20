@@ -5,9 +5,17 @@
 //! - Stripe (Global) - 2.9% + 30¢ fees
 //!
 //! Web payments bypass 30% App Store fees!
+//!
+//! Features:
+//! - Retry with exponential backoff and jitter
+//! - Dead letter queue for failed payments
+//! - Idempotent operations
 
 pub mod razorpay;
+pub mod retry;
 pub mod stripe;
+
+pub use retry::{DeadLetterQueue, RetryConfig, with_retry};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

@@ -66,7 +66,7 @@ impl RazorpayClient {
 }
 
 // Razorpay API types
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct CreateRazorpayOrder {
     amount: i64,
     currency: String,
@@ -141,7 +141,10 @@ struct RazorpayWebhookPayload {
 #[async_trait]
 impl PaymentProvider for RazorpayClient {
     async fn create_order(&self, request: CreateOrderRequest) -> Result<CreateOrderResponse, AppError> {
+        use super::retry::{RetryConfig, with_retry};
+
         let order_id = format!("order_{}", uuid::Uuid::new_v4().to_string().replace("-", "")[..16].to_string());
+        let config = RetryConfig::for_payments();
 
         let razorpay_order = CreateRazorpayOrder {
             amount: request.amount_cents,
@@ -150,32 +153,59 @@ impl PaymentProvider for RazorpayClient {
             notes: request.metadata.map(|m| serde_json::to_value(m).unwrap_or_default()),
         };
 
-        let response = self.client
-            .post(format!("{}/orders", RAZORPAY_API_URL))
-            .header("Authorization", &self.auth_header)
-            .json(&razorpay_order)
-            .send()
-            .await
-            .map_err(|e| AppError::internal(format!("Razorpay request failed: {}", e)))?;
+        // Clone for retry closure
+        let client = self.client.clone();
+        let auth_header = self.auth_header.clone();
+        let key_id = self.key_id.clone();
 
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(AppError::internal(format!("Razorpay error: {}", error_text)));
-        }
+        let result = with_retry(&config, "razorpay_create_order", || {
+            let client = client.clone();
+            let auth_header = auth_header.clone();
+            let razorpay_order = razorpay_order.clone();
+            let order_id = order_id.clone();
+            let key_id = key_id.clone();
 
-        let rz_order: RazorpayOrder = response.json().await
-            .map_err(|e| AppError::internal(format!("Failed to parse Razorpay response: {}", e)))?;
+            async move {
+                let response = client
+                    .post(format!("{}/orders", RAZORPAY_API_URL))
+                    .header("Authorization", &auth_header)
+                    .json(&razorpay_order)
+                    .send()
+                    .await
+                    .map_err(|e| AppError::internal(format!("Razorpay request failed: {}", e)))?;
 
-        Ok(CreateOrderResponse {
-            order_id,
-            gateway: PaymentGateway::Razorpay,
-            gateway_order_id: rz_order.id,
-            amount_cents: rz_order.amount,
-            currency: rz_order.currency,
-            razorpay_key_id: Some(self.key_id.clone()),
-            stripe_client_secret: None,
-            stripe_publishable_key: None,
-        })
+                let status = response.status();
+
+                // Check for retryable HTTP status codes
+                if status.as_u16() == 429 || status.as_u16() >= 500 {
+                    return Err(AppError::internal(format!(
+                        "Razorpay temporarily unavailable ({})",
+                        status
+                    )));
+                }
+
+                if !status.is_success() {
+                    let error_text = response.text().await.unwrap_or_default();
+                    return Err(AppError::internal(format!("Razorpay error: {}", error_text)));
+                }
+
+                let rz_order: RazorpayOrder = response.json().await
+                    .map_err(|e| AppError::internal(format!("Failed to parse Razorpay response: {}", e)))?;
+
+                Ok(CreateOrderResponse {
+                    order_id,
+                    gateway: PaymentGateway::Razorpay,
+                    gateway_order_id: rz_order.id,
+                    amount_cents: rz_order.amount,
+                    currency: rz_order.currency,
+                    razorpay_key_id: Some(key_id),
+                    stripe_client_secret: None,
+                    stripe_publishable_key: None,
+                })
+            }
+        }).await?;
+
+        Ok(result.value)
     }
 
     async fn verify_payment(&self, request: VerifyPaymentRequest) -> Result<PaymentVerification, AppError> {

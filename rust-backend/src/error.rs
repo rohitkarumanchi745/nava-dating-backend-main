@@ -6,7 +6,7 @@ use axum::{
 use serde_json::json;
 use std::fmt;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AppError {
     status: StatusCode,
     message: String,

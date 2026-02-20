@@ -22,6 +22,10 @@ pub async fn security_headers_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    // Check if this is a GraphQL playground request (GET /graphql)
+    let is_graphql_playground = request.method() == axum::http::Method::GET
+        && request.uri().path() == "/graphql";
+
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
 
@@ -49,11 +53,28 @@ pub async fn security_headers_middleware(
         HeaderValue::from_static("strict-origin-when-cross-origin"),
     );
 
-    // Content Security Policy (API-focused)
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
-    );
+    // Content Security Policy
+    // Relaxed for GraphQL playground to allow loading external scripts
+    if is_graphql_playground {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(
+                "default-src 'self'; \
+                script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com; \
+                style-src 'self' 'unsafe-inline' https://unpkg.com; \
+                img-src 'self' data: https:; \
+                font-src 'self' https://unpkg.com; \
+                connect-src 'self'; \
+                frame-ancestors 'none'"
+            ),
+        );
+    } else {
+        // Strict CSP for API endpoints
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+        );
+    }
 
     // Strict Transport Security (HTTPS only)
     headers.insert(

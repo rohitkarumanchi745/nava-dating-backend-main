@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use axum::extract::FromRef;
 use neo4rs::Graph;
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
@@ -34,6 +35,13 @@ pub struct AppState {
     // Payment and Ads services
     pub payment_service: Option<Arc<PaymentService>>,
     pub ads_service: Option<Arc<AdsService>>,
+}
+
+// Allow extracting AppState from Arc<AppState>
+impl FromRef<Arc<AppState>> for AppState {
+    fn from_ref(state: &Arc<AppState>) -> Self {
+        state.as_ref().clone()
+    }
 }
 
 impl AppState {

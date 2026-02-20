@@ -384,7 +384,7 @@ impl QueryRoot {
               AND u.is_profile_complete = true
               AND u.is_active = true
               AND u.id NOT IN (
-                  SELECT target_user_id FROM swipes WHERE user_id = $1
+                  SELECT to_user_id FROM swipes WHERE from_user_id = $1
               )
               AND u.id NOT IN (
                   SELECT CASE WHEN user1_id = $1 THEN user2_id ELSE user1_id END
@@ -1014,9 +1014,9 @@ impl MutationRoot {
         // Record the swipe
         sqlx::query(
             r#"
-            INSERT INTO swipes (user_id, target_user_id, action, created_at)
+            INSERT INTO swipes (from_user_id, to_user_id, action, created_at)
             VALUES ($1, $2, 'like', NOW())
-            ON CONFLICT (user_id, target_user_id) DO UPDATE SET action = 'like', created_at = NOW()
+            ON CONFLICT (from_user_id, to_user_id) DO UPDATE SET action = 'like', created_at = NOW()
             "#,
         )
         .bind(user_id)
@@ -1026,7 +1026,7 @@ impl MutationRoot {
 
         // Check for mutual like
         let mutual = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM swipes WHERE user_id = $1 AND target_user_id = $2 AND action = 'like'",
+            "SELECT COUNT(*) FROM swipes WHERE from_user_id = $1 AND to_user_id = $2 AND action = 'like'",
         )
         .bind(target_user_id)
         .bind(user_id)
@@ -1080,9 +1080,9 @@ impl MutationRoot {
 
         sqlx::query(
             r#"
-            INSERT INTO swipes (user_id, target_user_id, action, created_at)
+            INSERT INTO swipes (from_user_id, to_user_id, action, created_at)
             VALUES ($1, $2, 'pass', NOW())
-            ON CONFLICT (user_id, target_user_id) DO UPDATE SET action = 'pass', created_at = NOW()
+            ON CONFLICT (from_user_id, to_user_id) DO UPDATE SET action = 'pass', created_at = NOW()
             "#,
         )
         .bind(user_id)

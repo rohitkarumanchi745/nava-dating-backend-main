@@ -21,6 +21,7 @@ use serde_json::json;
 use crate::{
     auth::Claims,
     error::AppError,
+    jobs::get_dlq_stats,
     services::payments::{
         CreateOrderRequest, Currency, PaymentGateway,
         VerifyPaymentRequest, WebhookEvent, WebhookEventType,
@@ -38,6 +39,8 @@ pub struct CreateOrderPayload {
     pub currency: Option<String>,
     pub region_code: Option<String>,
     pub platform: Option<String>,
+    /// Client-generated idempotency key to prevent duplicate orders
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -112,6 +115,35 @@ pub async fn create_order(
     let user_id = claims.sub.parse::<i32>()
         .map_err(|_| AppError::unauthorized("Invalid token"))?;
 
+    // Idempotency check: If idempotency_key provided, check if already processed
+    if let Some(ref idempotency_key) = payload.idempotency_key {
+        let existing = sqlx::query!(
+            r#"
+            SELECT order_id, gateway, amount_cents, currency, gateway_order_id, status
+            FROM payment_orders
+            WHERE user_id = $1 AND idempotency_key = $2
+            LIMIT 1
+            "#,
+            user_id,
+            idempotency_key
+        )
+        .fetch_optional(&state.db)
+        .await?;
+
+        if let Some(order) = existing {
+            // Return the existing order info (idempotent response)
+            return Ok(Json(CreateOrderResponse {
+                order_id: order.order_id,
+                gateway: order.gateway,
+                amount_cents: order.amount_cents as i64,
+                currency: order.currency,
+                gateway_order_id: order.gateway_order_id.unwrap_or_default(),
+                client_secret: None, // Would need to retrieve from provider if needed
+                razorpay_key_id: None,
+            }));
+        }
+    }
+
     // Determine region and currency
     let region_code = payload.region_code.as_deref().unwrap_or("US");
     let currency_str = payload.currency.as_deref().unwrap_or_else(|| {
@@ -140,15 +172,16 @@ pub async fn create_order(
     let order_id = uuid::Uuid::new_v4().to_string();
     sqlx::query!(
         r#"
-        INSERT INTO payment_orders (order_id, user_id, product_id, gateway, amount_cents, currency, status)
-        VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+        INSERT INTO payment_orders (order_id, user_id, product_id, gateway, amount_cents, currency, status, idempotency_key)
+        VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
         "#,
         order_id,
         user_id,
         product.id,
         gateway.as_str(),
         product.amount_cents,
-        currency_str
+        currency_str,
+        payload.idempotency_key
     )
     .execute(&state.db)
     .await?;
@@ -162,7 +195,7 @@ pub async fn create_order(
     let request = CreateOrderRequest {
         user_id,
         product_id: payload.product_id.clone(),
-        amount_cents: product.amount_cents,
+        amount_cents: product.amount_cents as i64,
         currency,
         region_code: region_code.to_string(),
         platform: platform.to_string(),
@@ -183,7 +216,7 @@ pub async fn create_order(
     Ok(Json(CreateOrderResponse {
         order_id,
         gateway: provider_response.gateway.as_str().to_string(),
-        amount_cents: product.amount_cents,
+        amount_cents: product.amount_cents as i64,
         currency: currency_str.to_string(),
         gateway_order_id: provider_response.gateway_order_id,
         client_secret: provider_response.stripe_client_secret,
@@ -215,16 +248,17 @@ pub async fn verify_payment(
     .ok_or_else(|| AppError::not_found("Order not found"))?;
 
     // Verify user owns this order
-    if order.user_id != user_id {
+    if order.user_id != Some(user_id) {
         return Err(AppError::forbidden("Not authorized to verify this order"));
     }
 
     // Check if already processed
-    if order.status != "pending" {
+    let status = order.status.as_deref().unwrap_or("unknown");
+    if status != "pending" {
         return Ok(Json(VerifyPaymentResponse {
-            success: order.status == "completed",
+            success: status == "completed",
             transaction_id: payload.order_id.clone(),
-            message: format!("Order already processed: {}", order.status),
+            message: format!("Order already processed: {}", status),
         }));
     }
 
@@ -276,7 +310,9 @@ pub async fn verify_payment(
         .await?;
 
         // Grant the product to user (subscription or consumable)
-        grant_product_to_user(&state.db, user_id, order.product_id).await?;
+        if let Some(product_id) = order.product_id {
+            grant_product_to_user(&state.db, user_id, product_id).await?;
+        }
 
         Ok(Json(VerifyPaymentResponse {
             success: true,
@@ -336,8 +372,8 @@ pub async fn list_products(
 
         entry.prices.push(ProductPriceResponse {
             currency: row.currency.clone(),
-            amount_cents: row.amount_cents,
-            formatted_price: format_price(row.amount_cents, &row.currency),
+            amount_cents: row.amount_cents as i64,
+            formatted_price: format_price(row.amount_cents as i64, &row.currency),
         });
     }
 
@@ -366,9 +402,9 @@ pub async fn get_subscriptions(
     .await?;
 
     Ok(Json(subscriptions.into_iter().map(|s| SubscriptionResponse {
-        id: s.subscription_id,
+        id: s.subscription_id.unwrap_or_default(),
         product_name: s.name,
-        status: s.status,
+        status: s.status.unwrap_or_default(),
         current_period_end: s.current_period_end
             .map(|d| d.to_string())
             .unwrap_or_default(),
@@ -400,14 +436,19 @@ pub async fn cancel_subscription(
     .await?
     .ok_or_else(|| AppError::not_found("Subscription not found"))?;
 
-    let gateway = PaymentGateway::from_str(&subscription.gateway)
+    let gateway_str = subscription.gateway.as_deref()
+        .ok_or_else(|| AppError::internal("No gateway for subscription"))?;
+    let gateway = PaymentGateway::from_str(gateway_str)
         .ok_or_else(|| AppError::internal("Invalid gateway"))?;
 
     let payment_service = state.payment_service.as_ref()
         .ok_or_else(|| AppError::internal("Payment service not configured"))?;
 
+    let gateway_sub_id = subscription.gateway_subscription_id.as_deref()
+        .ok_or_else(|| AppError::internal("No gateway subscription ID"))?;
+
     // Cancel with payment provider (at period end)
-    payment_service.cancel_subscription(gateway, &subscription.gateway_subscription_id).await?;
+    payment_service.cancel_subscription(gateway, gateway_sub_id).await?;
 
     // Update database
     sqlx::query!(
@@ -547,7 +588,7 @@ async fn process_webhook_event(
                 .await?;
 
                 if let Some(order) = order {
-                    if order.status == "pending" {
+                    if order.status.as_deref() == Some("pending") {
                         // Create transaction
                         let transaction_id = uuid::Uuid::new_v4().to_string();
                         sqlx::query!(
@@ -573,7 +614,9 @@ async fn process_webhook_event(
                         .await?;
 
                         // Grant product
-                        grant_product_to_user(&state.db, order.user_id, order.product_id).await?;
+                        if let (Some(user_id), Some(product_id)) = (order.user_id, order.product_id) {
+                            grant_product_to_user(&state.db, user_id, product_id).await?;
+                        }
                     }
                 }
             }
@@ -634,4 +677,22 @@ fn format_price(amount_cents: i64, currency: &str) -> String {
         "GBP" => format!("£{:.2}", amount),
         _ => format!("{} {:.2}", currency, amount),
     }
+}
+
+/// Get DLQ statistics for monitoring
+/// GET /api/payments/dlq/stats
+pub async fn dlq_stats(
+    State(state): State<AppState>,
+    claims: Claims,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let _user_id = claims.sub.parse::<i32>()
+        .map_err(|_| AppError::unauthorized("Invalid token"))?;
+
+    // In production, you'd want to check if user is admin
+    // For now, any authenticated user can view stats
+
+    let stats = get_dlq_stats(&state).await
+        .map_err(|e| AppError::internal(format!("Failed to get DLQ stats: {}", e)))?;
+
+    Ok(Json(stats))
 }

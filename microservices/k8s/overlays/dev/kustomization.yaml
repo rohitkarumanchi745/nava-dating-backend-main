@@ -1,0 +1,63 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nava-dev
+
+resources:
+  - ../../base
+
+namePrefix: dev-
+
+commonLabels:
+  environment: development
+
+# Reduce replicas for dev
+replicas:
+  - name: gateway
+    count: 1
+  - name: auth-service
+    count: 1
+  - name: user-service
+    count: 1
+  - name: match-service
+    count: 1
+  - name: chat-service
+    count: 1
+  - name: payment-service
+    count: 1
+  - name: ambassador-service
+    count: 1
+
+patches:
+  # Disable HPA in dev
+  - target:
+      kind: HorizontalPodAutoscaler
+    patch: |
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: unused
+
+  # Use dev ingress host
+  - target:
+      kind: Ingress
+      name: nava-ingress
+    patch: |
+      - op: replace
+        path: /spec/rules/0/host
+        value: dev-api.nava.app
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: dev-api.nava.app
+
+  # Reduce resource limits in dev
+  - target:
+      kind: Deployment
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 256Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/cpu
+        value: 250m

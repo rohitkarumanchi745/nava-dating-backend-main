@@ -10,6 +10,7 @@ mod redis_service;
 mod services;
 mod state;
 mod storage;
+mod telemetry;
 mod vision;
 mod websocket;
 
@@ -50,6 +51,7 @@ use middleware::dual_write::DualWriteManager;
 use middleware::security::security_headers_middleware;
 use handlers::graph_handlers::graph_routes;
 use jobs::sync_job::{SyncJobRunner, SyncJobConfig};
+use jobs::dlq_processor::{DlqProcessorRunner, DlqProcessorConfig};
 
 use auth::decode_access_token;
 use redis_service::RedisService;
@@ -105,6 +107,7 @@ use handlers::{
         create_order as payment_create_order,
         verify_payment, list_products, get_subscriptions,
         cancel_subscription, razorpay_webhook, stripe_webhook,
+        dlq_stats,
     },
     // Ads
     ads::{request_ad, record_impression, rewarded_complete, get_rewards_balance},
@@ -277,25 +280,12 @@ async fn graphiql() -> impl IntoResponse {
 async fn main() {
     dotenvy::dotenv().ok();
 
-    // Initialize tracing based on environment
+    // Load configuration first
     let config = Config::from_env();
 
-    if config.is_production() {
-        // JSON logging for production (better for log aggregators)
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(
-                std::env::var("RUST_LOG").unwrap_or_else(|_| "info,sqlx=warn".to_string()),
-            )
-            .init();
-    } else {
-        // Pretty logging for development
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                std::env::var("RUST_LOG").unwrap_or_else(|_| "info,sqlx=warn".to_string()),
-            )
-            .init();
-    }
+    // Initialize telemetry (with optional OpenTelemetry support)
+    // Enable distributed tracing with: cargo build --features otel
+    telemetry::init_telemetry("nava-backend", config.is_production());
 
     // Validate configuration
     if let Err(e) = config.validate() {
@@ -532,6 +522,15 @@ async fn main() {
         info!("Background sync jobs started");
     }
 
+    // Start DLQ processor for payment retry handling
+    if state.payment_service.is_some() {
+        let dlq_runner = DlqProcessorRunner::new(Arc::new(state.clone()), DlqProcessorConfig::default());
+        tokio::spawn(async move {
+            dlq_runner.start().await;
+        });
+        info!("DLQ processor started for payment retries");
+    }
+
     // Start instance heartbeat for horizontal scaling (if Redis is available)
     if let Some(ref redis_conn) = state.redis {
         let redis_service = RedisService::new(redis_conn.clone());
@@ -643,6 +642,7 @@ async fn main() {
         .route("/api/payments/products", get(list_products))
         .route("/api/payments/subscriptions", get(get_subscriptions))
         .route("/api/payments/subscriptions/cancel", post(cancel_subscription))
+        .route("/api/payments/dlq/stats", get(dlq_stats))
         .route("/webhook/razorpay", post(razorpay_webhook))
         .route("/webhook/stripe", post(stripe_webhook))
         // Ads Monetization
@@ -728,7 +728,7 @@ async fn main() {
         .route("/fl/local-data", post(report_local_data))
         // ML System Stats
         .route("/ml/stats", get(get_ml_system_stats))
-        .with_state(state.clone())
+        .with_state(Arc::new(state.clone()))
         // Graph-powered endpoints (Neo4j + PostgreSQL fallback)
         .nest("/api/graph", graph_routes().with_state(Arc::new(state.clone())))
         // Merge GraphQL routes
@@ -815,6 +815,9 @@ async fn main() {
     // Give in-flight requests time to complete
     tokio::time::sleep(Duration::from_secs(shutdown_timeout)).await;
 
+    // Shutdown OpenTelemetry tracer (flushes remaining spans)
+    telemetry::shutdown_telemetry();
+
     info!("Server shutdown complete");
 }
 
@@ -824,6 +827,19 @@ async fn prometheus_metrics(
 ) -> String {
     let uptime = state.start_time.elapsed().as_secs();
     let metrics = &state.metrics;
+
+    // Fetch DLQ stats from database
+    let dlq_stats = fetch_dlq_metrics(&state.db).await;
+
+    // Fetch database pool stats
+    let db_pool_size = state.db.size();
+    let db_pool_idle = state.db.num_idle();
+
+    // Get WebSocket room stats
+    let (chat_rooms, chat_subscribers) = {
+        let rooms = state.chat_rooms.read().await;
+        (rooms.room_count(), rooms.total_subscribers())
+    };
 
     format!(
         r#"# HELP app_requests_total Total number of requests
@@ -857,6 +873,37 @@ app_websocket_connections {}
 # HELP app_uptime_seconds Server uptime in seconds
 # TYPE app_uptime_seconds counter
 app_uptime_seconds {}
+
+# HELP app_db_pool_size Database connection pool size
+# TYPE app_db_pool_size gauge
+app_db_pool_size {}
+
+# HELP app_db_pool_idle Idle database connections
+# TYPE app_db_pool_idle gauge
+app_db_pool_idle {}
+
+# HELP app_chat_rooms_active Active chat rooms
+# TYPE app_chat_rooms_active gauge
+app_chat_rooms_active {}
+
+# HELP app_chat_subscribers_total Total chat subscribers
+# TYPE app_chat_subscribers_total gauge
+app_chat_subscribers_total {}
+
+# HELP dlq_entries_pending Pending entries in dead letter queue
+# TYPE dlq_entries_pending gauge
+dlq_entries_pending{{queue="payments"}} {}
+dlq_entries_pending{{queue="webhooks"}} {}
+
+# HELP dlq_entries_resolved_total Total resolved DLQ entries
+# TYPE dlq_entries_resolved_total counter
+dlq_entries_resolved_total{{queue="payments"}} {}
+dlq_entries_resolved_total{{queue="webhooks"}} {}
+
+# HELP dlq_entries_abandoned_total Total abandoned DLQ entries
+# TYPE dlq_entries_abandoned_total counter
+dlq_entries_abandoned_total{{queue="payments"}} {}
+dlq_entries_abandoned_total{{queue="webhooks"}} {}
 "#,
         metrics.requests_total.load(Ordering::Relaxed),
         metrics.requests_active.load(Ordering::Relaxed),
@@ -866,5 +913,70 @@ app_uptime_seconds {}
         metrics.cache_misses.load(Ordering::Relaxed),
         metrics.websocket_connections.load(Ordering::Relaxed),
         uptime,
+        db_pool_size,
+        db_pool_idle,
+        chat_rooms,
+        chat_subscribers,
+        dlq_stats.payments_pending,
+        dlq_stats.webhooks_pending,
+        dlq_stats.payments_resolved,
+        dlq_stats.webhooks_resolved,
+        dlq_stats.payments_abandoned,
+        dlq_stats.webhooks_abandoned,
     )
+}
+
+// DLQ metrics structure
+struct DlqMetrics {
+    payments_pending: i64,
+    webhooks_pending: i64,
+    payments_resolved: i64,
+    webhooks_resolved: i64,
+    payments_abandoned: i64,
+    webhooks_abandoned: i64,
+}
+
+impl Default for DlqMetrics {
+    fn default() -> Self {
+        Self {
+            payments_pending: 0,
+            webhooks_pending: 0,
+            payments_resolved: 0,
+            webhooks_resolved: 0,
+            payments_abandoned: 0,
+            webhooks_abandoned: 0,
+        }
+    }
+}
+
+// Fetch DLQ metrics from database
+async fn fetch_dlq_metrics(db: &sqlx::PgPool) -> DlqMetrics {
+    let result = sqlx::query_as::<_, (String, String, i64)>(
+        r#"
+        SELECT queue_name, status, COUNT(*) as count
+        FROM dead_letter_queue
+        GROUP BY queue_name, status
+        "#
+    )
+    .fetch_all(db)
+    .await;
+
+    match result {
+        Ok(rows) => {
+            let mut metrics = DlqMetrics::default();
+            for (queue_name, status, count) in rows {
+                match (queue_name.as_str(), status.as_str()) {
+                    ("payments", "pending") => metrics.payments_pending = count,
+                    ("payments", "resolved") => metrics.payments_resolved = count,
+                    ("payments", "abandoned") => metrics.payments_abandoned = count,
+                    ("webhooks", "pending") => metrics.webhooks_pending = count,
+                    ("webhooks", "resolved") => metrics.webhooks_resolved = count,
+                    ("webhooks", "abandoned") => metrics.webhooks_abandoned = count,
+                    _ => {}
+                }
+            }
+            metrics
+        }
+        Err(_) => DlqMetrics::default(),
+    }
 }

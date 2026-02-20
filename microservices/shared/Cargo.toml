@@ -1,0 +1,52 @@
+[package]
+name = "shared"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+otel = ["tracing-opentelemetry", "opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp"]
+testing = ["reqwest"]
+
+[dependencies]
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+jsonwebtoken.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# HTTP utilities
+tower-http.workspace = true
+
+# Kafka
+rdkafka.workspace = true
+
+# Async utilities
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+
+# Random for jitter and nonce generation
+rand = "0.8"
+
+# Hex encoding for signatures
+hex.workspace = true
+
+# Redis for testing/caching
+redis = { workspace = true, optional = true }
+
+# HTTP client for testing
+reqwest = { workspace = true, optional = true }
+
+# Tracing infrastructure
+tracing-subscriber.workspace = true
+
+# OpenTelemetry (optional - enable with "otel" feature)
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }

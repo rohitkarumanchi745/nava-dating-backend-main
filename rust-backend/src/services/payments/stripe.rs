@@ -70,42 +70,78 @@ impl StripeClient {
         expected == v1_signature
     }
 
-    /// Make authenticated request to Stripe
-    async fn stripe_request<T: for<'de> Deserialize<'de>>(
+    /// Make authenticated request to Stripe with retry and jitter
+    async fn stripe_request<T: for<'de> Deserialize<'de> + Send + 'static>(
         &self,
         method: reqwest::Method,
         endpoint: &str,
         body: Option<&[(&str, &str)]>,
     ) -> Result<T, AppError> {
+        use super::retry::{RetryConfig, with_retry};
+
         let url = format!("{}{}", STRIPE_API_URL, endpoint);
+        let config = RetryConfig::for_payments();
 
-        let mut request = self.client
-            .request(method, &url)
-            .bearer_auth(&self.secret_key);
+        // Clone what we need for the retry closure
+        let client = self.client.clone();
+        let secret_key = self.secret_key.clone();
+        let method_clone = method.clone();
+        let body_owned: Option<Vec<(String, String)>> = body.map(|b| {
+            b.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        });
 
-        if let Some(form_data) = body {
-            request = request.form(form_data);
-        }
+        let result = with_retry(&config, &format!("stripe_{}", endpoint), || {
+            let url = url.clone();
+            let client = client.clone();
+            let secret_key = secret_key.clone();
+            let method = method_clone.clone();
+            let body = body_owned.clone();
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| AppError::internal(format!("Stripe request failed: {}", e)))?;
+            async move {
+                let mut request = client
+                    .request(method, &url)
+                    .bearer_auth(&secret_key);
 
-        if !response.status().is_success() {
-            let error: StripeError = response.json().await
-                .unwrap_or(StripeError {
-                    error: StripeErrorDetail {
-                        message: "Unknown error".to_string(),
-                        error_type: "api_error".to_string(),
-                        code: None,
-                    },
-                });
-            return Err(AppError::internal(format!("Stripe error: {}", error.error.message)));
-        }
+                if let Some(ref form_data) = body {
+                    let form: Vec<(&str, &str)> = form_data.iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+                    request = request.form(&form);
+                }
 
-        response.json::<T>().await
-            .map_err(|e| AppError::internal(format!("Failed to parse Stripe response: {}", e)))
+                let response = request
+                    .send()
+                    .await
+                    .map_err(|e| AppError::internal(format!("Stripe request failed: {}", e)))?;
+
+                let status = response.status();
+
+                // Check for retryable HTTP status codes
+                if status.as_u16() == 429 || status.as_u16() >= 500 {
+                    return Err(AppError::internal(format!(
+                        "Stripe temporarily unavailable ({})",
+                        status
+                    )));
+                }
+
+                if !status.is_success() {
+                    let error: StripeError = response.json().await
+                        .unwrap_or(StripeError {
+                            error: StripeErrorDetail {
+                                message: "Unknown error".to_string(),
+                                error_type: "api_error".to_string(),
+                                code: None,
+                            },
+                        });
+                    return Err(AppError::internal(format!("Stripe error: {}", error.error.message)));
+                }
+
+                response.json::<T>().await
+                    .map_err(|e| AppError::internal(format!("Failed to parse Stripe response: {}", e)))
+            }
+        }).await?;
+
+        Ok(result.value)
     }
 }
 
@@ -205,13 +241,14 @@ impl PaymentProvider for StripeClient {
 
         let amount_str = request.amount_cents.to_string();
         let currency = request.currency.as_str().to_lowercase();
+        let user_id_str = request.user_id.to_string();
 
-        let mut form_data = vec![
+        let form_data = vec![
             ("amount", amount_str.as_str()),
             ("currency", &currency),
             ("automatic_payment_methods[enabled]", "true"),
             ("metadata[order_id]", &order_id),
-            ("metadata[user_id]", &request.user_id.to_string()),
+            ("metadata[user_id]", user_id_str.as_str()),
             ("metadata[product_id]", &request.product_id),
         ];
 

@@ -40,9 +40,14 @@ uuid = { version = "1", features = ["serde", "v4"] }
 # Environment
 dotenvy = "0.15"
 
-# Logging & Tracing
+# Logging & Tracing with OpenTelemetry
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = { version = "0.22", optional = true }
+opentelemetry = { version = "0.21", optional = true }
+opentelemetry_sdk = { version = "0.21", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.14", features = ["tonic", "metrics"], optional = true }
+opentelemetry-semantic-conventions = { version = "0.13", optional = true }
 
 # Image Processing
 base64 = "0.22"
@@ -73,6 +78,13 @@ async-graphql-axum = "7.0.13"
 # Metrics (optional, for production monitoring)
 metrics = "0.22"
 metrics-exporter-prometheus = "0.13"
+async-trait = "0.1.89"
+hex = "0.4.3"
+
+[features]
+default = []
+# Enable OpenTelemetry distributed tracing
+otel = ["tracing-opentelemetry", "opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "opentelemetry-semantic-conventions"]
 
 [profile.release]
 lto = true

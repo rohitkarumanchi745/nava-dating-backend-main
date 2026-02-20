@@ -541,6 +541,8 @@ pub struct LocationUpdateRequest {
 pub struct PurchasePassRequest {
     pub pass_type: String,
     pub promo_code: Option<String>,
+    /// Client-generated idempotency key to prevent duplicate purchases
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -1591,6 +1591,55 @@ pub async fn purchase_pass(
         return Err(AppError::bad_request("Cannot purchase free pass"));
     }
 
+    // Idempotency check: If idempotency_key provided, check if already processed
+    if let Some(ref idempotency_key) = payload.idempotency_key {
+        let existing: Option<(i32, String, String)> = sqlx::query_as(
+            r#"
+            SELECT id, payment_id, status
+            FROM user_subscriptions
+            WHERE user_id = $1 AND idempotency_key = $2
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id)
+        .bind(idempotency_key)
+        .fetch_optional(&state.db)
+        .await?;
+
+        if let Some((_, payment_id, status)) = existing {
+            // Return the existing subscription info (idempotent response)
+            return Ok(Json(json!({
+                "message": "Pass already purchased (idempotent)",
+                "pass_type": pass_type.as_str(),
+                "payment_id": payment_id,
+                "status": status,
+                "idempotent": true,
+            })));
+        }
+    }
+
+    // Check for existing active subscription of the same type
+    let existing_active: Option<(i32,)> = sqlx::query_as(
+        r#"
+        SELECT id FROM user_subscriptions
+        WHERE user_id = $1
+          AND pass_type = $2
+          AND is_active = TRUE
+          AND (end_date IS NULL OR end_date > NOW())
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(pass_type.as_str())
+    .fetch_optional(&state.db)
+    .await?;
+
+    if existing_active.is_some() {
+        return Err(AppError::bad_request(
+            "You already have an active subscription of this type"
+        ));
+    }
+
     let price_cents = pass_type.price_cents(&state.config);
 
     // Check for student discount
@@ -1613,10 +1662,10 @@ pub async fn purchase_pass(
             user_id, subscription_type, pass_type, status, original_price, amount_paid,
             discount_applied, discount_type, start_date, end_date, payment_id, is_active,
             enhanced_radius, can_see_city_names, unlimited_swipes, priority_visibility,
-            created_at, updated_at
+            idempotency_key, created_at, updated_at
         ) VALUES (
             $1, $2, $2, 'active', $3, $4, $5, $6, $7, $8, $9, TRUE,
-            $10, $11, TRUE, TRUE, NOW(), NOW()
+            $10, $11, TRUE, TRUE, $12, NOW(), NOW()
         )
         "#,
     )
@@ -1631,6 +1680,7 @@ pub async fn purchase_pass(
     .bind(&payment_id)
     .bind(pass_type.enhanced_radius_miles())
     .bind(pass_type.can_see_city_names())
+    .bind(&payload.idempotency_key)
     .execute(&state.db)
     .await?;
 
@@ -5796,6 +5846,8 @@ pub struct PurchaseUniversityPassRequest {
     pub country_code: Option<String>, // Required for country pass
     pub duration_days: Option<i32>,   // NULL for lifetime
     pub payment_id: Option<String>,
+    /// Client-generated idempotency key to prevent duplicate purchases
+    pub idempotency_key: Option<String>,
 }
 
 pub async fn purchase_university_pass(
@@ -5826,6 +5878,35 @@ pub async fn purchase_university_pass(
     // Country pass requires country_code
     if payload.pass_type == "country" && payload.country_code.is_none() {
         return Err(AppError::bad_request("country_code required for country pass"));
+    }
+
+    // Idempotency check: If idempotency_key provided, check if already processed
+    if let Some(ref idempotency_key) = payload.idempotency_key {
+        let existing: Option<(i64, String)> = sqlx::query_as(
+            r#"
+            SELECT id, status
+            FROM university_passes
+            WHERE user_id = $1 AND idempotency_key = $2
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id)
+        .bind(idempotency_key)
+        .fetch_optional(&state.db)
+        .await?;
+
+        if let Some((pass_id, status)) = existing {
+            // Return the existing pass info (idempotent response)
+            return Ok(Json(json!({
+                "message": "Pass already purchased (idempotent)",
+                "pass": {
+                    "id": pass_id,
+                    "type": payload.pass_type,
+                    "status": status,
+                },
+                "idempotent": true,
+            })));
+        }
     }
 
     // Calculate pricing
@@ -5875,8 +5956,8 @@ pub async fn purchase_university_pass(
     // Create pass
     let pass_id = sqlx::query_scalar::<_, i64>(
         r#"
-        INSERT INTO university_passes (user_id, pass_type, country_code, status, start_date, end_date, amount_paid, payment_id)
-        VALUES ($1, $2, $3, 'active', NOW(), $4, $5, $6)
+        INSERT INTO university_passes (user_id, pass_type, country_code, status, start_date, end_date, amount_paid, payment_id, idempotency_key)
+        VALUES ($1, $2, $3, 'active', NOW(), $4, $5, $6, $7)
         RETURNING id
         "#
     )
@@ -5886,6 +5967,7 @@ pub async fn purchase_university_pass(
     .bind(end_date)
     .bind(price)
     .bind(&payload.payment_id)
+    .bind(&payload.idempotency_key)
     .fetch_one(&state.db)
     .await?;
 

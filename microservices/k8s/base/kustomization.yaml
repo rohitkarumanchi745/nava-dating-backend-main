@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nava
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secrets.yaml
+  - postgres.yaml
+  - redis.yaml
+  - neo4j.yaml
+  - gateway.yaml
+  - auth-service.yaml
+  - user-service.yaml
+  - match-service.yaml
+  - chat-service.yaml
+  - payment-service.yaml
+  - ambassador-service.yaml
+  - ingress.yaml
+  - hpa-advanced.yaml
+
+commonLabels:
+  app.kubernetes.io/name: nava
+  app.kubernetes.io/managed-by: kustomize

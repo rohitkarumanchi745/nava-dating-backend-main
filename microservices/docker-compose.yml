@@ -1,0 +1,389 @@
+version: '3.8'
+
+services:
+  # ============================================
+  # Infrastructure Services
+  # ============================================
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: nava-postgres
+    environment:
+      POSTGRES_USER: nava
+      POSTGRES_PASSWORD: nava_secret
+      POSTGRES_DB: nava_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nava -d nava_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: nava-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: nava-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/nava_secret
+    ports:
+      - "7474:7474"  # HTTP
+      - "7687:7687"  # Bolt
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD", "neo4j", "status"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # ============================================
+  # Kafka Infrastructure
+  # ============================================
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: nava-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: nava-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: nava-schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: nava-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: nava-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+  # Kafka topic initialization
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: nava-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      bash -c "
+        echo 'Creating Kafka topics...'
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 3 --replication-factor 1 --topic user.events
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 3 --replication-factor 1 --topic payment.events
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 3 --replication-factor 1 --topic match.events
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 3 --replication-factor 1 --topic chat.events
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 3 --replication-factor 1 --topic notification.commands
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 3 --replication-factor 1 --topic analytics.events
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 1 --replication-factor 1 --topic dlq.events
+        echo 'Topics created successfully!'
+        kafka-topics --list --bootstrap-server kafka:29092
+      "
+
+  # ============================================
+  # API Gateway
+  # ============================================
+
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    container_name: nava-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - GATEWAY_PORT=8000
+      - AUTH_SERVICE_URL=http://auth-service:8001
+      - USER_SERVICE_URL=http://user-service:8002
+      - MATCH_SERVICE_URL=http://match-service:8003
+      - CHAT_SERVICE_URL=http://chat-service:8004
+      - PAYMENT_SERVICE_URL=http://payment-service:8005
+      - AMBASSADOR_SERVICE_URL=http://ambassador-service:8006
+      - NOTIFICATION_SERVICE_URL=http://notification-service:8007
+      - ANALYTICS_SERVICE_URL=http://analytics-service:8008
+      - JWT_SECRET=your-super-secret-jwt-key-change-in-production
+    depends_on:
+      - auth-service
+      - user-service
+      - match-service
+      - chat-service
+      - payment-service
+      - ambassador-service
+      - notification-service
+      - analytics-service
+
+  # ============================================
+  # Application Services
+  # ============================================
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: services/auth-service/Dockerfile
+    container_name: nava-auth-service
+    ports:
+      - "8001:8001"
+    environment:
+      - AUTH_SERVICE_PORT=8001
+      - DATABASE_URL=postgres://nava:nava_secret@postgres:5432/nava_db
+      - REDIS_URL=redis://redis:6379
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - KAFKA_CLIENT_ID=auth-service
+      - JWT_SECRET=your-super-secret-jwt-key-change-in-production
+      - JWT_EXPIRY=3600
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}
+      - TWILIO_PHONE_NUMBER=${TWILIO_PHONE_NUMBER}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  user-service:
+    build:
+      context: .
+      dockerfile: services/user-service/Dockerfile
+    container_name: nava-user-service
+    ports:
+      - "8002:8002"
+    environment:
+      - USER_SERVICE_PORT=8002
+      - DATABASE_URL=postgres://nava:nava_secret@postgres:5432/nava_db
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - KAFKA_CLIENT_ID=user-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  match-service:
+    build:
+      context: .
+      dockerfile: services/match-service/Dockerfile
+    container_name: nava-match-service
+    ports:
+      - "8003:8003"
+    environment:
+      - MATCH_SERVICE_PORT=8003
+      - DATABASE_URL=postgres://nava:nava_secret@postgres:5432/nava_db
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - KAFKA_CLIENT_ID=match-service
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=nava_secret
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  chat-service:
+    build:
+      context: .
+      dockerfile: services/chat-service/Dockerfile
+    container_name: nava-chat-service
+    ports:
+      - "8004:8004"
+    environment:
+      - CHAT_SERVICE_PORT=8004
+      - DATABASE_URL=postgres://nava:nava_secret@postgres:5432/nava_db
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - KAFKA_CLIENT_ID=chat-service
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: services/payment-service/Dockerfile
+    container_name: nava-payment-service
+    ports:
+      - "8005:8005"
+    environment:
+      - PAYMENT_SERVICE_PORT=8005
+      - DATABASE_URL=postgres://nava:nava_secret@postgres:5432/nava_db
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - KAFKA_CLIENT_ID=payment-service
+      - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID}
+      - RAZORPAY_KEY_SECRET=${RAZORPAY_KEY_SECRET}
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  ambassador-service:
+    build:
+      context: .
+      dockerfile: services/ambassador-service/Dockerfile
+    container_name: nava-ambassador-service
+    ports:
+      - "8006:8006"
+    environment:
+      - AMBASSADOR_SERVICE_PORT=8006
+      - DATABASE_URL=postgres://nava:nava_secret@postgres:5432/nava_db
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - KAFKA_CLIENT_ID=ambassador-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  # ============================================
+  # Notification Service (Event Consumer)
+  # ============================================
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: services/notification-service/Dockerfile
+    container_name: nava-notification-service
+    ports:
+      - "8007:8007"
+    environment:
+      - NOTIFICATION_SERVICE_PORT=8007
+      - DATABASE_URL=postgres://nava:nava_secret@postgres:5432/nava_db
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - KAFKA_CLIENT_ID=notification-service
+      - KAFKA_GROUP_ID=notification-consumer-group
+      - FCM_SERVER_KEY=${FCM_SERVER_KEY}
+      - APNS_KEY_ID=${APNS_KEY_ID}
+      - APNS_TEAM_ID=${APNS_TEAM_ID}
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  # ============================================
+  # Analytics Service (Event Consumer)
+  # ============================================
+
+  analytics-service:
+    build:
+      context: .
+      dockerfile: services/analytics-service/Dockerfile
+    container_name: nava-analytics-service
+    ports:
+      - "8008:8008"
+    environment:
+      - ANALYTICS_SERVICE_PORT=8008
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - KAFKA_CLIENT_ID=analytics-service
+      - KAFKA_GROUP_ID=analytics-consumer-group
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_DATABASE=nava_analytics
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+  neo4j_data:
+  zookeeper_data:
+  zookeeper_log:
+  kafka_data:
+
+networks:
+  default:
+    name: nava-network
