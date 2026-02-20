@@ -11,6 +11,11 @@ pip-wheel-metadata/
 dist/
 build/
 
+# Accidentally created venv folders
+this/
+creates/
+\#/
+
 # OS / IDE
 .DS_Store
 .vscode/
