@@ -1,4 +1,4 @@
-# Telugu Dating Backend
+# Nava Dating Backend
 
 ## Setup
 ```bash
