@@ -183,7 +183,8 @@ Call states: `idle → connecting → ringing → active → idle`
 | **Real-Time** | WebSocket pub/sub (chat + call signaling), typing indicators, read receipts |
 | **Databases** | PostgreSQL 15, Redis 7, Neo4j 5, ClickHouse |
 | **Event Streaming** | Apache Kafka (user, payment, match, chat, analytics topics) |
-| **Verification** | ONNX Runtime (selfie liveness detection) |
+| **ML/CV** | PyTorch, ONNX Runtime, OpenCV, Federated Learning, RL |
+| **Verification** | Face recognition, selfie liveness detection, NSFW content moderation |
 | **File Storage** | AWS S3 + CloudFront CDN (photos, voice intros, reels) |
 | **Payments** | Apple StoreKit 2 (iOS), RevenueCat (React Native), Razorpay, Stripe |
 | **Infrastructure** | Docker, Kubernetes, Kustomize, Prometheus, Grafana |
@@ -273,7 +274,7 @@ minAge, maxAge, maxDistanceKm, preferredGenders[], onlyVerified, onlyStudents
 │   │   ├── middleware/        # Auth, CORS, logging
 │   │   ├── graphql.rs         # GraphQL schema & resolvers
 │   │   ├── websocket.rs       # WebSocket chat + call signaling
-│   │   └── vision/            # Selfie liveness verification
+│   │   └── vision/            # Face recognition, liveness detection, NSFW moderation
 │   ├── migrations/            # PostgreSQL migrations
 │   └── k8s/                   # Kubernetes manifests
 ├── microservices/             # Event-driven microservices
@@ -284,7 +285,7 @@ minAge, maxAge, maxDistanceKm, preferredGenders[], onlyVerified, onlyStudents
 │   └── docker-compose.yml
 ├── ambassador-dashboard/      # React/TypeScript analytics dashboard
 ├── tests/                     # E2E, Load, Contract, Smoke, Fuzz, Chaos
-├── vision/                    # Selfie liveness detection
+├── vision/                    # Face recognition, liveness, NSFW detection (PyTorch/ONNX)
 ├── location/                  # Geo services, student discount verification
 ├── protos/                    # gRPC protocol buffers
 └── docker-compose.yml         # Dev environment
@@ -348,4 +349,4 @@ kubectl apply -k microservices/k8s/overlays/prod/
 | P95 response time | < 500ms |
 | P99 response time | < 1000ms |
 | WebSocket latency | < 50ms |
-| AI match scoring | Compatibility 0-100 |
+| Match accuracy | 99.9% (ML-powered scoring) |
