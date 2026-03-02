@@ -385,3 +385,91 @@ kubectl apply -k microservices/k8s/overlays/prod/
 - Advanced profile recommendation using transformer-based models
 - Real-time sentiment analysis on chat messages
 - AI photo enhancement and auto-cropping suggestions
+
+## Revenue Model
+
+### 1. Subscriptions (Passes)
+
+| Pass | Duration | Radius | Features |
+|------|----------|--------|----------|
+| **Free** | — | — | Basic discovery, limited likes |
+| **Hourly** | 1 hr | 2 mi | Exact distance, enhanced discovery |
+| **Daily** | 24 hr | 5 mi | Exact distance, enhanced discovery |
+| **Weekly** | 7 days | 10 mi | Exact distance, enhanced discovery |
+| **Monthly** | 30 days | 25 mi | Exact distance, enhanced discovery |
+| **Ultra** | Unlimited | Unlimited | City names, exact distance, all features |
+
+**Premium Tiers (iOS StoreKit / RevenueCat):**
+
+| Tier | Key Features |
+|------|-------------|
+| **Gold** | Unlimited likes, see who likes you, 5 super likes/day, 1 boost/month, advanced filters |
+| **Platinum** | All Gold + priority matching, read receipts, weekly boost, undo swipe |
+| **Ultra** | All Platinum + priority support, exclusive events, unlimited super likes |
+
+**Consumables:** Boosts (1x, 5x), Super Likes (5x), Spotlight (1hr)
+
+### 2. Ad Monetization
+
+Multi-network ad serving with location and language targeting:
+
+| Ad Type | Revenue | Placement |
+|---------|---------|-----------|
+| **Banner** | Low | Non-intrusive, persistent |
+| **Interstitial** | Medium | Between screens |
+| **Native** | Medium | In-feed discovery |
+| **Rewarded** | High | User-initiated for rewards |
+
+**Ad Networks:** Google AdMob, Meta Audience Network, Unity Ads
+
+**Targeting:**
+- Location-based (country, state, city — India-first with regional targeting)
+- Language-based (Telugu, Hindi, Tamil, Kannada, + 9 more languages)
+- Platform-aware (iOS/Android)
+
+**Rewarded Ad Rewards:**
+
+| Reward | Amount | Trigger |
+|--------|--------|---------|
+| Boost | 1 free boost | Watch ad on boost screen |
+| Super Like | 1 super like | Watch ad on super like screen |
+| Premium Hours | 2 hours | Watch ad |
+| Extra Likes | 5 likes | Watch ad |
+| Profile View | 1 reveal | Watch ad |
+
+### 3. Ambassador Program
+
+Referral-driven growth engine with tiered ambassador compensation:
+
+| Tier | Monthly Target | Monthly Stipend | Bonus/Signup |
+|------|---------------|-----------------|--------------|
+| **Campus** | 50 signups | ₹10,000 | ₹50 |
+| **Regional** | 200 signups | ₹25,000 | ₹40 |
+| **City** | 500 signups | ₹50,000 | ₹30 |
+
+- Referral code tracking with signup attribution
+- Real-time performance dashboard (React)
+- Daily/weekly/monthly breakdown analytics
+- Leaderboard and earnings tracking
+
+### 4. Student Discounts
+
+University-tiered pricing to drive campus adoption:
+
+| Tier | Discount | Eligibility |
+|------|----------|-------------|
+| **Ivy / Top Private** | 30% | Top private universities |
+| **Top 50 / Top Public** | 20% | Top 50 public universities |
+| **State University** | 15% | State universities |
+| **Graduate Student** | 15% | Graduate programs |
+| **Other** | 10% | Any .edu email |
+| **Alumni** | 5% | Verified alumni |
+
+### 5. Payment Gateways
+
+| Gateway | Market | Integration |
+|---------|--------|-------------|
+| **Apple StoreKit 2** | iOS (US/Global) | Server-side receipt validation |
+| **RevenueCat** | Cross-platform | Subscription management + webhook sync |
+| **Razorpay** | India | UPI, cards, wallets, netbanking |
+| **Stripe** | Global | Cards, subscriptions, webhooks |
