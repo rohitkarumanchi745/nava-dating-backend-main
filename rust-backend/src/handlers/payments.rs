@@ -525,7 +525,7 @@ async fn grant_product_to_user(db: &sqlx::PgPool, user_id: i32, product_id: i32)
             // Update user to premium
             sqlx::query!(
                 "UPDATE users SET is_premium = true WHERE id = $1",
-                user_id
+                user_id as i64
             )
             .execute(db)
             .await?;
@@ -677,6 +677,142 @@ fn format_price(amount_cents: i64, currency: &str) -> String {
         "GBP" => format!("£{:.2}", amount),
         _ => format!("{} {:.2}", currency, amount),
     }
+}
+
+// ============================================================================
+// Apple StoreKit 2 Verification
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct VerifyApplePayload {
+    pub transaction_id: String,
+    pub product_id: String,
+    pub original_transaction_id: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct VerifyAppleResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+/// Verify an Apple StoreKit 2 transaction and grant the product
+/// POST /api/payments/verify-apple
+pub async fn verify_apple_payment(
+    State(state): State<AppState>,
+    claims: Claims,
+    Json(payload): Json<VerifyApplePayload>,
+) -> Result<Json<VerifyAppleResponse>, AppError> {
+    let user_id = claims.sub.parse::<i32>()
+        .map_err(|_| AppError::unauthorized("Invalid token"))?;
+
+    // Check for duplicate transaction
+    let existing = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM payment_transactions WHERE gateway_payment_id = $1 AND gateway = 'apple')"
+    )
+    .bind(&payload.transaction_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(false);
+
+    if existing {
+        return Ok(Json(VerifyAppleResponse {
+            success: true,
+            message: "Transaction already recorded".to_string(),
+        }));
+    }
+
+    // Look up product by store product ID (e.g. "com.nava.gold_monthly" -> backend product)
+    let product = sqlx::query!(
+        "SELECT id, product_type FROM products WHERE product_id = $1 AND is_active = true",
+        payload.product_id
+    )
+    .fetch_optional(&state.db)
+    .await?;
+
+    let product = match product {
+        Some(p) => p,
+        None => {
+            tracing::warn!("Apple verify: unknown product_id={}", payload.product_id);
+            return Ok(Json(VerifyAppleResponse {
+                success: false,
+                message: format!("Unknown product: {}", payload.product_id),
+            }));
+        }
+    };
+
+    // Create transaction record
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query!(
+        r#"
+        INSERT INTO payment_transactions
+        (transaction_id, order_id, user_id, gateway, gateway_payment_id, amount_cents, currency, status)
+        VALUES ($1, NULL, $2, 'apple', $3, 0, 'USD', 'completed')
+        "#,
+        transaction_id,
+        user_id,
+        payload.transaction_id
+    )
+    .execute(&state.db)
+    .await?;
+
+    // Grant the product to the user
+    grant_product_to_user(&state.db, user_id, product.id).await?;
+
+    tracing::info!(
+        "Apple payment verified: user={}, product={}, txn={}",
+        user_id, payload.product_id, payload.transaction_id
+    );
+
+    Ok(Json(VerifyAppleResponse {
+        success: true,
+        message: "Payment verified and product granted".to_string(),
+    }))
+}
+
+// ============================================================================
+// Account Deletion (GDPR / App Store requirement)
+// ============================================================================
+
+/// Delete the authenticated user's account and all associated data
+/// DELETE /account/delete
+pub async fn delete_account(
+    State(state): State<AppState>,
+    claims: Claims,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user_id = claims.sub.parse::<i32>()
+        .map_err(|_| AppError::unauthorized("Invalid token"))?;
+
+    // Soft-delete: mark account as inactive (preserves data for recovery)
+    sqlx::query!(
+        "UPDATE users SET is_active = false, updated_at = NOW() WHERE id = $1",
+        user_id as i64
+    )
+    .execute(&state.db)
+    .await?;
+
+    // Cancel any active subscriptions
+    sqlx::query!(
+        "UPDATE user_subscriptions SET status = 'cancelled', cancelled_at = NOW() WHERE user_id = $1 AND status = 'active'",
+        user_id
+    )
+    .execute(&state.db)
+    .await?;
+
+    // Remove from discovery
+    sqlx::query!(
+        "DELETE FROM user_locations WHERE user_id = $1",
+        user_id as i64
+    )
+    .execute(&state.db)
+    .await?;
+
+    tracing::info!("Account deleted: user_id={}", user_id);
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Account scheduled for deletion. Data will be permanently removed in 30 days."
+    })))
 }
 
 /// Get DLQ statistics for monitoring

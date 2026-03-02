@@ -105,9 +105,9 @@ use handlers::{
     // Web Payments (Razorpay + Stripe)
     payments::{
         create_order as payment_create_order,
-        verify_payment, list_products, get_subscriptions,
+        verify_payment, verify_apple_payment, list_products, get_subscriptions,
         cancel_subscription, razorpay_webhook, stripe_webhook,
-        dlq_stats,
+        dlq_stats, delete_account,
     },
     // Ads
     ads::{request_ad, record_impression, rewarded_complete, get_rewards_balance},
@@ -642,9 +642,12 @@ async fn main() {
         .route("/api/payments/products", get(list_products))
         .route("/api/payments/subscriptions", get(get_subscriptions))
         .route("/api/payments/subscriptions/cancel", post(cancel_subscription))
+        .route("/api/payments/verify-apple", post(verify_apple_payment))
         .route("/api/payments/dlq/stats", get(dlq_stats))
         .route("/webhook/razorpay", post(razorpay_webhook))
         .route("/webhook/stripe", post(stripe_webhook))
+        // Account Management
+        .route("/account/delete", post(delete_account))
         // Ads Monetization
         .route("/api/ads/request", get(request_ad))
         .route("/api/ads/impression", post(record_impression))
