@@ -183,8 +183,10 @@ Call states: `idle → connecting → ringing → active → idle`
 | **Real-Time** | WebSocket pub/sub (chat + call signaling), typing indicators, read receipts |
 | **Databases** | PostgreSQL 15, Redis 7, Neo4j 5, ClickHouse |
 | **Event Streaming** | Apache Kafka (user, payment, match, chat, analytics topics) |
-| **ML/CV** | PyTorch, ONNX Runtime, OpenCV, Federated Learning, RL |
+| **ML/CV** | PyTorch, ONNX Runtime, OpenCV, Federated Learning, RL, pgvector |
+| **LLM** | LLaMA 3 (content labeling, moderation), batch inference pipeline |
 | **Verification** | Face recognition, selfie liveness detection, NSFW content moderation |
+| **Recommendations** | pgvector 512-dim embeddings, short/long-term user vectors, collaborative filtering |
 | **File Storage** | AWS S3 + CloudFront CDN (photos, voice intros, reels) |
 | **Payments** | Apple StoreKit 2 (iOS), RevenueCat (React Native), Razorpay, Stripe |
 | **Infrastructure** | Docker, Kubernetes, Kustomize, Prometheus, Grafana |
@@ -350,3 +352,36 @@ kubectl apply -k microservices/k8s/overlays/prod/
 | P99 response time | < 1000ms |
 | WebSocket latency | < 50ms |
 | Match accuracy | 99.9% (ML-powered scoring) |
+
+## ML & AI Architecture
+
+### On-Device Federated Learning
+- **RL Agent** — Q-learning based matching optimization with per-user weights
+- **Federated Averaging** — Privacy-preserving model aggregation across clients (min 10 clients, 10% fraction per round)
+- **Differential Privacy** — Noise multiplier (1.0) + gradient clipping (norm 1.0) for user data protection
+- **Config:** `FL_ENABLED`, `FL_MIN_CLIENTS`, `FL_CLIENT_FRACTION`, `FL_LOCAL_EPOCHS`, `FL_LEARNING_RATE`, `FL_DP_ENABLED`
+
+### LLM Integration (LLaMA 3)
+- **Content Labeling** — Automated profile/bio moderation and tagging
+- **Batch Inference** — Configurable batch size (10) with retry logic (max 3)
+- **Config:** `LLM_ENABLED`, `LLM_API_URL`, `LLM_MODEL_NAME=llama3`, `LLM_BATCH_SIZE`
+
+### Recommendation Engine (pgvector)
+- **User Embeddings** — 512-dim vectors (short-term + long-term) stored in PostgreSQL with pgvector
+- **Behavioral Features** — Session duration, like/save/skip rates, category affinities, active hours
+- **Interaction Tracking** — Impressions, views, likes, saves, shares, skips, matches, messages across surfaces (discover, playground, search, profile, notification)
+- **Collaborative Filtering** — Creator affinities + engagement rate scoring
+
+### Computer Vision Pipeline
+- **Face Recognition** — Embedding extraction + cosine similarity matching
+- **Selfie Liveness Detection** — Anti-spoofing with ONNX Runtime (tract-onnx)
+- **NSFW Detection** — Content quality scoring and moderation
+- **Federated CV Updates** — Verification results feed back into federated learning rounds
+
+### Future AI Roadmap
+- LLM-powered conversational AI for in-app date coaching
+- AI-generated icebreakers and conversation starters based on mutual interests
+- Voice-to-text transcription for voice intros with semantic matching
+- Advanced profile recommendation using transformer-based models
+- Real-time sentiment analysis on chat messages
+- AI photo enhancement and auto-cropping suggestions
