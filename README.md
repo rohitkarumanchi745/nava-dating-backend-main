@@ -183,7 +183,7 @@ Call states: `idle → connecting → ringing → active → idle`
 | **Real-Time** | WebSocket pub/sub (chat + call signaling), typing indicators, read receipts |
 | **Databases** | PostgreSQL 15, Redis 7, Neo4j 5, ClickHouse |
 | **Event Streaming** | Apache Kafka (user, payment, match, chat, analytics topics) |
-| **ML/CV** | PyTorch, ONNX Runtime, OpenCV, Federated Learning |
+| **Verification** | ONNX Runtime (selfie liveness detection) |
 | **File Storage** | AWS S3 + CloudFront CDN (photos, voice intros, reels) |
 | **Payments** | Apple StoreKit 2 (iOS), RevenueCat (React Native), Razorpay, Stripe |
 | **Infrastructure** | Docker, Kubernetes, Kustomize, Prometheus, Grafana |
@@ -273,7 +273,7 @@ minAge, maxAge, maxDistanceKm, preferredGenders[], onlyVerified, onlyStudents
 │   │   ├── middleware/        # Auth, CORS, logging
 │   │   ├── graphql.rs         # GraphQL schema & resolvers
 │   │   ├── websocket.rs       # WebSocket chat + call signaling
-│   │   └── vision/            # Face verification, liveness detection
+│   │   └── vision/            # Selfie liveness verification
 │   ├── migrations/            # PostgreSQL migrations
 │   └── k8s/                   # Kubernetes manifests
 ├── microservices/             # Event-driven microservices
@@ -284,7 +284,7 @@ minAge, maxAge, maxDistanceKm, preferredGenders[], onlyVerified, onlyStudents
 │   └── docker-compose.yml
 ├── ambassador-dashboard/      # React/TypeScript analytics dashboard
 ├── tests/                     # E2E, Load, Contract, Smoke, Fuzz, Chaos
-├── vision/                    # CV models (face recognition, NSFW, liveness)
+├── vision/                    # Selfie liveness detection
 ├── location/                  # Geo services, student discount verification
 ├── protos/                    # gRPC protocol buffers
 └── docker-compose.yml         # Dev environment
@@ -348,4 +348,4 @@ kubectl apply -k microservices/k8s/overlays/prod/
 | P95 response time | < 500ms |
 | P99 response time | < 1000ms |
 | WebSocket latency | < 50ms |
-| Match accuracy | 99.9% (ML-powered) |
+| AI match scoring | Compatibility 0-100 |
