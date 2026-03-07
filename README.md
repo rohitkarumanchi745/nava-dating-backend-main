@@ -215,6 +215,161 @@ Call states: `idle → connecting → ringing → active → idle`
 | **Cross-Platform** | React Native, Expo, TypeScript |
 | **Dashboard** | React, TypeScript, Vite, Tailwind CSS |
 
+## Libraries, Packages & Connectors
+
+### Rust Crates (Backend)
+
+| Category | Crate | Version | Purpose |
+|----------|-------|---------|---------|
+| **Web Framework** | `axum` | 0.8 | HTTP server with JSON, WebSocket, multipart support |
+| | `axum-extra` | 0.10 | Typed headers |
+| | `tower` | 0.5 | Middleware stack (timeout, rate limit, load-shed) |
+| | `tower-http` | 0.6 | CORS, compression (gzip), tracing, request-id, timeout |
+| **Async Runtime** | `tokio` | 1.x | Multi-threaded async runtime with signal handling, fs, parking_lot |
+| | `futures` | 0.3 | Async combinators |
+| | `tokio-stream` | 0.1 | Stream utilities for async |
+| | `async-trait` | 0.1 | Async trait support |
+| **Database** | `sqlx` | 0.7 | Async PostgreSQL driver with compile-time query checking, chrono, JSON, UUID, Decimal |
+| | `redis` | 0.24 | Async Redis client with connection manager + tokio integration |
+| | `neo4rs` | 0.8 | Async Neo4j Bolt protocol driver |
+| **Serialization** | `serde` | 1.x | Serialization/deserialization framework |
+| | `serde_json` | 1.x | JSON parsing and generation |
+| | `rust_decimal` | 1.33 | Decimal arithmetic for financial calculations |
+| **Authentication** | `jsonwebtoken` | 9 | JWT token encode/decode (HS256/RS256) |
+| | `bcrypt` | 0.15 | Password hashing (bcrypt) |
+| **GraphQL** | `async-graphql` | 7.0 | GraphQL server with chrono, UUID, DataLoader |
+| | `async-graphql-axum` | 7.0 | Axum integration for GraphQL |
+| **Time & UUID** | `chrono` | 0.4 | Date/time handling with serde |
+| | `uuid` | 1.x | UUID v4 generation with serde |
+| **Computer Vision** | `tract-onnx` | 0.21 | ONNX model inference (ArcFace, FER+, NSFW, NIMA, Liveness) |
+| | `image` | 0.25 | Image decoding, resizing, pixel manipulation |
+| | `base64` | 0.22 | Base64 encoding/decoding for image data |
+| **ML** | `rand` | 0.8 | Random number generation (epsilon-greedy, Laplace noise) |
+| **HTTP Client** | `reqwest` | 0.12 | HTTP client with rustls-tls (S3, external APIs) |
+| **Crypto** | `sha2` | 0.10 | SHA-256 hashing (AWS Signature V4) |
+| | `hmac` | 0.12 | HMAC authentication (CloudFront signed URLs) |
+| | `hex` | 0.4 | Hex encoding for crypto operations |
+| **Email** | `lettre` | 0.11 | SMTP email client with TLS (OTP, notifications) |
+| **Observability** | `tracing` | 0.1 | Structured logging and distributed tracing |
+| | `tracing-subscriber` | 0.3 | Log output with env-filter and JSON format |
+| | `metrics` | 0.22 | Application metrics (counters, gauges) |
+| | `metrics-exporter-prometheus` | 0.13 | Prometheus metrics endpoint |
+| **OpenTelemetry** | `tracing-opentelemetry` | 0.22 | OpenTelemetry tracing bridge (optional) |
+| | `opentelemetry` | 0.21 | OpenTelemetry API (optional) |
+| | `opentelemetry_sdk` | 0.21 | OpenTelemetry SDK with tokio runtime (optional) |
+| | `opentelemetry-otlp` | 0.14 | OTLP exporter with tonic + metrics (optional) |
+| **Error Handling** | `thiserror` | 1.0 | Derive macros for error types |
+| **Validation** | `validator` | 0.16 | Input validation with derive macros |
+| **Environment** | `dotenvy` | 0.15 | `.env` file loading |
+
+### Rust Crates (Microservices)
+
+| Category | Crate | Version | Purpose |
+|----------|-------|---------|---------|
+| **Event Streaming** | `rdkafka` | 0.36 | Apache Kafka client (producer + consumer) with SSL |
+| **gRPC** | `tonic` | 0.10 | gRPC framework for inter-service communication |
+| | `prost` | 0.12 | Protocol Buffers code generation |
+| **Error Handling** | `anyhow` | 1.x | Error context and chaining |
+
+### Python Packages (ML & API)
+
+| Category | Package | Version | Purpose |
+|----------|---------|---------|---------|
+| **Web Framework** | `fastapi` | 0.116 | Async REST API framework |
+| | `uvicorn` | 0.35 | ASGI server |
+| | `uvloop` | 0.21 | High-performance event loop |
+| | `starlette` | 0.47 | ASGI toolkit (FastAPI dependency) |
+| **Database** | `sqlalchemy` | 2.0 | SQL ORM + connection pooling |
+| | `sqlmodel` | 0.0.24 | Pydantic + SQLAlchemy models |
+| | `asyncpg` | 0.30 | Async PostgreSQL driver |
+| | `psycopg2-binary` | 2.9 | Sync PostgreSQL driver |
+| | `redis` | 6.4 | Redis client |
+| **Deep Learning** | `torch` | 2.3 | PyTorch deep learning framework |
+| | `torchvision` | 0.18 | Vision models and transforms |
+| | `torchaudio` | 2.3 | Audio processing |
+| **Computer Vision** | `opencv-python` | 4.9 | Image/video processing |
+| | `face-recognition` | 1.3 | Face detection and recognition (dlib-based) |
+| | `dlib-bin` | 19.24 | Face landmark detection |
+| | `pillow` | 11.3 | Image manipulation |
+| **ML/Data Science** | `scikit-learn` | 1.3 | Machine learning algorithms |
+| | `numpy` | 1.26 | Numerical computing |
+| | `pandas` | 2.0 | Data manipulation and analysis |
+| | `scipy` | 1.10 | Scientific computing |
+| | `datafusion` | 41.0 | SQL query engine for analytics |
+| **GraphQL** | `strawberry-graphql` | 0.157 | GraphQL server with FastAPI integration |
+| **gRPC** | `grpcio` | 1.76 | gRPC client/server |
+| | `grpcio-tools` | 1.76 | Protocol Buffers compiler |
+| **Payments** | `stripe` | 12.5 | Stripe payment processing SDK |
+| **Event Streaming** | `kafka-python` | 2.0 | Apache Kafka producer/consumer |
+| **Auth & Crypto** | `python-jose` | 3.5 | JWT token handling |
+| | `bcrypt` | 4.3 | Password hashing |
+| | `cryptography` | 45.0 | TLS, X.509, encryption |
+| | `passlib` | 1.7 | Password hashing utilities |
+| **Geolocation** | `reverse_geocoder` | 1.5 | Coordinate to city/country lookup |
+| **Validation** | `pydantic` | 2.11 | Data validation and serialization |
+| **WebSocket** | `websockets` | 15.0 | WebSocket client/server |
+| **HTTP** | `requests` | 2.32 | HTTP client for external APIs |
+| **Environment** | `python-dotenv` | 1.1 | `.env` file loading |
+
+### NPM Packages (Ambassador Dashboard)
+
+| Category | Package | Version | Purpose |
+|----------|---------|---------|---------|
+| **UI Framework** | `react` | 18.2 | UI component library |
+| | `react-dom` | 18.2 | React DOM renderer |
+| | `react-router-dom` | 6.20 | Client-side routing |
+| **Charts** | `recharts` | 2.10 | Data visualization (performance charts, leaderboards) |
+| **HTTP** | `axios` | 1.6 | HTTP client for API calls |
+| **State Management** | `zustand` | 4.4 | Lightweight state management |
+| **Styling** | `tailwindcss` | 3.3 | Utility-first CSS framework |
+| | `tailwind-merge` | 2.1 | Merge Tailwind classes |
+| | `clsx` | 2.0 | Conditional CSS class joining |
+| **Date** | `date-fns` | 3.0 | Date formatting and manipulation |
+| **Build** | `vite` | 5.0 | Build tool and dev server |
+| | `typescript` | 5.3 | TypeScript compiler |
+
+### External Services & Connectors
+
+| Service | Purpose | Integration |
+|---------|---------|-------------|
+| **PostgreSQL 16** | Primary database (users, matches, payments, ML features) | `sqlx` (Rust), `asyncpg` (Python) |
+| **Redis 7** | Cache, rate limiting, OTP storage, session management, instance heartbeat | `redis` crate (Rust), `redis` package (Python) |
+| **Neo4j 5** | Social graph relationships, friend-of-friend discovery | `neo4rs` (Bolt protocol) |
+| **Apache Kafka** | Event streaming (user, payment, match, chat, analytics topics) | `rdkafka` (Rust), `kafka-python` (Python) |
+| **ClickHouse** | OLAP analytics database (DAU, event aggregation) | HTTP API |
+| **AWS S3** | Photo, voice intro, reel storage | `reqwest` with AWS Signature V4 |
+| **AWS CloudFront** | CDN for media delivery | Signed URLs via `hmac` + `sha2` |
+| **AWS EKS** | Kubernetes cluster for production | `kubectl`, Kustomize |
+| **AWS ECR** | Docker image registry | GitHub Actions push |
+| **AWS RDS** | Managed PostgreSQL (production) | ExternalName K8s service |
+| **AWS ElastiCache** | Managed Redis (production) | ExternalName K8s service |
+| **AWS ACM** | TLS certificates for ALB | ALB Ingress annotation |
+| **AWS SES** | Transactional email | SMTP via `lettre` |
+| **Apple StoreKit 2** | iOS in-app purchases and subscriptions | Server-side receipt validation |
+| **RevenueCat** | Cross-platform subscription management | Webhook sync |
+| **Razorpay** | India payments (UPI, cards, wallets, netbanking) | REST API + webhooks |
+| **Stripe** | Global card payments and subscriptions | `stripe` Python SDK + webhooks |
+| **Twilio** | SMS OTP delivery | REST API |
+| **Firebase (FCM)** | Android push notifications | HTTP API |
+| **Apple (APNs)** | iOS push notifications | HTTP/2 API |
+| **SendGrid / SMTP** | Email delivery (OTP, notifications) | SMTP transport |
+| **Prometheus** | Metrics collection and alerting | `/metrics` endpoint |
+| **Grafana** | Metrics visualization and dashboards | Prometheus data source |
+| **InfluxDB** | Time-series metrics (load testing) | k6 integration |
+| **Confluent Schema Registry** | Kafka message schema validation | HTTP API |
+
+### Build & DevOps Tools
+
+| Tool | Purpose |
+|------|---------|
+| **Docker** | Container builds (multi-stage Rust, Python) |
+| **Kubernetes** | Container orchestration (EKS) |
+| **Kustomize** | K8s manifest management (base + overlays) |
+| **GitHub Actions** | CI/CD (test, build, push, deploy) |
+| **k6** | Load testing |
+| **cargo** | Rust build system and package manager |
+| **protoc / prost** | Protocol Buffers code generation |
+
 ## ML & AI Architecture
 
 ### In-Memory ML Engine (Rust)
