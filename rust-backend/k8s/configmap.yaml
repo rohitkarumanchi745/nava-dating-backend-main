@@ -79,6 +79,11 @@ data:
   FL_NOISE_MULTIPLIER: "1.0"
   FL_CLIP_NORM: "1.0"
 
+  # ML Computation (RL Agent, LinUCB, FedAvg)
+  ML_ENABLED: "true"
+  RL_TRAIN_BATCH_SIZE: "32"
+  LINUCB_ALPHA: "0.6"
+
   # Health Checks
   HEALTH_CHECK_PATH: "/health"
   READY_CHECK_ENABLED: "true"

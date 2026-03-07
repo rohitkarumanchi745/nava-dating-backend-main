@@ -1,0 +1,64 @@
+# =============================================================================
+# NAVA Backend - AWS ALB Ingress
+# =============================================================================
+# Requires: AWS Load Balancer Controller installed in EKS cluster
+# Install: helm install aws-load-balancer-controller eks/aws-load-balancer-controller
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nava-backend-ingress
+  labels:
+    app: nava-backend
+  annotations:
+    # AWS ALB Controller
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+
+    # TLS via ACM - replace with your certificate ARN
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:ACCOUNT_ID:certificate/CERT_ID
+
+    # Health checks
+    alb.ingress.kubernetes.io/healthcheck-path: /ready
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+
+    # Sticky sessions for WebSocket
+    alb.ingress.kubernetes.io/target-group-attributes: stickiness.enabled=true,stickiness.lb_cookie.duration_seconds=3600
+
+    # WAF and Shield (optional)
+    # alb.ingress.kubernetes.io/wafv2-acl-arn: arn:aws:wafv2:...
+    # alb.ingress.kubernetes.io/shield-advanced-protection: "true"
+
+    # Timeouts
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=120
+
+    # Access logging
+    # alb.ingress.kubernetes.io/load-balancer-attributes: access_logs.s3.enabled=true,access_logs.s3.bucket=nava-alb-logs
+spec:
+  rules:
+    - host: api.nava.dating
+      http:
+        paths:
+          # API routes
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nava-backend
+                port:
+                  number: 80
+
+          # WebSocket routes (sticky sessions ensure same pod)
+          - path: /ws
+            pathType: Prefix
+            backend:
+              service:
+                name: nava-backend
+                port:
+                  number: 80

@@ -988,7 +988,15 @@ pub async fn discover(
     .fetch_all(&state.db)
     .await?;
 
-    let profiles: Vec<DiscoverProfile> = candidates
+    // RL-based ranking: score candidates and re-sort
+    let candidate_ids: Vec<i32> = candidates.iter().map(|c| c.id).collect();
+    let ml_scores = {
+        let ml = state.ml.read().await;
+        ml.rank_candidates(&state.db, user_id, &candidate_ids).await
+    };
+    let score_map: std::collections::HashMap<i32, f64> = ml_scores.into_iter().collect();
+
+    let mut profiles: Vec<DiscoverProfile> = candidates
         .into_iter()
         .map(|c| {
             let distance_km = if let (Some(ul), Some(lat), Some(lon)) = (&user_loc, c.latitude, c.longitude) {
@@ -1000,6 +1008,7 @@ pub async fn discover(
             };
 
             let photos = get_photos_from_row(&c);
+            let ml_score = score_map.get(&c.id).copied();
             DiscoverProfile {
                 id: c.id,
                 name: c.name,
@@ -1014,7 +1023,7 @@ pub async fn discover(
                 distance_km,
                 distance_text: distance_km.map(format_distance),
                 city: c.city,
-                compatibility_score: c.attractiveness_score,
+                compatibility_score: ml_score.or(c.attractiveness_score),
             }
         })
         .filter(|p| {
@@ -1026,6 +1035,14 @@ pub async fn discover(
             }
         })
         .collect();
+
+    // Sort by ML score (descending)
+    profiles.sort_by(|a, b| {
+        b.compatibility_score
+            .unwrap_or(0.0)
+            .partial_cmp(&a.compatibility_score.unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Log impression events for ML
     let slate_id = Uuid::new_v4().to_string();
@@ -1135,6 +1152,16 @@ pub async fn like_user(
     // Log like event
     let _ = log_interaction_event(&state.db, user_id, target_id, "like", None, None, Some("discover")).await;
 
+    // Feed RL agent with like signal
+    {
+        let mut ml = state.ml.write().await;
+        ml.record_swipe(&state.db, user_id, target_id, true).await;
+        // Match gives bonus reward
+        if is_mutual {
+            ml.record_swipe(&state.db, target_id, user_id, true).await;
+        }
+    }
+
     Ok(Json(json!({
         "message": if is_mutual { "It's a match!" } else { "Like sent" },
         "match_id": match_id,
@@ -1153,6 +1180,12 @@ pub async fn pass_user(
 
     // Log pass event (for ML training - negative signal)
     let _ = log_interaction_event(&state.db, user_id, target_id, "pass", None, None, Some("discover")).await;
+
+    // Feed RL agent with pass signal
+    {
+        let mut ml = state.ml.write().await;
+        ml.record_swipe(&state.db, user_id, target_id, false).await;
+    }
 
     // Determine user order
     let (user1_id, user2_id, is_user1) = if user_id < target_id {
@@ -5140,14 +5173,30 @@ pub async fn aggregate_fl_round(
         )));
     }
 
-    // FedAvg: weighted average by num_samples
-    let total_samples: i32 = updates.iter().map(|u| u.num_samples).sum();
-    let avg_loss: f64 = updates.iter().map(|u| u.local_loss * u.num_samples as f64).sum::<f64>() / total_samples as f64;
-    let avg_accuracy: f64 = updates.iter().filter_map(|u| u.local_accuracy.map(|a| a * u.num_samples as f64)).sum::<f64>() / total_samples as f64;
+    // Real FedAvg: weighted averaging with differential privacy
+    let ml = state.ml.read().await;
+    let client_data: Vec<(Value, i32, f64, Option<f64>)> = updates
+        .iter()
+        .map(|u| (u.local_weights.clone(), u.num_samples, u.local_loss, u.local_accuracy))
+        .collect();
 
-    // In production, you'd do actual weight aggregation here
-    // For now, we store the aggregated stats and mark complete
+    let aggregation = ml.federated.aggregate(&client_data)
+        .map_err(|e| AppError::internal(&format!("FedAvg aggregation failed: {e}")))?;
+
+    let avg_loss = aggregation.avg_loss;
+    let avg_accuracy = aggregation.avg_accuracy;
+    let total_samples = aggregation.total_samples;
     let new_version = round.2.unwrap_or(1) + 1;
+
+    // Store aggregated weights in fl_models
+    let _ = sqlx::query(
+        "INSERT INTO fl_models (model_type, version, weights, created_at) VALUES ($1, $2, $3, NOW()) ON CONFLICT (model_type, version) DO UPDATE SET weights = $3"
+    )
+    .bind(&payload.model_type)
+    .bind(new_version)
+    .bind(&aggregation.aggregated_weights)
+    .execute(&state.db)
+    .await;
 
     sqlx::query(
         r#"
@@ -5382,6 +5431,12 @@ pub async fn get_ml_system_stats(
     .fetch_all(&state.db)
     .await?;
 
+    // ML computation stats (RL, LinUCB)
+    let ml_computation = {
+        let ml = state.ml.read().await;
+        ml.ml_stats()
+    };
+
     Ok(Json(json!({
         "llm_labeling": {
             "queue_stats": labeling_stats.into_iter().collect::<HashMap<_, _>>(),
@@ -5399,7 +5454,8 @@ pub async fn get_ml_system_stats(
                 "round_number": rn,
                 "clients_participated": cp
             })).collect::<Vec<_>>()
-        }
+        },
+        "ml_computation": ml_computation
     })))
 }
 
@@ -6065,5 +6121,58 @@ pub async fn get_my_university_passes(
                 "365_days": 199.99
             }
         }
+    })))
+}
+
+// ============================================================================
+// ML Computation Endpoints
+// ============================================================================
+
+/// POST /ml/rl/rank — Rank candidates using RL agent
+#[derive(Deserialize)]
+pub struct MlRankRequest {
+    pub candidate_ids: Vec<i32>,
+}
+
+pub async fn ml_rank_candidates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<MlRankRequest>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let ml = state.ml.read().await;
+    let ranked = ml.rank_candidates(&state.db, user_id, &payload.candidate_ids).await;
+
+    Ok(Json(json!({
+        "ranked": ranked.iter().map(|(id, score)| json!({
+            "candidate_id": id,
+            "score": score
+        })).collect::<Vec<_>>()
+    })))
+}
+
+/// POST /ml/linucb/score — Score candidates using LinUCB bandit
+#[derive(Deserialize)]
+pub struct LinucbScoreRequest {
+    pub arm_id: String,
+    pub context: Vec<f64>,
+}
+
+pub async fn ml_linucb_score(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<LinucbScoreRequest>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let _ = decode_access_token(&token, &state.config.secret_key)?;
+
+    let ml = state.ml.read().await;
+    let score = ml.linucb.score(&payload.arm_id, &payload.context);
+
+    Ok(Json(json!({
+        "arm_id": payload.arm_id,
+        "ucb_score": score
     })))
 }

@@ -1,0 +1,49 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nava-dev
+
+bases:
+  - ../../base
+
+resources:
+  - postgres.yaml
+  - redis.yaml
+  - secrets.yaml
+
+patchesStrategicMerge:
+  - |-
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: nava-backend
+    spec:
+      replicas: 1
+      template:
+        spec:
+          containers:
+            - name: nava-backend
+              env:
+                - name: ENVIRONMENT
+                  value: "development"
+              resources:
+                requests:
+                  memory: "256Mi"
+                  cpu: "250m"
+                limits:
+                  memory: "1Gi"
+                  cpu: "1000m"
+
+configMapGenerator:
+  - name: nava-config
+    behavior: merge
+    literals:
+      - ENVIRONMENT=development
+      - DB_MAX_CONNECTIONS=20
+      - DB_MIN_CONNECTIONS=5
+      - RATE_LIMIT_RPM=60
+      - RATE_LIMIT_BURST=10
+      - WS_CHAT_BUFFER_SIZE=100
+      - WS_CALL_BUFFER_SIZE=50
+      - ML_ENABLED=true
+      - RL_TRAIN_BATCH_SIZE=16

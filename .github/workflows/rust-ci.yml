@@ -1,0 +1,172 @@
+# =============================================================================
+# Rust Backend - CI/CD Pipeline for AWS EKS
+# =============================================================================
+# Triggers on push to main and PRs
+# Builds, tests, pushes to ECR, and deploys to EKS
+
+name: Rust Backend CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust-backend/**"
+      - ".github/workflows/rust-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "rust-backend/**"
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: nava-backend
+  EKS_CLUSTER: nava-production
+  CARGO_TERM_COLOR: always
+
+# OIDC permissions for AWS auth (no long-lived keys)
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # ===========================================================================
+  # Job 1: Lint & Test
+  # ===========================================================================
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust-backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            rust-backend/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-backend/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
+        env:
+          SQLX_OFFLINE: true
+
+      - name: Run tests
+        run: cargo test --lib
+        env:
+          SQLX_OFFLINE: true
+
+  # ===========================================================================
+  # Job 2: Build & Push Docker Image
+  # ===========================================================================
+  build:
+    name: Build & Push to ECR
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          IMAGE_TAG="${SHORT_SHA}-${TIMESTAMP}"
+          echo "tags=${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "short-tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: rust-backend
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ===========================================================================
+  # Job 3: Deploy to EKS
+  # ===========================================================================
+  deploy:
+    name: Deploy to EKS
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Set image tag in kustomization
+        run: |
+          cd rust-backend/k8s/overlays/prod
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          IMAGE_TAG="${SHORT_SHA}-${TIMESTAMP}"
+          kustomize edit set image "nava/backend=${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}"
+
+      - name: Deploy with Kustomize
+        run: |
+          kubectl apply -k rust-backend/k8s/overlays/prod
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/nava-backend -n nava-prod --timeout=300s
+
+      - name: Verify deployment health
+        run: |
+          # Wait for pods to be ready
+          kubectl wait --for=condition=ready pod -l app=nava-backend -n nava-prod --timeout=120s
+
+          # Check health endpoint through service
+          POD=$(kubectl get pod -l app=nava-backend -n nava-prod -o jsonpath='{.items[0].metadata.name}')
+          kubectl exec -n nava-prod $POD -- curl -sf http://localhost:8080/health || exit 1
+          echo "Deployment healthy!"
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Deployment failed! Rolling back..."
+          kubectl rollout undo deployment/nava-backend -n nava-prod

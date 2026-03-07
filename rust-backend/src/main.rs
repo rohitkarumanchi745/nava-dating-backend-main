@@ -11,6 +11,7 @@ mod services;
 mod state;
 mod storage;
 mod telemetry;
+mod ml;
 mod vision;
 mod websocket;
 
@@ -506,6 +507,7 @@ async fn main() {
         start_time: Instant::now(),
         payment_service,
         ads_service,
+        ml: Arc::new(RwLock::new(ml::MlService::new())),
     };
 
     // Run startup sync if Neo4j is connected
@@ -729,6 +731,9 @@ async fn main() {
         .route("/fl/aggregate", post(aggregate_fl_round))
         .route("/fl/model", get(get_active_fl_model))
         .route("/fl/local-data", post(report_local_data))
+        // ML Computation Endpoints
+        .route("/ml/rl/rank", post(handlers::ml_rank_candidates))
+        .route("/ml/linucb/score", post(handlers::ml_linucb_score))
         // ML System Stats
         .route("/ml/stats", get(get_ml_system_stats))
         .with_state(Arc::new(state.clone()))

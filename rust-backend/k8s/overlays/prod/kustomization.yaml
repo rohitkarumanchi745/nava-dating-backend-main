@@ -1,0 +1,36 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nava-prod
+
+bases:
+  - ../../base
+
+resources:
+  - external-services.yaml
+  - secrets.yaml
+
+patchesStrategicMerge:
+  - deployment-patch.yaml
+  - hpa-patch.yaml
+
+configMapGenerator:
+  - name: nava-config
+    behavior: merge
+    literals:
+      - ENVIRONMENT=production
+      - DB_MAX_CONNECTIONS=300
+      - DB_MIN_CONNECTIONS=50
+      - RATE_LIMIT_RPM=120
+      - RATE_LIMIT_BURST=30
+      - WS_CHAT_BUFFER_SIZE=500
+      - WS_CALL_BUFFER_SIZE=200
+      - ML_ENABLED=true
+      - RL_TRAIN_BATCH_SIZE=32
+      - LINUCB_ALPHA=0.6
+      - FL_MIN_CLIENTS=10
+
+images:
+  - name: nava/backend
+    newName: ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/nava-backend
+    newTag: latest  # Overridden by CI/CD with git SHA

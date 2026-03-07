@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+commonLabels:
+  app.kubernetes.io/name: nava-backend
+  app.kubernetes.io/part-of: nava-dating
+
+resources:
+  - ../deployment.yaml    # Deployment + Service + HPA (existing)
+  - ../configmap.yaml     # ConfigMap (existing)
+  - ../secrets.yaml       # Secrets template (existing)
+  - ingress.yaml
+  - network-policy.yaml
+  - pdb.yaml
+  - service-account.yaml

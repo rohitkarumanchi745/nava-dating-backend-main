@@ -17,6 +17,7 @@ use crate::services::graph_service::GraphService;
 use crate::services::payments::PaymentService;
 use crate::services::ads::AdsService;
 use crate::middleware::dual_write::DualWriteManager;
+use crate::ml::MlService;
 
 /// Shared application state
 #[derive(Clone)]
@@ -35,6 +36,8 @@ pub struct AppState {
     // Payment and Ads services
     pub payment_service: Option<Arc<PaymentService>>,
     pub ads_service: Option<Arc<AdsService>>,
+    // ML service (RL, LinUCB, Federated Learning)
+    pub ml: Arc<RwLock<MlService>>,
 }
 
 // Allow extracting AppState from Arc<AppState>

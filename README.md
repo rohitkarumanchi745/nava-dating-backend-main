@@ -24,16 +24,19 @@ Production backend powering the Nava dating apps (SwiftUI iOS + React Native cro
    └───┬────┘ └───┬────┘ └────┬────┘ └───┬────┘ └───┬────┘
        └──────────┴────────────┴──────────┴──────────┘
                                │
-                  ┌────────────▼────────────┐
-                  │     Apache Kafka        │
-                  │    Event Streaming      │
-                  └────────────┬────────────┘
-            ┌──────────────────┼──────────────────┐
-            ▼                  ▼                   ▼
-      ┌───────────┐    ┌───────────┐       ┌───────────┐
-      │Notification│    │ Analytics │       │    ML     │
-      │  Service   │    │  Service  │       │  Service  │
-      └───────────┘    └───────────┘       └───────────┘
+          ┌────────────────────┼────────────────────┐
+          ▼                    ▼                     ▼
+   ┌────────────┐     ┌──────────────┐      ┌────────────┐
+   │  ML Engine │     │ Apache Kafka │      │  Vision    │
+   │ RL · LinUCB│     │   Events     │      │  Pipeline  │
+   │  FedAvg    │     │              │      │ Face·NSFW  │
+   └────────────┘     └──────┬───────┘      └────────────┘
+                   ┌─────────┼─────────┐
+                   ▼         ▼         ▼
+            ┌───────────┐ ┌──────┐ ┌──────┐
+            │Notification│ │Analyt│ │  ML  │
+            │  Service   │ │ ics  │ │Train │
+            └───────────┘ └──────┘ └──────┘
 
  ┌──────────┐ ┌───────┐ ┌───────┐ ┌─────┐ ┌──────────┐
  │PostgreSQL│ │ Redis │ │ Neo4j │ │ S3  │ │ClickHouse│
@@ -76,14 +79,32 @@ All endpoints require `Authorization: Bearer <jwt>` header unless noted.
 | `/update-bio` | POST | Quick bio update |
 | `/profile/me` | POST | Get/load user profile |
 
-### Discovery & Matching (GraphQL)
+### Discovery & Matching (GraphQL + ML)
 
 | Operation | Type | Description |
 |-----------|------|-------------|
-| `discover(filters: { useAi, limit })` | Query | Get swipeable profiles with AI `compatibilityScore` (0-100) |
-| `likeUser(targetUserId)` | Mutation | Like a profile → `{ success, isMutual, matchId }` |
-| `passUser(targetUserId)` | Mutation | Skip a profile |
+| `discover(filters: { useAi, limit })` | Query | Get swipeable profiles ranked by RL agent with `compatibilityScore` |
+| `likeUser(targetUserId)` | Mutation | Like a profile → feeds RL agent, returns `{ success, isMutual, matchId }` |
+| `passUser(targetUserId)` | Mutation | Skip a profile → feeds RL agent with negative signal |
 | `matches` | Query | Get all matches with partner details (mutual + received likes) |
+
+### ML Computation Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/ml/rl/rank` | POST | Rank candidate user IDs using Q-learning RL agent |
+| `/ml/linucb/score` | POST | Score a candidate arm using LinUCB contextual bandit |
+| `/ml/stats` | GET | RL agent stats (epsilon, replay buffer), LinUCB stats, FL stats |
+| `/ml/embeddings` | POST/GET | Store/retrieve user embedding vectors |
+| `/ml/bandit` | POST/GET | Store/retrieve LinUCB arm states (A-matrix, b-vector) |
+| `/ml/reward` | POST | Log reward signal for ML training |
+| `/ml/events` | GET | Get training events for offline analysis |
+| `/ml/scores/bulk` | POST | Bulk update attractiveness scores |
+| `/fl/register` | POST | Register FL client for federated learning |
+| `/fl/round/start` | POST | Start new FL round |
+| `/fl/update` | POST | Submit client model update |
+| `/fl/aggregate` | POST | FedAvg aggregation with differential privacy |
+| `/fl/model` | GET | Get active global model weights for deployment |
 
 ### Preferences (GraphQL)
 
@@ -181,18 +202,64 @@ Call states: `idle → connecting → ringing → active → idle`
 |-------|-------------|
 | **Backend** | Rust, Axum, Tokio, SQLx, async-graphql |
 | **Real-Time** | WebSocket pub/sub (chat + call signaling), typing indicators, read receipts |
-| **Databases** | PostgreSQL 15, Redis 7, Neo4j 5, ClickHouse |
+| **Databases** | PostgreSQL 16, Redis 7, Neo4j 5, ClickHouse |
 | **Event Streaming** | Apache Kafka (user, payment, match, chat, analytics topics) |
-| **ML/CV** | PyTorch, ONNX Runtime, OpenCV, Federated Learning, RL, pgvector |
+| **ML Engine** | Q-Learning RL (14-dim state, epsilon-greedy), LinUCB Contextual Bandit (UCB scoring), FedAvg with Differential Privacy |
+| **Computer Vision** | tract-onnx (ArcFace, FER+, NSFW, NIMA, Liveness), face verification, emotion detection |
 | **LLM** | LLaMA 3 (content labeling, moderation), batch inference pipeline |
-| **Verification** | Face recognition, selfie liveness detection, NSFW content moderation |
-| **Recommendations** | pgvector 512-dim embeddings, short/long-term user vectors, collaborative filtering |
+| **Recommendations** | RL-scored discovery ranking, pgvector 512-dim embeddings, collaborative filtering |
 | **File Storage** | AWS S3 + CloudFront CDN (photos, voice intros, reels) |
 | **Payments** | Apple StoreKit 2 (iOS), RevenueCat (React Native), Razorpay, Stripe |
-| **Infrastructure** | Docker, Kubernetes, Kustomize, Prometheus, Grafana |
+| **Infrastructure** | Docker, Kubernetes (EKS), Kustomize, Prometheus, Grafana, GitHub Actions CI/CD |
 | **iOS** | SwiftUI, Combine, StoreKit 2 |
 | **Cross-Platform** | React Native, Expo, TypeScript |
 | **Dashboard** | React, TypeScript, Vite, Tailwind CSS |
+
+## ML & AI Architecture
+
+### In-Memory ML Engine (Rust)
+
+All ML computation runs in-process for sub-millisecond scoring latency:
+
+| Component | Algorithm | Details |
+|-----------|-----------|---------|
+| **RL Agent** | Q-Learning | 14-dim state (7 user + 7 candidate features), epsilon-greedy (0.3→0.01, decay 0.995), per-user model blending (70% global + 30% personal), 10K experience replay buffer |
+| **LinUCB Bandit** | Contextual Bandit | UCB scoring with Gauss-Jordan matrix inverse, per-arm A-matrix + b-vector, alpha=0.6, observation decay 0.995, JSONB persistence to PostgreSQL |
+| **FedAvg** | Federated Learning | Weighted averaging by sample count, Laplace noise differential privacy (scale 0.1), min 2 clients per round, global learning rate 0.1 |
+
+**Discovery Flow:**
+```
+SQL candidates → RL scoring → Re-rank by Q-value → Return to client
+     ↓                                                    ↓
+  Filters (age, distance,           Like/Pass feeds back into
+   verified, not-yet-swiped)         RL agent training loop
+```
+
+**Feature Vector (7 dimensions per user):**
+1. Age (normalized 18-60)
+2. Attractiveness score
+3. Profile completeness
+4. Verification score (selfie + student)
+5. Activity score (7-day interactions)
+6. Photo count
+7. Height (normalized)
+
+### On-Device Federated Learning
+- **Privacy-preserving model aggregation** across clients (min 10 clients, 10% fraction per round)
+- **Differential Privacy** — Noise multiplier (1.0) + gradient clipping (norm 1.0) for user data protection
+- **Config:** `FL_ENABLED`, `FL_MIN_CLIENTS`, `FL_CLIENT_FRACTION`, `FL_LOCAL_EPOCHS`, `FL_LEARNING_RATE`, `FL_DP_ENABLED`
+
+### LLM Integration (LLaMA 3)
+- **Content Labeling** — Automated profile/bio moderation and tagging
+- **Batch Inference** — Configurable batch size (10) with retry logic (max 3)
+- **Config:** `LLM_ENABLED`, `LLM_API_URL`, `LLM_MODEL_NAME=llama3`, `LLM_BATCH_SIZE`
+
+### Computer Vision Pipeline
+- **Face Recognition** — ArcFace embedding extraction + cosine similarity matching
+- **Selfie Liveness Detection** — LBP entropy + FFT frequency + HSV color analysis (weights 0.4/0.4/0.2)
+- **Emotion Detection** — FER+ 8-emotion classification
+- **NSFW Detection** — Content quality scoring and moderation
+- **Image Quality** — NIMA aesthetic scoring
 
 ## Microservices
 
@@ -220,6 +287,135 @@ notification.cmds  →  push, email, SMS commands
 dlq.events         →  dead letter queue for failed events
 ```
 
+## Project Structure
+
+```
+├── rust-backend/              # Main Rust backend (Axum)
+│   ├── src/
+│   │   ├── handlers/          # REST + GraphQL endpoint handlers (150+)
+│   │   ├── ml/                # ML computation engine
+│   │   │   ├── rl_agent.rs    # Q-learning RL for discovery ranking
+│   │   │   ├── linucb.rs      # LinUCB contextual bandit
+│   │   │   ├── federated.rs   # FedAvg aggregation + differential privacy
+│   │   │   ├── features.rs    # 7-dim user feature extraction
+│   │   │   └── math.rs        # softmax, laplace noise, cosine similarity
+│   │   ├── services/          # Business logic layer
+│   │   ├── middleware/        # Auth, CORS, rate limiting, dual-write
+│   │   ├── graphql.rs         # GraphQL schema & resolvers
+│   │   ├── websocket.rs       # WebSocket chat + call signaling
+│   │   └── vision/            # Face recognition, liveness, emotion, NSFW
+│   ├── k8s/                   # Kubernetes manifests
+│   │   ├── base/              # Ingress, NetworkPolicy, PDB, ServiceAccount
+│   │   ├── overlays/dev/      # Dev: in-cluster Postgres + Redis
+│   │   └── overlays/prod/     # Prod: RDS + ElastiCache, higher resources
+│   ├── monitoring/            # Prometheus rules + alerts
+│   ├── migrations/            # PostgreSQL migrations
+│   └── Dockerfile             # Multi-stage build, non-root, healthcheck
+├── microservices/             # Event-driven microservices
+│   ├── gateway/               # API Gateway
+│   ├── services/              # Auth, User, Match, Chat, Payment, etc.
+│   ├── shared/                # Common lib (auth, config, events, models)
+│   ├── k8s/                   # K8s manifests (base + dev/prod overlays)
+│   └── docker-compose.yml
+├── ambassador-dashboard/      # React/TypeScript analytics dashboard
+├── tests/                     # E2E, Load, Contract, Smoke, Fuzz, Chaos
+├── vision/                    # Face recognition, liveness, NSFW detection (PyTorch/ONNX)
+├── location/                  # Geo services, student discount verification
+├── protos/                    # gRPC protocol buffers
+├── .github/workflows/         # CI/CD (lint, test, build, deploy to EKS)
+└── docker-compose.yml         # Dev environment
+```
+
+## Quick Start
+
+### Rust Backend
+```bash
+cd rust-backend
+cp .env.example .env       # configure DATABASE_URL, REDIS_URL, etc.
+cargo build --release
+cargo run                  # serves on http://127.0.0.1:8080
+```
+
+### Microservices (Docker Compose)
+```bash
+cd microservices
+docker compose up -d       # all services + Kafka + Postgres + Redis
+```
+
+### Ambassador Dashboard
+```bash
+cd ambassador-dashboard
+npm install && npm run dev
+```
+
+## Deployment (AWS EKS)
+
+### Development (in-cluster databases)
+```bash
+kubectl create namespace nava-dev
+kubectl apply -k rust-backend/k8s/overlays/dev/
+```
+
+### Production (RDS + ElastiCache)
+```bash
+kubectl create namespace nava-prod
+
+# Configure secrets (use AWS Secrets Manager in production)
+kubectl create secret generic nava-secrets \
+  --from-env-file=.env.production -n nava-prod
+
+# Deploy
+kubectl apply -k rust-backend/k8s/overlays/prod/
+
+# Verify
+kubectl get pods -n nava-prod
+kubectl get hpa -n nava-prod
+```
+
+### CI/CD Pipeline
+Automated via GitHub Actions (`.github/workflows/rust-ci.yml`):
+1. **Test** — `cargo fmt`, `cargo clippy`, `cargo test`
+2. **Build** — Multi-stage Docker build, push to ECR
+3. **Deploy** — Rolling update to EKS with auto-rollback on failure
+
+### Kubernetes Features
+- **HPA** — Auto-scales 3→20 pods based on CPU (65%) and memory (75%)
+- **PDB** — Minimum 2 pods always available during upgrades
+- **Rolling updates** — Zero-downtime with `maxUnavailable: 0`
+- **Topology spread** — Pods distributed across AZs
+- **Network policies** — Restricted pod-to-pod traffic
+- **IRSA** — IAM Roles for Service Accounts (no embedded credentials)
+- **ALB Ingress** — TLS via ACM, WebSocket sticky sessions
+
+## Testing
+
+```bash
+tests/e2e/run_tests.sh          # End-to-end user flows
+tests/load/k6 run load_tests.js # k6 load tests
+tests/contract/run_tests.sh     # API contract validation
+tests/smoke/run_tests.sh        # Health checks
+tests/fuzz/cargo +nightly fuzz  # Fuzz testing
+tests/chaos/chaos_tests.sh      # Resilience testing
+```
+
+## API Base URLs
+
+| Environment | HTTP | WebSocket |
+|------------|------|-----------|
+| Development | `http://127.0.0.1:8080` | `ws://127.0.0.1:8080` |
+| Production | `https://api.nava.app` | `wss://api.nava.app` |
+
+## Performance Targets
+
+| Metric | Target |
+|--------|--------|
+| Concurrent connections | 10K+ per node |
+| P95 response time | < 500ms |
+| P99 response time | < 1000ms |
+| WebSocket latency | < 50ms |
+| ML scoring latency | < 1ms (in-memory) |
+| Match accuracy | 99.9% (RL-powered scoring) |
+
 ## Data Models
 
 ### UserProfile
@@ -234,7 +430,7 @@ voiceIntroUrl, isProfileComplete, isVerified, isStudentVerified
 ### DiscoverProfile
 ```
 id, name, age, bio, location, photos[], interests[], languages[],
-compatibilityScore (0-100), professionTitle, isVerified,
+compatibilityScore (RL-scored), professionTitle, isVerified,
 voiceIntroUrl, hasVoiceIntro, hasReels
 ```
 
@@ -265,126 +461,6 @@ status: idle → connecting → ringing → active → idle
 ```
 minAge, maxAge, maxDistanceKm, preferredGenders[], onlyVerified, onlyStudents
 ```
-
-## Project Structure
-
-```
-├── rust-backend/              # Main Rust backend (Axum)
-│   ├── src/
-│   │   ├── handlers/          # REST + GraphQL endpoint handlers
-│   │   ├── services/          # Business logic layer
-│   │   ├── middleware/        # Auth, CORS, logging
-│   │   ├── graphql.rs         # GraphQL schema & resolvers
-│   │   ├── websocket.rs       # WebSocket chat + call signaling
-│   │   └── vision/            # Face recognition, liveness detection, NSFW moderation
-│   ├── migrations/            # PostgreSQL migrations
-│   └── k8s/                   # Kubernetes manifests
-├── microservices/             # Event-driven microservices
-│   ├── gateway/               # API Gateway
-│   ├── services/              # Auth, User, Match, Chat, Payment, etc.
-│   ├── shared/                # Common lib (auth, config, events, models)
-│   ├── k8s/                   # K8s manifests (base + dev/prod overlays)
-│   └── docker-compose.yml
-├── ambassador-dashboard/      # React/TypeScript analytics dashboard
-├── tests/                     # E2E, Load, Contract, Smoke, Fuzz, Chaos
-├── vision/                    # Face recognition, liveness, NSFW detection (PyTorch/ONNX)
-├── location/                  # Geo services, student discount verification
-├── protos/                    # gRPC protocol buffers
-└── docker-compose.yml         # Dev environment
-```
-
-## Quick Start
-
-### Rust Backend
-```bash
-cd rust-backend
-cp .env.example .env       # configure DATABASE_URL, REDIS_URL, etc.
-cargo build --release
-cargo run                  # serves on http://127.0.0.1:8080
-```
-
-### Microservices (Docker Compose)
-```bash
-cd microservices
-docker compose up -d       # all services + Kafka + Postgres + Redis
-```
-
-### Ambassador Dashboard
-```bash
-cd ambassador-dashboard
-npm install && npm run dev
-```
-
-## Testing
-
-```bash
-tests/e2e/run_tests.sh          # End-to-end user flows
-tests/load/k6 run load_tests.js # k6 load tests
-tests/contract/run_tests.sh     # API contract validation
-tests/smoke/run_tests.sh        # Health checks
-tests/fuzz/cargo +nightly fuzz  # Fuzz testing
-tests/chaos/chaos_tests.sh      # Resilience testing
-```
-
-## Deployment
-
-```bash
-# Development
-docker compose up -d
-
-# Production (Kubernetes)
-kubectl apply -k microservices/k8s/overlays/prod/
-```
-
-## API Base URLs
-
-| Environment | HTTP | WebSocket |
-|------------|------|-----------|
-| Development | `http://127.0.0.1:8080` | `ws://127.0.0.1:8080` |
-| Production | `https://api.nava.app` | `wss://api.nava.app` |
-
-## Performance Targets
-
-| Metric | Target |
-|--------|--------|
-| Concurrent connections | 10K+ per node |
-| P95 response time | < 500ms |
-| P99 response time | < 1000ms |
-| WebSocket latency | < 50ms |
-| Match accuracy | 99.9% (ML-powered scoring) |
-
-## ML & AI Architecture
-
-### On-Device Federated Learning
-- **RL Agent** — Q-learning based matching optimization with per-user weights
-- **Federated Averaging** — Privacy-preserving model aggregation across clients (min 10 clients, 10% fraction per round)
-- **Differential Privacy** — Noise multiplier (1.0) + gradient clipping (norm 1.0) for user data protection
-- **Config:** `FL_ENABLED`, `FL_MIN_CLIENTS`, `FL_CLIENT_FRACTION`, `FL_LOCAL_EPOCHS`, `FL_LEARNING_RATE`, `FL_DP_ENABLED`
-
-### LLM Integration (LLaMA 3)
-- **Content Labeling** — Automated profile/bio moderation and tagging
-- **Batch Inference** — Configurable batch size (10) with retry logic (max 3)
-- **Config:** `LLM_ENABLED`, `LLM_API_URL`, `LLM_MODEL_NAME=llama3`, `LLM_BATCH_SIZE`
-
-### Recommendation Engine (pgvector)
-- **User Embeddings** — 512-dim vectors (short-term + long-term) stored in PostgreSQL with pgvector
-- **Behavioral Features** — Session duration, like/save/skip rates, category affinities, active hours
-- **Interaction Tracking** — Impressions, views, likes, saves, shares, skips, matches, messages across surfaces (discover, playground, search, profile, notification)
-- **Collaborative Filtering** — Creator affinities + engagement rate scoring
-
-### Computer Vision Pipeline
-- **Face Recognition** — Embedding extraction + cosine similarity matching
-- **Selfie Liveness Detection** — Anti-spoofing with ONNX Runtime (tract-onnx)
-- **NSFW Detection** — Content quality scoring and moderation
-- **Federated CV Updates** — Verification results feed back into federated learning rounds
-
-### Future AI Roadmap
-- LLM-powered conversational AI for in-app date coaching
-- AI-generated icebreakers and conversation starters based on mutual interests
-- Voice-to-text transcription for voice intros with semantic matching
-- Advanced profile recommendation using transformer-based models
-- Real-time sentiment analysis on chat messages
-- AI photo enhancement and auto-cropping suggestions
 
 ## Revenue Model
 
@@ -473,3 +549,9 @@ University-tiered pricing to drive campus adoption:
 | **RevenueCat** | Cross-platform | Subscription management + webhook sync |
 | **Razorpay** | India | UPI, cards, wallets, netbanking |
 | **Stripe** | Global | Cards, subscriptions, webhooks |
+
+## Monitoring & Alerting
+
+- **Prometheus metrics** at `/metrics` — request counts, errors, DB pool, WebSocket connections, uptime
+- **AlertManager rules** — High error rate (>5%), high latency (P95 >2s), DB pool exhaustion (>85%), Redis failures
+- **Health probes** — `/health` (basic), `/ready` (K8s readiness), `/live` (K8s liveness)

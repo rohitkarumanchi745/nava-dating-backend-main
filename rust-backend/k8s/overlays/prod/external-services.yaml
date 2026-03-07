@@ -1,0 +1,29 @@
+# =============================================================================
+# Production - External AWS Managed Services
+# =============================================================================
+# Points to Amazon RDS and ElastiCache instead of in-cluster StatefulSets
+
+# ExternalName service for RDS PostgreSQL
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+    environment: production
+spec:
+  type: ExternalName
+  externalName: nava-prod.xxxxxxxxxxxx.us-east-1.rds.amazonaws.com  # Replace with your RDS endpoint
+
+---
+# ExternalName service for ElastiCache Redis
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    app: redis
+    environment: production
+spec:
+  type: ExternalName
+  externalName: nava-prod.xxxxxx.0001.use1.cache.amazonaws.com  # Replace with your ElastiCache endpoint

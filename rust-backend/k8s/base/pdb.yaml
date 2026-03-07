@@ -1,0 +1,16 @@
+# =============================================================================
+# NAVA Backend - PodDisruptionBudget
+# =============================================================================
+# Ensures at least 2 pods are always available during node drains/upgrades
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nava-backend-pdb
+  labels:
+    app: nava-backend
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: nava-backend
