@@ -87,6 +87,35 @@ services:
           memory: 1G
 
   # ---------------------------------------------------------------------------
+  # PgBouncer Connection Pooler
+  # ---------------------------------------------------------------------------
+  pgbouncer:
+    image: edoburu/pgbouncer:1.22.0
+    container_name: nava-pgbouncer
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgres://nava:${DB_PASSWORD}@postgres:5432/nava
+      - POOL_MODE=transaction
+      - DEFAULT_POOL_SIZE=50
+      - MAX_CLIENT_CONN=1000
+      - MIN_POOL_SIZE=10
+      - RESERVE_POOL_SIZE=10
+      - SERVER_IDLE_TIMEOUT=300
+      - QUERY_TIMEOUT=30
+    ports:
+      - "6432:6432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - nava-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 128M
+
+  # ---------------------------------------------------------------------------
   # Redis Cache
   # ---------------------------------------------------------------------------
   redis:

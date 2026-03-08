@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT product_type, duration_days, consumable_quantity FROM products WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "product_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "duration_days",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "consumable_quantity",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "d760acf86f472c2615c870a1a206a1a34848e43e9dac4c9e12ba5997f2118c52"
+}

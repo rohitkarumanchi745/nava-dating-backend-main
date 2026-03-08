@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT gateway, gateway_subscription_id\n        FROM user_subscriptions\n        WHERE subscription_id = $1 AND user_id = $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "gateway",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "gateway_subscription_id",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "199e21a5f9143179dc67c425f83494930d8ae24418b9c6ab6de78ce5c27db904"
+}

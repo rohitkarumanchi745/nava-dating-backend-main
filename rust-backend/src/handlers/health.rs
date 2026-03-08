@@ -151,3 +151,17 @@ pub async fn readiness_probe(State(state): State<AppState>) -> StatusCode {
 pub async fn liveness_probe() -> StatusCode {
     StatusCode::OK
 }
+
+/// Admin: check which secrets would change if reloaded.
+/// GET /admin/secrets/status
+/// Does NOT apply changes (K8s rolling restart handles that).
+/// Returns list of secrets that differ between current config and file/env.
+pub async fn secrets_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let mut current = state.config.clone();
+    let changed = current.reload_secrets();
+    Json(serde_json::json!({
+        "secrets_pending_rotation": changed,
+        "count": changed.len(),
+        "note": "Secrets are applied on pod restart. Use K8s rolling restart to rotate.",
+    }))
+}

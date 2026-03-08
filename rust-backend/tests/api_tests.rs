@@ -799,7 +799,7 @@ mod security_tests {
             if let Some(at_pos) = email.find('@') {
                 let local = &email[..at_pos];
                 let domain = &email[at_pos..];
-                let visible = if local.len() > 2 { 2 } else { 1 };
+                let visible = if local.len() >= 2 { 2 } else { 1 };
                 format!("{}***{}", &local[..visible], domain)
             } else {
                 "***".to_string()

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE payment_orders SET gateway_order_id = $1 WHERE order_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "495155e70f20114e1fb7c6e8e4cac2e215d631937692a40bdad1906c4ea88942"
+}

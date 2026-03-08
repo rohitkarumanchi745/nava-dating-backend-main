@@ -1,5 +1,18 @@
 use std::env;
 
+/// Read a secret from a file path (K8s mounted secret) or fall back to env var.
+/// Supports secret rotation without restart: mount new secret file, app reads on next call.
+fn secret_from_file_or_env(file_env: &str, value_env: &str, default: &str) -> String {
+    // First check for a file path (K8s secret mount pattern: SECRET_KEY_FILE=/run/secrets/jwt_key)
+    if let Ok(path) = env::var(file_env) {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            return contents.trim().to_string();
+        }
+    }
+    // Fall back to env var
+    env::var(value_env).unwrap_or_else(|_| default.to_string())
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     // Server
@@ -19,6 +32,11 @@ pub struct Config {
     // Read Replica Support
     pub db_read_replica_url: Option<String>,
     pub db_read_replica_enabled: bool,
+    pub db_read_max_connections: u32,
+    pub db_read_min_connections: u32,
+
+    // Statement-level timeout to protect primary (milliseconds)
+    pub db_statement_timeout_ms: u64,
 
     // Authentication
     pub secret_key: String,
@@ -152,8 +170,9 @@ impl Config {
     pub fn from_env() -> Self {
         let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
         let database_url = env::var("DATABASE_URL").unwrap_or_default();
-        let secret_key =
-            env::var("SECRET_KEY").unwrap_or_else(|_| "your-secret-key-change-in-production".to_string());
+        let secret_key = secret_from_file_or_env(
+            "SECRET_KEY_FILE", "SECRET_KEY", "your-secret-key-change-in-production",
+        );
         let access_token_expire_minutes = env::var("ACCESS_TOKEN_EXPIRE_MINUTES")
             .ok()
             .and_then(|value| value.parse::<i64>().ok())
@@ -254,6 +273,19 @@ impl Config {
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false);
+        let db_read_max_connections = env::var("DB_READ_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(db_max_connections / 2);  // Default: half of primary
+        let db_read_min_connections = env::var("DB_READ_MIN_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(db_min_connections / 2);
+        // Statement timeout protects primary from long-running queries (default 30s)
+        let db_statement_timeout_ms = env::var("DB_STATEMENT_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if is_prod { 15000 } else { 30000 });
 
         // Rate Limiting - SCALED FOR HIGH TRAFFIC
         // Production: 120 req/min + 30 burst = 150 total per user
@@ -410,15 +442,23 @@ impl Config {
         // RevenueCat
         let revenuecat_webhook_secret = env::var("REVENUECAT_WEBHOOK_SECRET").ok();
 
-        // Payment Gateways - Razorpay (India)
+        // Payment Gateways - Razorpay (India) — supports file-based secrets for rotation
         let razorpay_key_id = env::var("RAZORPAY_KEY_ID").unwrap_or_default();
-        let razorpay_key_secret = env::var("RAZORPAY_KEY_SECRET").unwrap_or_default();
-        let razorpay_webhook_secret = env::var("RAZORPAY_WEBHOOK_SECRET").unwrap_or_default();
+        let razorpay_key_secret = secret_from_file_or_env(
+            "RAZORPAY_KEY_SECRET_FILE", "RAZORPAY_KEY_SECRET", "",
+        );
+        let razorpay_webhook_secret = secret_from_file_or_env(
+            "RAZORPAY_WEBHOOK_SECRET_FILE", "RAZORPAY_WEBHOOK_SECRET", "",
+        );
 
-        // Payment Gateways - Stripe (Global)
-        let stripe_secret_key = env::var("STRIPE_SECRET_KEY").unwrap_or_default();
+        // Payment Gateways - Stripe (Global) — supports file-based secrets for rotation
+        let stripe_secret_key = secret_from_file_or_env(
+            "STRIPE_SECRET_KEY_FILE", "STRIPE_SECRET_KEY", "",
+        );
         let stripe_publishable_key = env::var("STRIPE_PUBLISHABLE_KEY").unwrap_or_default();
-        let stripe_webhook_secret = env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default();
+        let stripe_webhook_secret = secret_from_file_or_env(
+            "STRIPE_WEBHOOK_SECRET_FILE", "STRIPE_WEBHOOK_SECRET", "",
+        );
 
         // Payment Settings
         let payment_default_currency = env::var("PAYMENT_DEFAULT_CURRENCY")
@@ -483,6 +523,9 @@ impl Config {
             db_max_lifetime_secs,
             db_read_replica_url,
             db_read_replica_enabled,
+            db_read_max_connections,
+            db_read_min_connections,
+            db_statement_timeout_ms,
             secret_key,
             access_token_expire_minutes,
             call_token_expire_minutes,
@@ -572,6 +615,46 @@ impl Config {
 
     pub fn is_production(&self) -> bool {
         self.environment == "production"
+    }
+
+    /// Reload secrets from file/env at runtime (for zero-downtime rotation).
+    /// Call via admin endpoint or SIGHUP handler.
+    pub fn reload_secrets(&mut self) -> Vec<String> {
+        let mut rotated = Vec::new();
+
+        let new_secret = secret_from_file_or_env(
+            "SECRET_KEY_FILE", "SECRET_KEY", "your-secret-key-change-in-production",
+        );
+        if new_secret != self.secret_key {
+            self.secret_key = new_secret;
+            rotated.push("secret_key".to_string());
+        }
+
+        let new_rz = secret_from_file_or_env("RAZORPAY_KEY_SECRET_FILE", "RAZORPAY_KEY_SECRET", "");
+        if new_rz != self.razorpay_key_secret {
+            self.razorpay_key_secret = new_rz;
+            rotated.push("razorpay_key_secret".to_string());
+        }
+
+        let new_rz_wh = secret_from_file_or_env("RAZORPAY_WEBHOOK_SECRET_FILE", "RAZORPAY_WEBHOOK_SECRET", "");
+        if new_rz_wh != self.razorpay_webhook_secret {
+            self.razorpay_webhook_secret = new_rz_wh;
+            rotated.push("razorpay_webhook_secret".to_string());
+        }
+
+        let new_stripe = secret_from_file_or_env("STRIPE_SECRET_KEY_FILE", "STRIPE_SECRET_KEY", "");
+        if new_stripe != self.stripe_secret_key {
+            self.stripe_secret_key = new_stripe;
+            rotated.push("stripe_secret_key".to_string());
+        }
+
+        let new_stripe_wh = secret_from_file_or_env("STRIPE_WEBHOOK_SECRET_FILE", "STRIPE_WEBHOOK_SECRET", "");
+        if new_stripe_wh != self.stripe_webhook_secret {
+            self.stripe_webhook_secret = new_stripe_wh;
+            rotated.push("stripe_webhook_secret".to_string());
+        }
+
+        rotated
     }
 
     pub fn validate(&self) -> Result<(), String> {

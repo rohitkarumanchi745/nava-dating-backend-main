@@ -74,6 +74,68 @@ jobs:
           SQLX_OFFLINE: true
 
   # ===========================================================================
+  # Job 1b: Database Integration Tests (partition regression, schema validation)
+  # ===========================================================================
+  db-test:
+    name: Database Integration Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust-backend
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: nava
+          POSTGRES_PASSWORD: nava_test
+          POSTGRES_DB: nava
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run migrations
+        env:
+          PGHOST: localhost
+          PGUSER: nava
+          PGPASSWORD: nava_test
+          PGDATABASE: nava
+        run: |
+          for f in migrations/*.sql; do
+            echo "Running $f..."
+            psql -f "$f"
+          done
+
+      - name: Run swipes partition regression test
+        env:
+          PGHOST: localhost
+          PGUSER: nava
+          PGPASSWORD: nava_test
+          PGDATABASE: nava
+        run: |
+          echo "Running swipes partition regression test..."
+          psql -f tests/swipes_partition_test.sql
+          echo "Swipes partition tests passed."
+
+      - name: Run statement_timeout verification
+        env:
+          PGHOST: localhost
+          PGUSER: nava
+          PGPASSWORD: nava_test
+          PGDATABASE: nava
+        run: |
+          echo "Running statement_timeout verification..."
+          psql -f tests/statement_timeout_test.sql
+          echo "Statement timeout tests passed."
+
+  # ===========================================================================
   # Job 2: Build & Push Docker Image
   # ===========================================================================
   build:

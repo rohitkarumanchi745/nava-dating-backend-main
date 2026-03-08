@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE users SET is_premium = false\n                    WHERE id = (SELECT user_id FROM user_subscriptions WHERE gateway_subscription_id = $1)\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3a9bf9127b3714b3c158a89bd7382408992d9df71840b603ebf00b494e4ecf98"
+}

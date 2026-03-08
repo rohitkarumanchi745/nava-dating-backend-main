@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE user_subscriptions SET cancel_at_period_end = true WHERE subscription_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1c69395cd8ffd1e6f95f292117604f2fff046dae195d6bbb3590f18234cc67de"
+}

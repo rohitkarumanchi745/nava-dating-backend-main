@@ -1,0 +1,338 @@
+# =============================================================================
+# NAVA Platform — SLO Definitions & Prometheus Alerting Rules
+# =============================================================================
+# Deploy alongside Prometheus. Import via prometheus.yml:
+#   rule_files:
+#     - /etc/prometheus/slo-alerts.yml
+# =============================================================================
+
+groups:
+  # ===========================================================================
+  # SLO 1: Availability — 99.9% uptime (43 min downtime/month max)
+  # ===========================================================================
+  - name: slo_availability
+    interval: 30s
+    rules:
+      # Error rate over 5 minutes (non-4xx errors)
+      - record: nava:http_error_rate:5m
+        expr: |
+          sum(rate(app_errors_total[5m]))
+          /
+          sum(rate(app_requests_total[5m]))
+
+      # ALERT: Error rate > 0.1% for 5 minutes (SLO burn rate)
+      - alert: HighErrorRate
+        expr: nava:http_error_rate:5m > 0.001
+        for: 5m
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "Error rate {{ $value | humanizePercentage }} exceeds 0.1% SLO"
+          runbook: "Check /health/detailed, review recent deployments, check DB connectivity"
+
+      # ALERT: Health endpoint returning 503
+      - alert: ServiceUnhealthy
+        expr: probe_http_status_code{job="nava-health"} != 200
+        for: 2m
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "NAVA health endpoint returning non-200 for 2+ minutes"
+
+  # ===========================================================================
+  # SLO 2: Latency — p99 < 500ms for API, p99 < 200ms for discover
+  # ===========================================================================
+  - name: slo_latency
+    interval: 30s
+    rules:
+      # ALERT: API p99 latency > 500ms
+      - alert: HighApiLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          slo: latency
+        annotations:
+          summary: "API p99 latency {{ $value | humanizeDuration }} exceeds 500ms SLO"
+          runbook: "Check DB pool saturation, slow queries, ML scoring latency"
+
+      # ALERT: Discover endpoint p99 > 200ms (most latency-sensitive path)
+      - alert: HighDiscoverLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket{path="/discover"}[5m])) by (le)
+          ) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+          slo: latency
+        annotations:
+          summary: "Discover p99 {{ $value | humanizeDuration }} exceeds 200ms SLO"
+
+  # ===========================================================================
+  # SLO 3: Database — pool saturation < 80%, query timeout rate < 0.01%
+  # ===========================================================================
+  - name: slo_database
+    interval: 30s
+    rules:
+      # Pool utilization ratio
+      - record: nava:db_pool_utilization
+        expr: |
+          1 - (app_db_pool_idle / app_db_pool_size)
+
+      # ALERT: Pool > 80% utilized
+      - alert: DbPoolSaturated
+        expr: nava:db_pool_utilization > 0.8
+        for: 3m
+        labels:
+          severity: warning
+          slo: database
+        annotations:
+          summary: "DB pool {{ $value | humanizePercentage }} utilized (threshold 80%)"
+          runbook: "Scale up DB_MAX_CONNECTIONS or add read replicas"
+
+      # ALERT: Pool completely exhausted
+      - alert: DbPoolExhausted
+        expr: app_db_pool_idle == 0
+        for: 1m
+        labels:
+          severity: critical
+          slo: database
+        annotations:
+          summary: "DB connection pool fully exhausted — zero idle connections"
+
+      # ALERT: Swipe write TPS approaching sharding trigger threshold
+      - alert: SwipeWriteTpsHigh
+        expr: rate(app_swipe_writes_total[5m]) > 500
+        for: 10m
+        labels:
+          severity: warning
+          slo: database
+        annotations:
+          summary: "Swipe write rate {{ $value | humanize }}/s sustained >500 TPS — evaluate sharding roadmap"
+          runbook: "See ops-runbook.md#write-scaling-roadmap. Check pool utilization and WAL generation rate."
+
+  # ===========================================================================
+  # SLO 4: Payment Processing — success rate > 99.5%, DLQ pending < 50
+  # ===========================================================================
+  - name: slo_payments
+    interval: 60s
+    rules:
+      # ALERT: DLQ entries accumulating
+      - alert: PaymentDlqBacklog
+        expr: dlq_entries_pending{queue="payments"} > 50
+        for: 10m
+        labels:
+          severity: warning
+          slo: payments
+        annotations:
+          summary: "{{ $value }} pending payment DLQ entries (threshold 50)"
+          runbook: "Check /api/payments/dlq/stats, review gateway status"
+
+      # ALERT: DLQ entries abandoned (permanent failures)
+      - alert: PaymentDlqAbandoned
+        expr: increase(dlq_entries_abandoned_total{queue="payments"}[1h]) > 5
+        for: 0m
+        labels:
+          severity: critical
+          slo: payments
+        annotations:
+          summary: "{{ $value }} payment DLQ entries abandoned in last hour"
+
+  # ===========================================================================
+  # SLO 5: ML Scoring — latency < 10ms p99, fallback rate < 5%
+  # ===========================================================================
+  - name: slo_ml
+    interval: 30s
+    rules:
+      # ALERT: ML scoring latency too high
+      - alert: MlScoringLatencyHigh
+        expr: app_ml_avg_scoring_latency_us > 10000
+        for: 5m
+        labels:
+          severity: warning
+          slo: ml_scoring
+        annotations:
+          summary: "ML scoring avg latency {{ $value }}us exceeds 10ms SLO"
+
+      # ALERT: ML fallback rate > 5% (attractiveness score used instead of RL)
+      - alert: MlFallbackRateHigh
+        expr: |
+          rate(app_ml_fallback_total[5m])
+          /
+          (rate(app_discover_requests_total[5m]) + 1)
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          slo: ml_scoring
+        annotations:
+          summary: "ML fallback rate {{ $value | humanizePercentage }} exceeds 5% — ranking degraded to attractiveness score"
+          runbook: "Check ML scoring latency, RwLock contention, model size. See ops-runbook.md#ml-fallback"
+
+      # ALERT: ML fallback rate > 20% (critical — most users getting unranked results)
+      - alert: MlFallbackRateCritical
+        expr: |
+          rate(app_ml_fallback_total[5m])
+          /
+          (rate(app_discover_requests_total[5m]) + 1)
+          > 0.20
+        for: 5m
+        labels:
+          severity: critical
+          slo: ml_scoring
+        annotations:
+          summary: "ML fallback rate {{ $value | humanizePercentage }} exceeds 20% — most discover requests unranked"
+
+  # ===========================================================================
+  # SLO 5b: Vision/LLM Service — availability monitoring
+  # ===========================================================================
+  - name: slo_vision
+    interval: 30s
+    rules:
+      # ALERT: Vision service unavailable requests spiking
+      - alert: VisionServiceUnavailable
+        expr: increase(app_vision_unavailable_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+          slo: availability
+        annotations:
+          summary: "Vision service returned unavailable {{ $value }} times in 5m"
+          runbook: "Check vision sidecar health, model loading status. Vision endpoints return 503 when disabled."
+
+  # ===========================================================================
+  # SLO 6: WebSocket — active connections within capacity
+  # ===========================================================================
+  - name: slo_websocket
+    interval: 30s
+    rules:
+      # ALERT: WebSocket connections approaching limit
+      - alert: WebSocketConnectionsHigh
+        expr: app_websocket_connections > 8000
+        for: 5m
+        labels:
+          severity: warning
+          slo: capacity
+        annotations:
+          summary: "{{ $value }} WebSocket connections approaching 10k limit"
+          runbook: "Consider horizontal scaling or connection draining"
+
+  # ===========================================================================
+  # Infrastructure — Pod/Instance Health
+  # ===========================================================================
+  - name: infra_alerts
+    interval: 30s
+    rules:
+      # ALERT: Instance heartbeat lost (Redis-based registration)
+      - alert: InstanceHeartbeatLost
+        expr: absent(app_uptime_seconds) == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NAVA instance metrics not reporting — possible crash"
+
+      # ALERT: Cache miss rate too high (cold cache or eviction storm)
+      - alert: HighCacheMissRate
+        expr: |
+          rate(app_cache_misses[5m])
+          /
+          (rate(app_cache_hits[5m]) + rate(app_cache_misses[5m]))
+          > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cache miss rate {{ $value | humanizePercentage }} — check Redis memory/eviction"
+
+  # ===========================================================================
+  # Read Replica — Lag and Routing
+  # ===========================================================================
+  - name: replica_alerts
+    interval: 30s
+    rules:
+      # ALERT: Replica lag exceeds 2 seconds (auto-fallback kicks in)
+      - alert: ReplicaLagHigh
+        expr: app_replica_lag_ms > 2000
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Read replica lag {{ $value }}ms exceeds 2s cutoff — reads falling back to primary"
+          runbook: "Check replica WAL replay, network, and max_standby_streaming_delay"
+
+      # ALERT: Replica unhealthy for extended period
+      - alert: ReplicaUnhealthy
+        expr: app_replica_healthy == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Read replica unhealthy for 5+ minutes — all reads on primary"
+
+      # ALERT: High fallback rate (replica flapping)
+      - alert: ReplicaFallbackRateHigh
+        expr: |
+          rate(app_reads_fallback_to_primary[5m])
+          /
+          (rate(app_reads_from_replica[5m]) + rate(app_reads_fallback_to_primary[5m]) + 1)
+          > 0.3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of reads falling back to primary"
+
+  # ===========================================================================
+  # PgBouncer — Connection Pool Health (requires pgbouncer_exporter)
+  # ===========================================================================
+  - name: pgbouncer_alerts
+    interval: 30s
+    rules:
+      # ALERT: PgBouncer server connections exhausted
+      - alert: PgBouncerPoolExhausted
+        expr: pgbouncer_pools_server_active >= pgbouncer_pools_server_maxconn * 0.9
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PgBouncer server pool >90% utilized — increase default_pool_size"
+
+      # ALERT: Client wait queue growing
+      - alert: PgBouncerClientWaiting
+        expr: pgbouncer_pools_client_waiting > 50
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} clients waiting for PgBouncer connections"
+
+  # ===========================================================================
+  # Statement Timeouts & Partition Health
+  # ===========================================================================
+  - name: query_alerts
+    interval: 60s
+    rules:
+      # ALERT: Statement timeouts increasing (requires pg_stat_statements or log parsing)
+      - alert: StatementTimeoutsRising
+        expr: increase(pg_stat_activity_max_tx_duration{datname="nava"} > 15)[5m:] > 5
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Multiple queries hitting statement_timeout in last 5 minutes"
+
+      # ALERT: Autovacuum falling behind on partitioned tables
+      - alert: AutovacuumBehind
+        expr: pg_stat_user_tables_n_dead_tup{relname=~"swipes_p.*|interaction_events_.*|messages_.*"} > 100000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dead tuple count {{ $value }} on {{ $labels.relname }} — autovacuum may be behind"

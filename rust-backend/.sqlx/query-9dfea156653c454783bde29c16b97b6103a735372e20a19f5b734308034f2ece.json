@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE user_subscriptions SET status = 'cancelled', cancelled_at = NOW() WHERE gateway_subscription_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9dfea156653c454783bde29c16b97b6103a735372e20a19f5b734308034f2ece"
+}

@@ -1,0 +1,106 @@
+# =============================================================================
+# Prometheus Configuration for NAVA Platform
+# =============================================================================
+# Deploy as ConfigMap:
+#   kubectl create configmap prometheus-config \
+#     --from-file=prometheus.yml -n monitoring
+# =============================================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+# Alert rules
+rule_files:
+  - /etc/prometheus/rules/prometheus-rules.yaml
+  - /etc/prometheus/rules/slo-alerts.yml
+
+# Alertmanager integration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+      timeout: 10s
+
+# Scrape configs
+scrape_configs:
+  # -------------------------------------------------------------------------
+  # NAVA Backend API (auto-discovered via K8s annotations)
+  # -------------------------------------------------------------------------
+  - job_name: 'nava-backend'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - nava-prod
+    relabel_configs:
+      # Only scrape pods with prometheus.io/scrape: "true"
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      # Use annotated port
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        target_label: __address__
+        regex: (.+)
+        replacement: ${1}
+      # Use annotated path
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      # Add pod name label
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: pod
+      # Add node label
+      - source_labels: [__meta_kubernetes_node_name]
+        action: replace
+        target_label: node
+    # Scrape every 15s for SLO alerting (30s evaluation needs at least 2 data points)
+    scrape_interval: 15s
+    metrics_path: /metrics
+
+  # -------------------------------------------------------------------------
+  # NAVA Health Probe (for ServiceUnhealthy alert in slo-alerts.yml)
+  # -------------------------------------------------------------------------
+  - job_name: 'nava-health'
+    metrics_path: /health
+    kubernetes_sd_configs:
+      - role: service
+        namespaces:
+          names:
+            - nava-prod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name]
+        action: keep
+        regex: nava-backend
+    scrape_interval: 15s
+
+  # -------------------------------------------------------------------------
+  # PgBouncer Exporter (for pgbouncer_alerts in slo-alerts.yml)
+  # -------------------------------------------------------------------------
+  - job_name: 'pgbouncer'
+    static_configs:
+      - targets:
+            - pgbouncer-exporter:9127
+    scrape_interval: 15s
+
+  # -------------------------------------------------------------------------
+  # PostgreSQL Exporter (for query_alerts in slo-alerts.yml)
+  # -------------------------------------------------------------------------
+  - job_name: 'postgres'
+    static_configs:
+      - targets:
+            - postgres-exporter:9187
+    scrape_interval: 30s
+
+  # -------------------------------------------------------------------------
+  # Prometheus self-monitoring
+  # -------------------------------------------------------------------------
+  - job_name: 'prometheus'
+    static_configs:
+      - targets:
+            - localhost:9090

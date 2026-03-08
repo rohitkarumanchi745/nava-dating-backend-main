@@ -87,6 +87,37 @@ route:
             severity: critical
           receiver: 'email-security'
 
+    # SLO alerts (from slo-alerts.yml) -> Platform team
+    # These use 'slo' label instead of 'team'
+    - match_re:
+        slo: '(availability|latency|database|capacity)'
+      receiver: 'slack-platform'
+      routes:
+        - match:
+            severity: critical
+          receiver: 'pagerduty-critical'
+          continue: true
+
+    # SLO: Payment alerts -> Payments team
+    - match:
+        slo: payments
+      receiver: 'slack-payments'
+      routes:
+        - match:
+            severity: critical
+          receiver: 'pagerduty-payments'
+          continue: true
+
+    # SLO: ML scoring alerts -> Platform team
+    - match:
+        slo: ml_scoring
+      receiver: 'slack-platform'
+      routes:
+        - match:
+            severity: critical
+          receiver: 'pagerduty-critical'
+          continue: true
+
     # Growth/business alerts -> Growth channel
     - match:
         team: growth
@@ -114,6 +145,13 @@ inhibit_rules:
     target_match:
       severity: 'warning'
     equal: ['alertname', 'instance']
+
+  # SLO critical suppresses SLO warning for same SLO group
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['slo']
 
 # Receiver definitions
 receivers:

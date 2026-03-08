@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE payment_orders SET status = 'failed' WHERE gateway_order_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b0782bb7b470b10c790ec8777819b88c046c11d74879d87583e8f933ab7a0dc2"
+}

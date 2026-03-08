@@ -23,6 +23,9 @@ use crate::ml::MlService;
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
+    /// Read replica pool for read-heavy queries (discover, matches, history).
+    /// Falls back to primary if not configured.
+    pub db_read: Option<PgPool>,
     pub redis: Option<ConnectionManager>,
     pub neo4j: Option<Arc<Graph>>,
     pub graph_service: Option<Arc<GraphService>>,
@@ -48,6 +51,21 @@ impl FromRef<Arc<AppState>> for AppState {
 }
 
 impl AppState {
+    /// Get the read-replica pool if available and healthy.
+    /// Falls back to primary if replica is not configured or `replica_healthy` is false.
+    /// The `replica_healthy` flag is updated by a background task that checks lag every 5s.
+    /// This keeps the hot path zero-cost (no extra query per request).
+    pub fn read_pool(&self) -> &PgPool {
+        if let Some(ref replica) = self.db_read {
+            if self.metrics.replica_healthy.load(Ordering::Relaxed) {
+                self.metrics.reads_from_replica.fetch_add(1, Ordering::Relaxed);
+                return replica;
+            }
+            self.metrics.reads_fallback_to_primary.fetch_add(1, Ordering::Relaxed);
+        }
+        &self.db
+    }
+
     /// Get Redis service wrapper (if Redis is connected)
     pub fn redis_service(&self) -> Option<RedisService> {
         self.redis.as_ref().map(|conn| RedisService::new(conn.clone()))
@@ -83,6 +101,22 @@ pub struct AppMetrics {
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,
     pub websocket_connections: AtomicU64,
+    /// Reads served from the read replica pool
+    pub reads_from_replica: AtomicU64,
+    /// Reads that fell back to primary (replica unavailable or lag too high)
+    pub reads_fallback_to_primary: AtomicU64,
+    /// Whether the read replica is healthy (lag < cutoff). Updated by background task.
+    pub replica_healthy: std::sync::atomic::AtomicBool,
+    /// Last measured replica lag in milliseconds (for /metrics export)
+    pub replica_lag_ms: AtomicU64,
+    /// Discover requests that fell back to attractiveness score (ML timeout/error)
+    pub ml_fallback_total: AtomicU64,
+    /// Total discover requests (denominator for ML fallback rate)
+    pub discover_requests_total: AtomicU64,
+    /// Vision service requests that were unavailable or failed
+    pub vision_unavailable_total: AtomicU64,
+    /// Total swipe write operations (like + pass) for TPS monitoring
+    pub swipe_writes_total: AtomicU64,
 }
 
 impl AppMetrics {
@@ -95,6 +129,14 @@ impl AppMetrics {
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             websocket_connections: AtomicU64::new(0),
+            reads_from_replica: AtomicU64::new(0),
+            reads_fallback_to_primary: AtomicU64::new(0),
+            replica_healthy: std::sync::atomic::AtomicBool::new(false),
+            replica_lag_ms: AtomicU64::new(0),
+            ml_fallback_total: AtomicU64::new(0),
+            discover_requests_total: AtomicU64::new(0),
+            vision_unavailable_total: AtomicU64::new(0),
+            swipe_writes_total: AtomicU64::new(0),
         }
     }
 
@@ -129,6 +171,22 @@ impl AppMetrics {
 
     pub fn dec_ws_connections(&self) {
         self.websocket_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_ml_fallback(&self) {
+        self.ml_fallback_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_discover_requests(&self) {
+        self.discover_requests_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_vision_unavailable(&self) {
+        self.vision_unavailable_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_swipe_writes(&self) {
+        self.swipe_writes_total.fetch_add(1, Ordering::Relaxed);
     }
 }
 

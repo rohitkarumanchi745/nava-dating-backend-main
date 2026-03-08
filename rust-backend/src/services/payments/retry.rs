@@ -172,34 +172,42 @@ where
 
 /// Check if an error is retryable
 fn is_retryable_error(error: &AppError) -> bool {
-    // Check error message for retryable patterns
+    use axum::http::StatusCode;
+
+    // Non-retryable status codes (client errors that won't change on retry)
+    match error.status {
+        StatusCode::BAD_REQUEST
+        | StatusCode::UNAUTHORIZED
+        | StatusCode::FORBIDDEN
+        | StatusCode::NOT_FOUND
+        | StatusCode::CONFLICT
+        | StatusCode::UNPROCESSABLE_ENTITY => return false,
+        // Server errors and gateway errors are retryable
+        StatusCode::BAD_GATEWAY
+        | StatusCode::SERVICE_UNAVAILABLE
+        | StatusCode::GATEWAY_TIMEOUT => return true,
+        _ => {}
+    }
+
+    // For 500 Internal Server Error, check message for transient patterns
     let error_str = format!("{}", error);
 
-    // Network/transient errors are retryable
     if error_str.contains("timeout")
         || error_str.contains("connection")
         || error_str.contains("temporarily unavailable")
         || error_str.contains("rate limit")
-        || error_str.contains("503")
-        || error_str.contains("502")
-        || error_str.contains("504")
         || error_str.contains("network")
     {
         return true;
     }
 
-    // Non-retryable: authentication, validation, not found errors
-    if error_str.contains("unauthorized")
-        || error_str.contains("forbidden")
-        || error_str.contains("not found")
+    if error_str.contains("duplicate")
         || error_str.contains("invalid")
-        || error_str.contains("bad request")
-        || error_str.contains("duplicate")
     {
         return false;
     }
 
-    // Default: retry on unknown errors (conservative approach for payments)
+    // Default: retry on unknown 500s (conservative approach for payments)
     true
 }
 

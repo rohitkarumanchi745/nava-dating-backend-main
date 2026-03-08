@@ -83,7 +83,7 @@ use handlers::{
     // Vision
     verify_selfie, vision_analyze,
     // Admin
-    admin_stats,
+    admin_stats, secrets_status,
     // WebSocket
     ws_call, ws_chat,
     // ML Training
@@ -322,11 +322,28 @@ async fn main() {
             std::process::exit(1);
         });
 
+    // Statement timeout: set per-connection only when NOT using PgBouncer.
+    // With PgBouncer (transaction pooling), session-level SET is lost after each txn.
+    // In that case, rely on postgresql.conf: statement_timeout = <value>.
+    if !config.pgbouncer_mode {
+        if let Err(e) = sqlx::query(&format!(
+            "SET statement_timeout = '{}ms'",
+            config.db_statement_timeout_ms
+        ))
+        .execute(&db)
+        .await
+        {
+            warn!("Failed to set statement_timeout: {e}");
+        }
+    }
+
     info!(
-        "Connected to database (pool: {}-{} connections, pgbouncer: {}, instance: {})",
+        "Connected to database (pool: {}-{} connections, pgbouncer: {}, stmt_timeout: {}ms{}, instance: {})",
         config.db_min_connections,
         config.db_max_connections,
         config.pgbouncer_mode,
+        config.db_statement_timeout_ms,
+        if config.pgbouncer_mode { " [via postgresql.conf]" } else { " [per-session]" },
         config.instance_id
     );
 
@@ -334,8 +351,8 @@ async fn main() {
     let db_read_replica = if config.db_read_replica_enabled {
         if let Some(ref replica_url) = config.db_read_replica_url {
             match PgPoolOptions::new()
-                .max_connections(config.db_max_connections / 2)  // Half the connections for reads
-                .min_connections(config.db_min_connections / 2)
+                .max_connections(config.db_read_max_connections)
+                .min_connections(config.db_read_min_connections)
                 .acquire_timeout(Duration::from_secs(config.db_acquire_timeout_secs))
                 .idle_timeout(Duration::from_secs(config.db_idle_timeout_secs))
                 .connect(replica_url)
@@ -356,7 +373,7 @@ async fn main() {
     } else {
         None
     };
-    let _ = db_read_replica;  // Will be used in future read-heavy queries
+    // db_read_replica is stored in AppState and accessed via state.read_pool()
 
     // Redis connection (optional but recommended for production)
     let redis = match RedisClient::open(config.redis_url.as_str()) {
@@ -494,8 +511,12 @@ async fn main() {
         None
     };
 
+    // Initialize ML service with warm-start from DB (before db moves into AppState)
+    let ml_service = ml::MlService::new(&db).await;
+
     let state = AppState {
         db,
+        db_read: db_read_replica,
         redis,
         neo4j,
         graph_service,
@@ -508,7 +529,7 @@ async fn main() {
         start_time: Instant::now(),
         payment_service,
         ads_service,
-        ml: Arc::new(RwLock::new(ml::MlService::new())),
+        ml: Arc::new(RwLock::new(ml_service)),
     };
 
     // Run startup sync if Neo4j is connected
@@ -548,6 +569,39 @@ async fn main() {
             }
         });
         info!("Instance heartbeat started (id: {})", state.config.instance_id);
+    }
+
+    // Start replica lag monitor (if read replica is configured)
+    if state.db_read.is_some() {
+        let replica_pool = state.db_read.clone().unwrap();
+        let metrics = state.metrics.clone();
+        tokio::spawn(async move {
+            const LAG_CUTOFF_SECS: f64 = 2.0;
+            loop {
+                let lag = sqlx::query_scalar::<_, Option<f64>>(
+                    "SELECT CASE WHEN pg_is_in_recovery() THEN \
+                     EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp())) \
+                     ELSE 0 END"
+                )
+                .fetch_optional(&replica_pool)
+                .await
+                .ok()
+                .flatten()
+                .flatten()
+                .unwrap_or(f64::MAX);
+
+                let healthy = lag < LAG_CUTOFF_SECS;
+                metrics.replica_healthy.store(healthy, Ordering::Relaxed);
+                metrics.replica_lag_ms.store((lag * 1000.0) as u64, Ordering::Relaxed);
+
+                if !healthy {
+                    warn!(lag_secs = lag, cutoff = LAG_CUTOFF_SECS, "Read replica lag exceeds cutoff, routing to primary");
+                }
+
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        info!("Replica lag monitor started (cutoff: 2s, check interval: 5s)");
     }
 
     // Build GraphQL schema
@@ -689,6 +743,7 @@ async fn main() {
         .route("/vision/analyze", post(vision_analyze))
         // Admin
         .route("/admin/stats", get(admin_stats))
+        .route("/admin/secrets/status", get(secrets_status))
         // WebSocket
         .route("/ws/chat", get(ws_chat))
         .route("/ws/call", get(ws_call))
@@ -844,6 +899,25 @@ async fn prometheus_metrics(
     // Fetch database pool stats
     let db_pool_size = state.db.size();
     let db_pool_idle = state.db.num_idle();
+    let db_read_pool_size = state.db_read.as_ref().map(|p| p.size()).unwrap_or(0);
+    let db_read_pool_idle = state.db_read.as_ref().map(|p| p.num_idle() as u32).unwrap_or(0);
+
+    // Fetch ML stats
+    let ml_stats = {
+        let ml = state.ml.read().await;
+        ml.ml_stats()
+    };
+    let ml_avg_scoring_us = ml_stats.get("rl_agent")
+        .and_then(|v| v.get("avg_scoring_latency_us"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let ml_epsilon = ml_stats.get("rl_agent")
+        .and_then(|v| v.get("epsilon"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let ml_train_counter = ml_stats.get("train_counter")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     // Get WebSocket room stats
     let (chat_rooms, chat_subscribers) = {
@@ -900,6 +974,58 @@ app_chat_rooms_active {}
 # TYPE app_chat_subscribers_total gauge
 app_chat_subscribers_total {}
 
+# HELP app_db_read_pool_size Read replica connection pool size
+# TYPE app_db_read_pool_size gauge
+app_db_read_pool_size {}
+
+# HELP app_db_read_pool_idle Idle read replica connections
+# TYPE app_db_read_pool_idle gauge
+app_db_read_pool_idle {}
+
+# HELP app_replica_lag_ms Read replica replication lag in milliseconds
+# TYPE app_replica_lag_ms gauge
+app_replica_lag_ms {}
+
+# HELP app_replica_healthy Whether the read replica is healthy (1=yes, 0=no)
+# TYPE app_replica_healthy gauge
+app_replica_healthy {}
+
+# HELP app_reads_from_replica Total reads served from read replica
+# TYPE app_reads_from_replica counter
+app_reads_from_replica {}
+
+# HELP app_reads_fallback_to_primary Total reads that fell back to primary
+# TYPE app_reads_fallback_to_primary counter
+app_reads_fallback_to_primary {}
+
+# HELP app_ml_avg_scoring_latency_us ML scoring average latency in microseconds
+# TYPE app_ml_avg_scoring_latency_us gauge
+app_ml_avg_scoring_latency_us {}
+
+# HELP app_ml_epsilon RL agent exploration rate
+# TYPE app_ml_epsilon gauge
+app_ml_epsilon {}
+
+# HELP app_ml_train_counter Total ML training batches
+# TYPE app_ml_train_counter counter
+app_ml_train_counter {}
+
+# HELP app_ml_fallback_total Discover requests that fell back to attractiveness score
+# TYPE app_ml_fallback_total counter
+app_ml_fallback_total {}
+
+# HELP app_discover_requests_total Total discover endpoint requests
+# TYPE app_discover_requests_total counter
+app_discover_requests_total {}
+
+# HELP app_vision_unavailable_total Vision service requests that were unavailable
+# TYPE app_vision_unavailable_total counter
+app_vision_unavailable_total {}
+
+# HELP app_swipe_writes_total Total swipe write operations (like + pass)
+# TYPE app_swipe_writes_total counter
+app_swipe_writes_total {}
+
 # HELP dlq_entries_pending Pending entries in dead letter queue
 # TYPE dlq_entries_pending gauge
 dlq_entries_pending{{queue="payments"}} {}
@@ -925,6 +1051,19 @@ dlq_entries_abandoned_total{{queue="webhooks"}} {}
         uptime,
         db_pool_size,
         db_pool_idle,
+        db_read_pool_size,
+        db_read_pool_idle,
+        metrics.replica_lag_ms.load(Ordering::Relaxed),
+        if metrics.replica_healthy.load(Ordering::Relaxed) { 1 } else { 0 },
+        metrics.reads_from_replica.load(Ordering::Relaxed),
+        metrics.reads_fallback_to_primary.load(Ordering::Relaxed),
+        ml_avg_scoring_us,
+        ml_epsilon,
+        ml_train_counter,
+        metrics.ml_fallback_total.load(Ordering::Relaxed),
+        metrics.discover_requests_total.load(Ordering::Relaxed),
+        metrics.vision_unavailable_total.load(Ordering::Relaxed),
+        metrics.swipe_writes_total.load(Ordering::Relaxed),
         chat_rooms,
         chat_subscribers,
         dlq_stats.payments_pending,

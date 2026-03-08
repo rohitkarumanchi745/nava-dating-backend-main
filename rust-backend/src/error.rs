@@ -8,7 +8,7 @@ use std::fmt;
 
 #[derive(Debug, Clone)]
 pub struct AppError {
-    status: StatusCode,
+    pub status: StatusCode,
     message: String,
 }
 
@@ -47,6 +47,10 @@ impl AppError {
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
+
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, message)
     }
 }
 

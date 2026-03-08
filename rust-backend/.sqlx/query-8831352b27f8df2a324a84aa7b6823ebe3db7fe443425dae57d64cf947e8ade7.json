@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT order_id, gateway, amount_cents, currency, gateway_order_id, status\n            FROM payment_orders\n            WHERE user_id = $1 AND idempotency_key = $2\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "order_id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "gateway",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "amount_cents",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "currency",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "gateway_order_id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "status",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "8831352b27f8df2a324a84aa7b6823ebe3db7fe443425dae57d64cf947e8ade7"
+}

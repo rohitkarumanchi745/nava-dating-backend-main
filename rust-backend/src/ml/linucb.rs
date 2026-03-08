@@ -62,6 +62,8 @@ pub struct LinUcbBandit {
     arms: HashMap<String, ArmState>,
     /// Observation decay factor
     decay: f64,
+    // --- Metrics ---
+    cumulative_reward: f64,
 }
 
 impl LinUcbBandit {
@@ -70,6 +72,7 @@ impl LinUcbBandit {
             alpha: 0.6,
             arms: HashMap::new(),
             decay: 0.995,
+            cumulative_reward: 0.0,
         }
     }
 
@@ -141,6 +144,7 @@ impl LinUcbBandit {
 
         arm.num_pulls += 1;
         arm.total_reward += reward;
+        self.cumulative_reward += reward;
     }
 
     /// Rank a list of candidate arm_ids by UCB score (descending).
@@ -163,12 +167,18 @@ impl LinUcbBandit {
         self.arms.get(arm_id)
     }
 
+    /// Get all arm IDs (for checkpoint persistence).
+    pub fn arm_ids(&self) -> Vec<String> {
+        self.arms.keys().cloned().collect()
+    }
+
     /// Stats for monitoring.
     pub fn stats(&self) -> LinUcbStats {
         LinUcbStats {
             alpha: self.alpha,
             num_arms: self.arms.len(),
             total_pulls: self.arms.values().map(|a| a.num_pulls).sum(),
+            cumulative_reward: self.cumulative_reward,
         }
     }
 }
@@ -184,6 +194,7 @@ pub struct LinUcbStats {
     pub alpha: f64,
     pub num_arms: usize,
     pub total_pulls: u64,
+    pub cumulative_reward: f64,
 }
 
 /// Gauss-Jordan pseudo-inverse for small d×d matrix (flat, row-major).

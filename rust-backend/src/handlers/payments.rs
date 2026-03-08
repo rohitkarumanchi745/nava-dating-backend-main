@@ -355,7 +355,7 @@ pub async fn list_products(
         ORDER BY p.sort_order, pp.currency
         "#
     )
-    .fetch_all(&state.db)
+    .fetch_all(state.read_pool())
     .await?;
 
     // Group by product
@@ -398,7 +398,7 @@ pub async fn get_subscriptions(
         "#,
         user_id
     )
-    .fetch_all(&state.db)
+    .fetch_all(state.read_pool())
     .await?;
 
     Ok(Json(subscriptions.into_iter().map(|s| SubscriptionResponse {
@@ -478,8 +478,13 @@ pub async fn razorpay_webhook(
 
     let event = payment_service.process_webhook(PaymentGateway::Razorpay, &body, signature)?;
 
-    // Process the webhook event
-    process_webhook_event(&state, event).await?;
+    // Process webhook, enqueue to DLQ on failure (always return 200 to gateway to avoid infinite retries)
+    if let Err(e) = process_webhook_event(&state, event).await {
+        tracing::error!("Razorpay webhook processing failed, enqueuing to DLQ: {e}");
+        let dlq = crate::services::payments::retry::DeadLetterQueue::new(state.db.clone());
+        let payload = serde_json::from_slice(&body).unwrap_or(serde_json::json!({"raw": "parse_failed"}));
+        let _ = dlq.enqueue("webhooks", payload, &format!("razorpay webhook: {e}")).await;
+    }
 
     Ok((StatusCode::OK, "OK"))
 }
@@ -501,8 +506,13 @@ pub async fn stripe_webhook(
 
     let event = payment_service.process_webhook(PaymentGateway::Stripe, &body, signature)?;
 
-    // Process the webhook event
-    process_webhook_event(&state, event).await?;
+    // Process webhook, enqueue to DLQ on failure (always return 200 to gateway to avoid infinite retries)
+    if let Err(e) = process_webhook_event(&state, event).await {
+        tracing::error!("Stripe webhook processing failed, enqueuing to DLQ: {e}");
+        let dlq = crate::services::payments::retry::DeadLetterQueue::new(state.db.clone());
+        let payload = serde_json::from_slice(&body).unwrap_or(serde_json::json!({"raw": "parse_failed"}));
+        let _ = dlq.enqueue("webhooks", payload, &format!("stripe webhook: {e}")).await;
+    }
 
     Ok((StatusCode::OK, "OK"))
 }

@@ -206,7 +206,7 @@ pub async fn get_rewards_balance(
         "#
     )
     .bind(user_id)
-    .fetch_all(&state.db)
+    .fetch_all(state.read_pool())
     .await?;
 
     let balances: std::collections::HashMap<String, i32> = consumables

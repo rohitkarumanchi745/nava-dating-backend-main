@@ -202,6 +202,19 @@ pub async fn liveness_probe() -> StatusCode {
     StatusCode::OK
 }
 
+/// Admin: check which secrets would change if reloaded from file/env.
+/// GET /admin/secrets/status
+/// Does NOT apply changes (K8s rolling restart handles that).
+pub async fn secrets_status(State(state): State<AppState>) -> Json<Value> {
+    let mut current = state.config.clone();
+    let changed = current.reload_secrets();
+    Json(json!({
+        "secrets_pending_rotation": changed,
+        "count": changed.len(),
+        "note": "Secrets are applied on pod restart. Use K8s rolling restart to rotate.",
+    }))
+}
+
 // ============================================================================
 // Authentication - OTP Flow
 // ============================================================================
@@ -749,7 +762,7 @@ pub async fn profile_status(
         "#,
     )
     .bind(user_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(state.read_pool())
     .await?;
 
     let user = row.ok_or_else(|| AppError::not_found("User not found"))?;
@@ -786,15 +799,16 @@ pub async fn profile_me(
 ) -> Result<Json<Value>, AppError> {
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let read_db = state.read_pool();
 
-    let user = fetch_user_by_id(&state.db, user_id).await?;
+    let user = fetch_user_by_id(read_db, user_id).await?;
     let user = user.ok_or_else(|| AppError::not_found("User not found"))?;
 
     let (preferences, location, subscriptions, spots) = tokio::try_join!(
-        fetch_user_preferences(&state.db, user_id),
-        fetch_user_location(&state.db, user_id),
-        fetch_user_subscriptions(&state.db, user_id),
-        fetch_user_spots(&state.db, user_id, 10),
+        fetch_user_preferences(read_db, user_id),
+        fetch_user_location(read_db, user_id),
+        fetch_user_subscriptions(read_db, user_id),
+        fetch_user_spots(read_db, user_id, 10),
     )?;
 
     let profile = json!({
@@ -936,19 +950,21 @@ pub async fn discover(
 ) -> Result<Json<Value>, AppError> {
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
+    state.metrics.inc_discover_requests();
 
     let limit = params
         .get("limit")
         .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(state.config.discover_limit);
 
-    // Get user and preferences
-    let user = fetch_user_by_id(&state.db, user_id)
+    // Get user and preferences (read-replica safe)
+    let read_db = state.read_pool();
+    let user = fetch_user_by_id(read_db, user_id)
         .await?
         .ok_or_else(|| AppError::not_found("User not found"))?;
 
-    let prefs = fetch_user_preferences(&state.db, user_id).await?;
-    let user_loc = fetch_user_location(&state.db, user_id).await?;
+    let prefs = fetch_user_preferences(read_db, user_id).await?;
+    let user_loc = fetch_user_location(read_db, user_id).await?;
 
     // Build discovery query with filters
     let min_age = prefs.as_ref().and_then(|p| p.min_age).unwrap_or(18);
@@ -985,16 +1001,27 @@ pub async fn discover(
     .bind(min_age)
     .bind(max_age)
     .bind(limit)
-    .fetch_all(&state.db)
+    .fetch_all(read_db)
     .await?;
 
-    // RL-based ranking: score candidates and re-sort
+    // RL-based ranking: score candidates and re-sort (graceful degradation)
     let candidate_ids: Vec<i32> = candidates.iter().map(|c| c.id).collect();
-    let ml_scores = {
-        let ml = state.ml.read().await;
-        ml.rank_candidates(&state.db, user_id, &candidate_ids).await
+    let score_map: std::collections::HashMap<i32, f64> = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        async {
+            let mut ml = state.ml.write().await;
+            ml.rank_candidates(&state.db, user_id, &candidate_ids).await
+        },
+    )
+    .await
+    {
+        Ok(scores) => scores.into_iter().collect(),
+        Err(_) => {
+            state.metrics.inc_ml_fallback();
+            tracing::warn!(user_id, "ML ranking timed out, falling back to attractiveness score");
+            std::collections::HashMap::new()
+        }
     };
-    let score_map: std::collections::HashMap<i32, f64> = ml_scores.into_iter().collect();
 
     let mut profiles: Vec<DiscoverProfile> = candidates
         .into_iter()
@@ -1073,6 +1100,7 @@ pub async fn like_user(
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
     let target_id = payload.target_user_id;
+    state.metrics.inc_swipe_writes();
 
     if user_id == target_id {
         return Err(AppError::bad_request("Cannot like yourself"));
@@ -1152,15 +1180,16 @@ pub async fn like_user(
     // Log like event
     let _ = log_interaction_event(&state.db, user_id, target_id, "like", None, None, Some("discover")).await;
 
-    // Feed RL agent with like signal
-    {
-        let mut ml = state.ml.write().await;
-        ml.record_swipe(&state.db, user_id, target_id, true).await;
-        // Match gives bonus reward
+    // Feed RL agent with like signal (non-blocking, never fails the request)
+    let ml = state.ml.clone();
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        let mut ml = ml.write().await;
+        ml.record_swipe(&db, user_id, target_id, true).await;
         if is_mutual {
-            ml.record_swipe(&state.db, target_id, user_id, true).await;
+            ml.record_swipe(&db, target_id, user_id, true).await;
         }
-    }
+    });
 
     Ok(Json(json!({
         "message": if is_mutual { "It's a match!" } else { "Like sent" },
@@ -1177,15 +1206,18 @@ pub async fn pass_user(
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
     let target_id = payload.target_user_id;
+    state.metrics.inc_swipe_writes();
 
     // Log pass event (for ML training - negative signal)
     let _ = log_interaction_event(&state.db, user_id, target_id, "pass", None, None, Some("discover")).await;
 
-    // Feed RL agent with pass signal
-    {
-        let mut ml = state.ml.write().await;
-        ml.record_swipe(&state.db, user_id, target_id, false).await;
-    }
+    // Feed RL agent with pass signal (non-blocking)
+    let ml = state.ml.clone();
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        let mut ml = ml.write().await;
+        ml.record_swipe(&db, user_id, target_id, false).await;
+    });
 
     // Determine user order
     let (user1_id, user2_id, is_user1) = if user_id < target_id {
@@ -1323,6 +1355,7 @@ pub async fn get_matches(
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
 
+    let read_db = state.read_pool();
     let matches = sqlx::query_as::<_, MatchRow>(
         r#"
         SELECT id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match,
@@ -1337,13 +1370,13 @@ pub async fn get_matches(
         "#,
     )
     .bind(user_id)
-    .fetch_all(&state.db)
+    .fetch_all(read_db)
     .await?;
 
     let mut results = Vec::new();
     for m in matches {
         let other_id = if m.user1_id == user_id { m.user2_id } else { m.user1_id };
-        if let Some(other_user) = fetch_user_by_id(&state.db, other_id).await? {
+        if let Some(other_user) = fetch_user_by_id(read_db, other_id).await? {
             results.push(json!({
                 "match_id": m.id,
                 "is_mutual": true,
@@ -1572,7 +1605,7 @@ pub async fn get_nearby(
     .bind(user_lat)
     .bind(user_lon)
     .bind(limit)
-    .fetch_all(&state.db)
+    .fetch_all(state.read_pool())
     .await?;
 
     let can_see_exact = pass_type.can_see_exact_distance();
@@ -2528,7 +2561,7 @@ pub async fn get_spots(
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
 
-    let spots = fetch_user_spots(&state.db, user_id, 50).await?;
+    let spots = fetch_user_spots(state.read_pool(), user_id, 50).await?;
 
     let results: Vec<Value> = spots
         .into_iter()
@@ -2566,7 +2599,10 @@ pub async fn vision_analyze(
     let vision = state
         .vision
         .as_ref()
-        .ok_or_else(|| AppError::internal("Vision service is disabled"))?
+        .ok_or_else(|| {
+            state.metrics.inc_vision_unavailable();
+            AppError::service_unavailable("Vision service is not available. Try again later.")
+        })?
         .clone();
     let bytes = STANDARD
         .decode(payload.image_base64.as_bytes())
@@ -2590,7 +2626,10 @@ pub async fn verify_selfie(
     let vision = state
         .vision
         .as_ref()
-        .ok_or_else(|| AppError::internal("Vision service is disabled"))?
+        .ok_or_else(|| {
+            state.metrics.inc_vision_unavailable();
+            AppError::service_unavailable("Vision service is not available. Try again later.")
+        })?
         .clone();
 
     let mut selfie_bytes: Option<Vec<u8>> = None;
@@ -2701,58 +2740,60 @@ pub async fn admin_stats(
     State(state): State<AppState>,
     _admin: AdminClaims, // Requires admin authorization
 ) -> Result<Json<AdminStats>, AppError> {
+    let read_db = state.read_pool();
+
     let total_users = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users")
-        .fetch_one(&state.db)
+        .fetch_one(read_db)
         .await
         .unwrap_or(0);
 
     let verified_users = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM users WHERE is_verified = TRUE",
     )
-    .fetch_one(&state.db)
+    .fetch_one(read_db)
     .await
     .unwrap_or(0);
 
     let active_users_24h = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM users WHERE last_active > NOW() - INTERVAL '24 hours'",
     )
-    .fetch_one(&state.db)
+    .fetch_one(read_db)
     .await
     .unwrap_or(0);
 
     let total_matches = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM matches")
-        .fetch_one(&state.db)
+        .fetch_one(read_db)
         .await
         .unwrap_or(0);
 
     let mutual_matches = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM matches WHERE is_mutual_match = TRUE",
     )
-    .fetch_one(&state.db)
+    .fetch_one(read_db)
     .await
     .unwrap_or(0);
 
     let total_messages = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
-        .fetch_one(&state.db)
+        .fetch_one(read_db)
         .await
         .unwrap_or(0);
 
     let total_spots = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM spots")
-        .fetch_one(&state.db)
+        .fetch_one(read_db)
         .await
         .unwrap_or(0);
 
     let student_verified_users = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM users WHERE is_student_verified = TRUE",
     )
-    .fetch_one(&state.db)
+    .fetch_one(read_db)
     .await
     .unwrap_or(0);
 
     let active_subscriptions = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM user_subscriptions WHERE is_active = TRUE AND (end_date IS NULL OR end_date > NOW())",
     )
-    .fetch_one(&state.db)
+    .fetch_one(read_db)
     .await
     .unwrap_or(0);
 
@@ -3400,7 +3441,7 @@ pub async fn get_user_embedding(
         "SELECT embedding, recency_stats, updated_at FROM user_features WHERE user_id = $1",
     )
     .bind(user_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(state.read_pool())
     .await?;
 
     match row {
@@ -3453,7 +3494,7 @@ pub async fn get_batch_embeddings(
         q = q.bind(*id);
     }
 
-    let results = q.fetch_all(&state.db).await?;
+    let results = q.fetch_all(state.read_pool()).await?;
 
     Ok(Json(json!({
         "embeddings": results,
@@ -3543,7 +3584,7 @@ pub async fn get_bandit_arm(
         "SELECT id, arm_id, arm_type, user_id, a_matrix, b_vector, theta_vector, num_pulls, total_reward, updated_at FROM bandit_arm_stats WHERE arm_id = $1",
     )
     .bind(arm_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(state.read_pool())
     .await?;
 
     match row {
@@ -3651,6 +3692,7 @@ pub async fn get_training_events(
         created_at: Option<NaiveDateTime>,
     }
 
+    let read_db = state.read_pool();
     let events = if let Some(since) = &params.since {
         sqlx::query_as::<_, EventRow>(
             r#"
@@ -3664,7 +3706,7 @@ pub async fn get_training_events(
         .bind(since)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&state.db)
+        .fetch_all(read_db)
         .await?
     } else {
         sqlx::query_as::<_, EventRow>(
@@ -3677,7 +3719,7 @@ pub async fn get_training_events(
         )
         .bind(limit)
         .bind(offset)
-        .fetch_all(&state.db)
+        .fetch_all(read_db)
         .await?
     };
 
@@ -3730,7 +3772,7 @@ pub async fn get_user_interactions(
     )
     .bind(user_id)
     .bind(limit)
-    .fetch_all(&state.db)
+    .fetch_all(state.read_pool())
     .await?;
 
     Ok(Json(json!({
@@ -3933,7 +3975,7 @@ pub async fn get_reel_feed(
     )
     .bind(user_id)
     .bind(limit)
-    .fetch_all(&state.db)
+    .fetch_all(state.read_pool())
     .await?;
 
     Ok(Json(json!({ "reels": reels, "session_id": session_id, "count": reels.len() })))
@@ -4143,8 +4185,9 @@ pub async fn get_reel_inbox(
            WHERE rm.receiver_id = $1 ORDER BY rm.created_at DESC LIMIT $2"#
     };
 
-    let messages = sqlx::query_as::<_, InboxMsg>(query).bind(user_id).bind(limit).fetch_all(&state.db).await?;
-    let unread_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM reel_messages WHERE receiver_id = $1 AND is_read = FALSE").bind(user_id).fetch_one(&state.db).await.unwrap_or(0);
+    let read_db = state.read_pool();
+    let messages = sqlx::query_as::<_, InboxMsg>(query).bind(user_id).bind(limit).fetch_all(read_db).await?;
+    let unread_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM reel_messages WHERE receiver_id = $1 AND is_read = FALSE").bind(user_id).fetch_one(read_db).await.unwrap_or(0);
 
     Ok(Json(json!({ "messages": messages, "unread_count": unread_count })))
 }
@@ -4239,9 +4282,10 @@ pub async fn get_reel_conversation(
     #[derive(sqlx::FromRow, Serialize)]
     struct ConvMsg { id: i32, sender_id: i32, content: String, message_type: Option<String>, is_read: Option<bool>, created_at: Option<NaiveDateTime> }
 
+    let read_db = state.read_pool();
     let messages = sqlx::query_as::<_, ConvMsg>(
         "SELECT id, sender_id, content, message_type, is_read, created_at FROM reel_messages WHERE reel_id = $1 AND ((sender_id = $2 AND receiver_id = $3) OR (sender_id = $3 AND receiver_id = $2)) ORDER BY created_at ASC"
-    ).bind(reel_id).bind(user_id).bind(other_user).fetch_all(&state.db).await?;
+    ).bind(reel_id).bind(user_id).bind(other_user).fetch_all(read_db).await?;
 
     let (user_a, user_b) = if user_id < other_user { (user_id, other_user) } else { (other_user, user_id) };
 
@@ -4249,7 +4293,7 @@ pub async fn get_reel_conversation(
     struct ConvStats { total_messages: Option<i32>, eligible_for_match: Option<bool>, match_suggested: Option<bool>, match_id: Option<String> }
 
     let stats = sqlx::query_as::<_, ConvStats>("SELECT total_messages, eligible_for_match, match_suggested, match_id FROM reel_conversations WHERE reel_id = $1 AND user_a = $2 AND user_b = $3")
-        .bind(reel_id).bind(user_a).bind(user_b).fetch_optional(&state.db).await?;
+        .bind(reel_id).bind(user_a).bind(user_b).fetch_optional(read_db).await?;
 
     Ok(Json(json!({ "messages": messages, "stats": stats })))
 }
@@ -4271,9 +4315,10 @@ pub async fn get_my_learned_patterns(
     #[derive(sqlx::FromRow, Serialize)]
     struct IntStats { total_swipes: Option<i32>, total_matches_from_swipes: Option<i32>, swipe_success_rate: Option<f64>, total_reel_interactions: Option<i32>, total_matches_from_reels: Option<i32>, reel_success_rate: Option<f64>, best_interaction_mode: Option<String> }
 
-    let content = sqlx::query_as::<_, ContentPrefs>("SELECT preferred_categories, preferred_tags, completion_rate, like_rate, message_rate, response_rate FROM user_content_preferences WHERE user_id = $1").bind(user_id).fetch_optional(&state.db).await?;
-    let response = sqlx::query_as::<_, RespPatterns>("SELECT successful_categories, successful_opener_types, response_rate, conversations_continued, matches_from_reels FROM user_response_patterns WHERE user_id = $1").bind(user_id).fetch_optional(&state.db).await?;
-    let interaction = sqlx::query_as::<_, IntStats>("SELECT total_swipes, total_matches_from_swipes, swipe_success_rate, total_reel_interactions, total_matches_from_reels, reel_success_rate, best_interaction_mode FROM user_interaction_model WHERE user_id = $1").bind(user_id).fetch_optional(&state.db).await?;
+    let read_db = state.read_pool();
+    let content = sqlx::query_as::<_, ContentPrefs>("SELECT preferred_categories, preferred_tags, completion_rate, like_rate, message_rate, response_rate FROM user_content_preferences WHERE user_id = $1").bind(user_id).fetch_optional(read_db).await?;
+    let response = sqlx::query_as::<_, RespPatterns>("SELECT successful_categories, successful_opener_types, response_rate, conversations_continued, matches_from_reels FROM user_response_patterns WHERE user_id = $1").bind(user_id).fetch_optional(read_db).await?;
+    let interaction = sqlx::query_as::<_, IntStats>("SELECT total_swipes, total_matches_from_swipes, swipe_success_rate, total_reel_interactions, total_matches_from_reels, reel_success_rate, best_interaction_mode FROM user_interaction_model WHERE user_id = $1").bind(user_id).fetch_optional(read_db).await?;
 
     Ok(Json(json!({ "content_preferences": content, "response_patterns": response, "interaction_stats": interaction })))
 }
@@ -5777,8 +5822,9 @@ pub async fn discover_university_profiles(
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
 
-    // Check access
-    let (has_access, access_type) = check_university_access(&state.db, user_id, params.university_id).await?;
+    // Check access (read-replica safe)
+    let read_db = state.read_pool();
+    let (has_access, access_type) = check_university_access(read_db, user_id, params.university_id).await?;
     if !has_access {
         return Err(AppError::forbidden(&access_type));
     }
@@ -5791,7 +5837,7 @@ pub async fn discover_university_profiles(
         "SELECT id, name, short_name, domain, country, country_code, state_province, city, tier FROM universities WHERE id = $1"
     )
     .bind(params.university_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(read_db)
     .await?
     .ok_or_else(|| AppError::not_found("University not found"))?;
 
@@ -5823,7 +5869,7 @@ pub async fn discover_university_profiles(
     .bind(user_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(&state.db)
+    .fetch_all(read_db)
     .await?;
 
     let results: Vec<DiscoverProfile> = profiles.iter().map(|row| {
@@ -6206,7 +6252,7 @@ pub async fn ml_rank_candidates(
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
 
-    let ml = state.ml.read().await;
+    let mut ml = state.ml.write().await;
     let ranked = ml.rank_candidates(&state.db, user_id, &payload.candidate_ids).await;
 
     Ok(Json(json!({

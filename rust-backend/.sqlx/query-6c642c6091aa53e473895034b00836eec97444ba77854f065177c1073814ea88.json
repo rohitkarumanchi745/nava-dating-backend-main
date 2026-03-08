@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                            INSERT INTO payment_transactions\n                            (transaction_id, order_id, user_id, gateway, gateway_payment_id, amount_cents, currency, status)\n                            SELECT $1, id, user_id, gateway, $2, amount_cents, currency, 'completed'\n                            FROM payment_orders WHERE id = $3\n                            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6c642c6091aa53e473895034b00836eec97444ba77854f065177c1073814ea88"
+}

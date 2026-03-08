@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO user_consumables (user_id, product_id, quantity)\n                VALUES ($1, $2, $3)\n                ON CONFLICT (user_id, product_id)\n                DO UPDATE SET quantity = user_consumables.quantity + EXCLUDED.quantity\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Int4",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ea4f70aeb7018765a10b08a894a5673fdb99d3eec6c6354da0b3741c5cb012f6"
+}

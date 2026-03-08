@@ -246,6 +246,120 @@ impl UserFeatures {
     }
 }
 
+/// Population-level feature defaults for graceful fallback when per-user
+/// features are unavailable (user not found, DB timeout, etc.).
+#[derive(Debug, Clone)]
+pub struct FeatureDefaults {
+    pub defaults: UserFeatures,
+}
+
+impl FeatureDefaults {
+    /// Hardcoded neutral defaults (fallback of fallbacks).
+    pub fn hardcoded() -> Self {
+        Self {
+            defaults: UserFeatures {
+                user_id: 0,
+                age_norm: 0.5,
+                attractiveness: 0.5,
+                profile_completeness: 0.3,
+                verification_score: 0.0,
+                photo_count: 0.25,
+                height_norm: 0.5,
+                has_profession: 0.0,
+                gender_enc: 0.5,
+                intent_enc: 0.0,
+                language_count: 0.2,
+                interest_count: 0.2,
+                activity_score: 0.1,
+                like_rate: 0.5,
+                match_rate: 0.1,
+            },
+        }
+    }
+
+    /// Compute population-level means from the database.
+    pub async fn from_population(pool: &PgPool) -> Self {
+        #[derive(sqlx::FromRow)]
+        struct PopRow {
+            avg_age: Option<f64>,
+            avg_attractiveness: Option<f64>,
+            avg_verified: Option<f64>,
+            avg_height: Option<f64>,
+            avg_photo_count: Option<f64>,
+            avg_completeness: Option<f64>,
+        }
+
+        let row = sqlx::query_as::<_, PopRow>(
+            r#"SELECT
+                AVG(EXTRACT(EPOCH FROM AGE(NOW(), dob)) / 365.25) AS avg_age,
+                AVG(attractiveness_score) AS avg_attractiveness,
+                AVG(CASE WHEN is_verified THEN 1.0 ELSE 0.0 END) AS avg_verified,
+                AVG(height_cm) AS avg_height,
+                AVG(
+                    (CASE WHEN profile_photo_url IS NOT NULL THEN 1 ELSE 0 END +
+                     CASE WHEN profile_photo_1 IS NOT NULL THEN 1 ELSE 0 END +
+                     CASE WHEN profile_photo_2 IS NOT NULL THEN 1 ELSE 0 END +
+                     CASE WHEN profile_photo_3 IS NOT NULL THEN 1 ELSE 0 END)::float / 4.0
+                ) AS avg_photo_count,
+                AVG(
+                    (CASE WHEN name IS NOT NULL THEN 1 ELSE 0 END +
+                     CASE WHEN bio IS NOT NULL THEN 1 ELSE 0 END +
+                     CASE WHEN profile_photo_url IS NOT NULL THEN 1 ELSE 0 END +
+                     CASE WHEN looking_for IS NOT NULL THEN 1 ELSE 0 END +
+                     CASE WHEN height_cm IS NOT NULL THEN 1 ELSE 0 END +
+                     CASE WHEN profession_category IS NOT NULL THEN 1 ELSE 0 END +
+                     CASE WHEN gender IS NOT NULL THEN 1 ELSE 0 END +
+                     CASE WHEN interests IS NOT NULL THEN 1 ELSE 0 END +
+                     CASE WHEN languages IS NOT NULL THEN 1 ELSE 0 END)::float / 9.0
+                ) AS avg_completeness
+            FROM users WHERE dob IS NOT NULL"#,
+        )
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+
+        let hc = Self::hardcoded().defaults;
+        match row {
+            Some(r) => {
+                let age_norm = r.avg_age
+                    .map(|a| ((a - 18.0) / 42.0).clamp(0.0, 1.0))
+                    .unwrap_or(hc.age_norm);
+                let height_norm = r.avg_height
+                    .map(|h| ((h - 140.0) / 60.0).clamp(0.0, 1.0))
+                    .unwrap_or(hc.height_norm);
+                Self {
+                    defaults: UserFeatures {
+                        user_id: 0,
+                        age_norm,
+                        attractiveness: r.avg_attractiveness.unwrap_or(hc.attractiveness),
+                        profile_completeness: r.avg_completeness.unwrap_or(hc.profile_completeness),
+                        verification_score: r.avg_verified.unwrap_or(hc.verification_score),
+                        photo_count: r.avg_photo_count.unwrap_or(hc.photo_count),
+                        height_norm,
+                        has_profession: hc.has_profession,
+                        gender_enc: hc.gender_enc,
+                        intent_enc: hc.intent_enc,
+                        language_count: hc.language_count,
+                        interest_count: hc.interest_count,
+                        activity_score: hc.activity_score,
+                        like_rate: hc.like_rate,
+                        match_rate: hc.match_rate,
+                    },
+                }
+            }
+            None => Self::hardcoded(),
+        }
+    }
+
+    /// Create a UserFeatures from defaults for a given user_id.
+    pub fn for_user(&self, user_id: i32) -> UserFeatures {
+        let mut f = self.defaults.clone();
+        f.user_id = user_id;
+        f
+    }
+}
+
 /// Combine user + candidate features into a 28-dim state vector for RL.
 pub fn combine_features(user: &UserFeatures, candidate: &UserFeatures) -> Vec<f64> {
     let mut v = user.to_vec();
