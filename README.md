@@ -38,11 +38,19 @@ Production backend powering the Nava dating apps (SwiftUI iOS + React Native cro
             │  Service   │ │ ics  │ │Train │
             └───────────┘ └──────┘ └──────┘
 
- ┌──────────┐ ┌───────┐ ┌───────┐ ┌─────┐ ┌──────────┐
- │PostgreSQL│ │ Redis │ │ Neo4j │ │ S3  │ │ClickHouse│
- │(Users,   │ │(Cache,│ │(Graph │ │(Media│ │(Analytics│
- │ Payments)│ │ OTP)  │ │ Rel.) │ │ CDN)│ │  OLAP)   │
- └──────────┘ └───────┘ └───────┘ └─────┘ └──────────┘
+ ┌──────────────────────────────────────────────────┐
+ │              Data Layer                          │
+ │  ┌──────────┐ ┌───────┐ ┌───────┐ ┌─────┐       │
+ │  │PostgreSQL│ │ Redis │ │ Neo4j │ │ S3  │       │
+ │  │ Primary  │ │(Cache,│ │(Graph │ │(Media│      │
+ │  │(Writes)  │ │ OTP)  │ │ Rel.) │ │ CDN)│      │
+ │  └────┬─────┘ └───────┘ └───────┘ └─────┘       │
+ │  ┌────▼─────┐ ┌───────────┐ ┌──────────┐        │
+ │  │ PgBouncer│ │  Read     │ │ClickHouse│        │
+ │  │ (Conn    │ │  Replica  │ │(Analytics│        │
+ │  │  Pool)   │ │  (Reads)  │ │  OLAP)   │        │
+ │  └──────────┘ └───────────┘ └──────────┘        │
+ └──────────────────────────────────────────────────┘
 ```
 
 ## Client Apps
@@ -202,7 +210,7 @@ Call states: `idle → connecting → ringing → active → idle`
 |-------|-------------|
 | **Backend** | Rust, Axum, Tokio, SQLx, async-graphql |
 | **Real-Time** | WebSocket pub/sub (chat + call signaling), typing indicators, read receipts |
-| **Databases** | PostgreSQL 16, Redis 7, Neo4j 5, ClickHouse |
+| **Databases** | PostgreSQL 16 (primary + read replicas), PgBouncer (connection pooling), Redis 7, Neo4j 5, ClickHouse |
 | **Event Streaming** | Apache Kafka (user, payment, match, chat, analytics topics) |
 | **ML Engine** | Q-Learning RL (14-dim state, epsilon-greedy), LinUCB Contextual Bandit (UCB scoring), FedAvg with Differential Privacy |
 | **Computer Vision** | tract-onnx (ArcFace, FER+, NSFW, NIMA, Liveness), face verification, emotion detection |
@@ -210,7 +218,7 @@ Call states: `idle → connecting → ringing → active → idle`
 | **Recommendations** | RL-scored discovery ranking, pgvector 512-dim embeddings, collaborative filtering |
 | **File Storage** | AWS S3 + CloudFront CDN (photos, voice intros, reels) |
 | **Payments** | Apple StoreKit 2 (iOS), RevenueCat (React Native), Razorpay, Stripe |
-| **Infrastructure** | Docker, Kubernetes (EKS), Kustomize, Prometheus, Grafana, GitHub Actions CI/CD |
+| **Infrastructure** | Docker, Kubernetes (EKS), Kustomize, PgBouncer, Prometheus, Grafana, Alertmanager, PagerDuty, GitHub Actions CI/CD |
 | **iOS** | SwiftUI, Combine, StoreKit 2 |
 | **Cross-Platform** | React Native, Expo, TypeScript |
 | **Dashboard** | React, TypeScript, Vite, Tailwind CSS |
@@ -463,8 +471,9 @@ dlq.events         →  dead letter queue for failed events
 │   │   ├── base/              # Ingress, NetworkPolicy, PDB, ServiceAccount
 │   │   ├── overlays/dev/      # Dev: in-cluster Postgres + Redis
 │   │   └── overlays/prod/     # Prod: RDS + ElastiCache, higher resources
-│   ├── monitoring/            # Prometheus rules + alerts
-│   ├── migrations/            # PostgreSQL migrations
+│   ├── deploy/                # Ops runbook, SLO alerts, PgBouncer + PostgreSQL configs
+│   ├── monitoring/            # Prometheus scrape config, Alertmanager routing
+│   ├── migrations/            # PostgreSQL migrations (incl. hash-partitioned swipes)
 │   └── Dockerfile             # Multi-stage build, non-root, healthcheck
 ├── microservices/             # Event-driven microservices
 │   ├── gateway/               # API Gateway
@@ -473,7 +482,7 @@ dlq.events         →  dead letter queue for failed events
 │   ├── k8s/                   # K8s manifests (base + dev/prod overlays)
 │   └── docker-compose.yml
 ├── ambassador-dashboard/      # React/TypeScript analytics dashboard
-├── tests/                     # E2E, Load, Contract, Smoke, Fuzz, Chaos
+├── tests/                     # E2E, Load (k6 PgBouncer+replica), Contract, Smoke, Fuzz, Chaos
 ├── vision/                    # Face recognition, liveness, NSFW detection (PyTorch/ONNX)
 ├── location/                  # Geo services, student discount verification
 ├── protos/                    # gRPC protocol buffers
@@ -529,9 +538,10 @@ kubectl get hpa -n nava-prod
 
 ### CI/CD Pipeline
 Automated via GitHub Actions (`.github/workflows/rust-ci.yml`):
-1. **Test** — `cargo fmt`, `cargo clippy`, `cargo test`
-2. **Build** — Multi-stage Docker build, push to ECR
-3. **Deploy** — Rolling update to EKS with auto-rollback on failure
+1. **Test** — `cargo fmt`, `cargo clippy`, `cargo test --lib`
+2. **DB Integration Tests** — PostgreSQL 16 service container, runs migrations, swipes partition regression test, statement_timeout verification (direct + PgBouncer modes)
+3. **Build** — Multi-stage Docker build, push to ECR
+4. **Deploy** — Rolling update to EKS with auto-rollback on failure
 
 ### Kubernetes Features
 - **HPA** — Auto-scales 3→20 pods based on CPU (65%) and memory (75%)
@@ -545,6 +555,17 @@ Automated via GitHub Actions (`.github/workflows/rust-ci.yml`):
 ## Testing
 
 ```bash
+# Unit & integration tests (63 tests)
+cd rust-backend && cargo test --lib
+
+# Database integration tests (CI-automated)
+psql -f rust-backend/tests/swipes_partition_test.sql    # Partition regression
+psql -f rust-backend/tests/statement_timeout_test.sql   # Timeout verification
+
+# Load testing (PgBouncer + replica validation)
+k6 run tests/load/k6-pgbouncer-replica.js               # ML fallback, replica lag, pool saturation
+
+# Other test suites
 tests/e2e/run_tests.sh          # End-to-end user flows
 tests/load/k6 run load_tests.js # k6 load tests
 tests/contract/run_tests.sh     # API contract validation
@@ -562,14 +583,18 @@ tests/chaos/chaos_tests.sh      # Resilience testing
 
 ## Performance Targets
 
-| Metric | Target |
-|--------|--------|
-| Concurrent connections | 10K+ per node |
-| P95 response time | < 500ms |
-| P99 response time | < 1000ms |
-| WebSocket latency | < 50ms |
-| ML scoring latency | < 1ms (in-memory) |
-| Match accuracy | 99.9% (RL-powered scoring) |
+| Metric | Target | SLO Alert |
+|--------|--------|-----------|
+| Availability | 99.9% (43 min/month) | Error rate > 0.1% for 5m |
+| API latency (p99) | < 500ms | > 500ms for 5m |
+| Discover latency (p99) | < 200ms | > 200ms for 5m |
+| ML scoring latency | < 10ms avg (in-memory) | > 10ms for 5m |
+| ML fallback rate | < 5% | > 5% warning, > 20% critical |
+| WebSocket connections | 10K+ per node | > 8,000 for 5m |
+| WebSocket latency | < 50ms | — |
+| DB pool utilization | < 80% | > 80% for 3m |
+| Write TPS capacity | ~5,000-8,000 | > 500 TPS sustained 10m |
+| Replica lag | < 2s | > 2s auto-fallback to primary |
 
 ## Data Models
 
@@ -707,6 +732,107 @@ University-tiered pricing to drive campus adoption:
 
 ## Monitoring & Alerting
 
-- **Prometheus metrics** at `/metrics` — request counts, errors, DB pool, WebSocket connections, uptime
-- **AlertManager rules** — High error rate (>5%), high latency (P95 >2s), DB pool exhaustion (>85%), Redis failures
-- **Health probes** — `/health` (basic), `/ready` (K8s readiness), `/live` (K8s liveness)
+### Prometheus Metrics (`/metrics`)
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `app_http_requests_total` | Counter | Total HTTP requests by method/path/status |
+| `http_request_duration_seconds` | Histogram | Request latency by endpoint |
+| `app_db_pool_size` / `app_db_pool_idle` | Gauge | Database connection pool utilization |
+| `app_websocket_connections` | Gauge | Active WebSocket connections |
+| `app_ml_fallback_total` | Counter | Discover requests that fell back to attractiveness scoring |
+| `app_discover_requests_total` | Counter | Total discover requests (for fallback rate calculation) |
+| `app_ml_avg_scoring_latency_us` | Gauge | Average ML scoring latency in microseconds |
+| `app_vision_unavailable_total` | Counter | Vision endpoint requests when sidecar unavailable |
+| `app_swipe_writes_total` | Counter | Total swipe writes (like + pass) for TPS monitoring |
+| `app_replica_lag_ms` | Gauge | Read replica replication lag in milliseconds |
+| `app_replica_healthy` | Gauge | Read replica health (1=healthy, 0=degraded) |
+| `app_reads_from_replica` | Counter | Reads served by replica |
+| `app_reads_fallback_to_primary` | Counter | Reads that fell back to primary |
+| `dlq_entries_pending` | Gauge | Pending DLQ entries by queue |
+
+### SLO Definitions
+
+| SLO | Target | Alert Threshold |
+|-----|--------|----------------|
+| **Availability** | 99.9% (43 min/month) | Error rate > 0.1% for 5m |
+| **API Latency** | p99 < 500ms | > 500ms for 5m |
+| **Discover Latency** | p99 < 200ms | > 200ms for 5m |
+| **DB Pool** | < 80% utilization | > 80% for 3m |
+| **Payment DLQ** | < 50 pending | > 50 for 10m |
+| **ML Scoring** | avg < 10ms | > 10ms for 5m |
+| **ML Fallback Rate** | < 5% | > 5% for 5m (warning), > 20% (critical) |
+| **WebSocket Capacity** | < 8,000 connections | > 8,000 for 5m |
+
+### Alert Routing
+
+| Severity | Channels |
+|----------|----------|
+| **Warning** | Slack (`#nava-platform-alerts`, `#nava-payments-alerts`) |
+| **Critical** | Slack urgent channels + PagerDuty on-call |
+| **Security** | `#nava-security-alerts` + email to security team |
+
+Alert rules defined in `rust-backend/deploy/slo-alerts.yml`. Alertmanager config in `rust-backend/monitoring/alertmanager.yaml`.
+
+### Health Probes
+
+| Endpoint | Purpose | Details |
+|----------|---------|---------|
+| `/health` | Basic liveness | Returns 200 if app is running |
+| `/health/detailed` | Component health | DB pool, Redis, replica status, ML engine |
+| `/ready` | K8s readiness | Checks DB connectivity |
+| `/metrics` | Prometheus scrape | All counters, gauges, histograms |
+
+## Database Architecture
+
+### Connection Pooling (PgBouncer)
+- **Mode:** Transaction pooling (connection returned after each transaction)
+- **Pool:** 50 server connections, 1,000 max client connections
+- **Config:** `rust-backend/deploy/pgbouncer.ini`
+- **Note:** Session-level `SET` statements are lost between transactions — use `SET LOCAL` within transactions or configure in `postgresql.conf`
+
+### Read Replicas
+- **Primary pool** (`state.db`) — all writes + fallback reads
+- **Replica pool** (`state.db_read`) — read-heavy queries (discover, matches, profiles, admin stats, embeddings, reels)
+- **Health check:** Background task every 5s via `pg_last_xact_replay_timestamp()`
+- **Auto-fallback:** If replica lag > 2s, all reads automatically route to primary
+- **~15 read-heavy handlers** migrated to replica: profile, discover, matches, spots, admin stats, embeddings, bandit arms, training events, reels, learned patterns, payment reads
+
+### Swipes Partitioning
+- **Strategy:** Hash-partitioned by `from_user_id` into 8 partitions
+- **Benefit:** Write distribution across partitions, preserves UNIQUE constraint for ON CONFLICT upserts
+- **CI enforced:** Partition regression test runs on every push/PR
+
+### Write Scaling Roadmap
+- **Current capacity:** ~5,000-8,000 write TPS on 4vCPU/16GB primary (adequate for ~50K DAU)
+- **Sharding triggers:** Pool utilization >60% sustained, write p99 >100ms, WAL >500MB/min, DAU >100K
+- **Phase 1:** Functional sharding (swipes DB, messages DB, events DB)
+- **Phase 2:** Horizontal sharding by `user_id % N`
+- Full details in `rust-backend/deploy/ops-runbook.md`
+
+## Graceful Degradation
+
+| Component | When Unavailable | User Impact |
+|-----------|-----------------|-------------|
+| **Vision sidecar** | 503 on `/vision/analyze`, `/verify/selfie` | Photo analysis skipped, verification unavailable |
+| **ML ranking** | 2s timeout → attractiveness score fallback | Lower-quality discover rankings |
+| **ML `record_swipe`** | Fire-and-forget (`tokio::spawn`) | Zero impact on swipe latency |
+| **Read replica** | Auto-fallback to primary (lag >2s) | No user impact, higher primary load |
+| **Neo4j (graph)** | Dual-write manager queues, PG-only fallback | No user impact |
+| **Redis (cache)** | App runs without cache | Slightly slower responses |
+
+### Webhook Resilience
+- Razorpay and Stripe webhooks catch processing failures and auto-enqueue to DLQ
+- Always return 200 to payment gateway (prevents infinite retries)
+- DLQ entries can be retried or manually reviewed via `/api/payments/dlq/*` endpoints
+
+## Operations
+
+Full ops runbook at `rust-backend/deploy/ops-runbook.md` covering:
+- K8s secret rotation procedure (`SECRET_KEY_FILE` pattern)
+- SLO definitions and burn rate windows
+- Alert response playbooks for every alert
+- ML fallback investigation and remediation
+- PgBouncer admin commands and scaling
+- Read replica monitoring and scaling
+- Write scaling roadmap and sharding strategy
