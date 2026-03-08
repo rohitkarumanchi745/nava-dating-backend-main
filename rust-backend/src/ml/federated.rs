@@ -1,10 +1,12 @@
 use serde_json::Value;
 
+use super::features::USER_FEATURE_DIM;
 use super::math::laplace_noise;
 
 /// FedAvg aggregation with differential privacy.
-/// Performs actual weighted averaging of client model weights,
-/// replacing the stub in handlers/mod.rs.
+/// Performs actual weighted averaging of client model weights.
+/// The model operates on 28-dim state vectors (14 user features + 14 candidate features)
+/// covering profile attributes, swipe behavior, and engagement signals.
 
 pub struct FederatedCoordinator {
     /// Global learning rate for aggregation
@@ -110,6 +112,23 @@ impl FederatedCoordinator {
             num_clients: client_updates.len(),
             total_samples,
             dp_applied: self.dp_enabled,
+        })
+    }
+
+    /// Stats for monitoring, including feature dimensions the FL model uses.
+    pub fn stats(&self) -> Value {
+        serde_json::json!({
+            "global_lr": self.global_lr,
+            "min_clients": self.min_clients,
+            "dp_enabled": self.dp_enabled,
+            "dp_noise_scale": self.dp_noise_scale,
+            "user_feature_dim": USER_FEATURE_DIM,
+            "combined_state_dim": USER_FEATURE_DIM * 2,
+            "feature_categories": {
+                "profile": ["age_norm", "attractiveness", "profile_completeness", "verification_score", "photo_count", "height_norm", "has_profession", "gender_enc"],
+                "richness": ["intent_enc", "language_count", "interest_count"],
+                "engagement": ["activity_score", "like_rate", "match_rate"]
+            }
         })
     }
 }

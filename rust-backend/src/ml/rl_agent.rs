@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use rand::Rng;
 
 /// Q-learning RL agent for discovery ranking.
-/// State = 14-dim (7 user features + 7 candidate features).
+/// State = 28-dim (14 user features + 14 candidate features).
 /// Actions: 0 = pass, 1 = like.
 
-const STATE_DIM: usize = 14;
+const STATE_DIM: usize = 28;
 const NUM_ACTIONS: usize = 2;
 const REPLAY_BUFFER_MAX: usize = 10_000;
 

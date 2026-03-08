@@ -100,7 +100,8 @@ use handlers::{
     submit_user_labels, mark_labeling_failed, get_reel_labels, export_training_snapshot,
     // Federated Learning
     register_fl_client, get_fl_round, submit_fl_update, start_fl_round,
-    aggregate_fl_round, get_active_fl_model, report_local_data, get_ml_system_stats,
+    aggregate_fl_round, get_active_fl_model, report_local_data, get_fl_training_data,
+    get_ml_system_stats,
     // RevenueCat Subscriptions
     sync_subscription, revenuecat_webhook,
     // Web Payments (Razorpay + Stripe)
@@ -731,6 +732,7 @@ async fn main() {
         .route("/fl/aggregate", post(aggregate_fl_round))
         .route("/fl/model", get(get_active_fl_model))
         .route("/fl/local-data", post(report_local_data))
+        .route("/fl/training-data", get(get_fl_training_data))
         // ML Computation Endpoints
         .route("/ml/rl/rank", post(handlers::ml_rank_candidates))
         .route("/ml/linucb/score", post(handlers::ml_linucb_score))

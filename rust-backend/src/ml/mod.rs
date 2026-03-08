@@ -6,7 +6,7 @@ pub mod rl_agent;
 
 use sqlx::PgPool;
 
-use self::features::{UserFeatures, combine_features};
+use self::features::{UserFeatures, combine_features, USER_FEATURE_DIM};
 use self::federated::FederatedCoordinator;
 use self::linucb::LinUcbBandit;
 use self::rl_agent::{RlAgent, SwipeExperience};
@@ -79,7 +79,7 @@ impl MlService {
             UserFeatures::from_db(pool, candidate_id).await,
         ) {
             (Ok(uf), Ok(cf)) => combine_features(&uf, &cf),
-            _ => vec![0.5; 14], // Fallback
+            _ => vec![0.5; USER_FEATURE_DIM * 2], // Fallback: 28-dim neutral
         };
 
         self.rl_agent.record_experience(SwipeExperience {
@@ -106,7 +106,10 @@ impl MlService {
         serde_json::json!({
             "rl_agent": self.rl_agent.stats(),
             "linucb": self.linucb.stats(),
+            "federated": self.federated.stats(),
             "train_counter": self.train_counter,
+            "feature_dim": USER_FEATURE_DIM,
+            "state_dim": USER_FEATURE_DIM * 2,
         })
     }
 }

@@ -4951,10 +4951,14 @@ pub async fn get_fl_round(
             return Ok(Json(json!({ "eligible": false, "reason": "Already participated in this round" })));
         }
 
+        // Include feature schema so the client knows what the model dimensions represent
+        let schema = crate::ml::features::feature_schema();
+
         Ok(Json(json!({
             "eligible": true,
             "round": r,
-            "client_id": client_id
+            "client_id": client_id,
+            "feature_schema": schema
         })))
     } else {
         Ok(Json(json!({ "eligible": false, "reason": "No active round" })))
@@ -4975,6 +4979,8 @@ pub struct SubmitFLUpdatePayload {
     pub dp_epsilon: Option<f64>,
     pub dp_delta: Option<f64>,
     pub checksum: String,
+    /// Summary of features used in local training (profile, swipe, engagement stats)
+    pub feature_summary: Option<Value>,
 }
 
 pub async fn submit_fl_update(
@@ -5120,10 +5126,13 @@ pub async fn start_fl_round(
     .fetch_one(&state.db)
     .await?;
 
+    let schema = crate::ml::features::feature_schema();
+
     Ok(Json(json!({
         "round_id": round_id,
         "round_number": next_round,
-        "status": "in_progress"
+        "status": "in_progress",
+        "feature_schema": schema
     })))
 }
 
@@ -5325,6 +5334,61 @@ pub async fn report_local_data(
     .await?;
 
     Ok(Json(json!({ "reported": true, "eligible_for_training": min_samples_met })))
+}
+
+/// Get FL training data for on-device model training.
+/// Serves the user's profile features + their swipe history as labeled training
+/// pairs so the FL client can train a local recommendation model using real
+/// user data (age, profession, height, languages, interests, gender, swipe
+/// behavior, engagement, and match outcomes).
+pub async fn get_fl_training_data(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let max_pairs: i64 = params
+        .get("max_pairs")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+
+    let device_id = params
+        .get("device_id")
+        .ok_or_else(|| AppError::bad_request("device_id required"))?;
+
+    // Verify client is registered and opted in
+    let client = sqlx::query_as::<_, (i64, bool, bool)>(
+        "SELECT id, is_active, opted_in FROM fl_clients WHERE user_id = $1 AND device_id = $2"
+    )
+    .bind(user_id)
+    .bind(device_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (_, is_active, opted_in) = client
+        .ok_or_else(|| AppError::bad_request("Client not registered for FL"))?;
+    if !is_active || !opted_in {
+        return Err(AppError::bad_request("Client not active or not opted in"));
+    }
+
+    let training_data = crate::ml::features::FLTrainingData::build(
+        &state.db,
+        user_id,
+        max_pairs,
+    )
+    .await
+    .map_err(|e| AppError::internal(&format!("Failed to build FL training data: {e}")))?;
+
+    Ok(Json(json!({
+        "user_id": user_id,
+        "user_features": training_data.user_features,
+        "training_pairs_count": training_data.training_pairs.len(),
+        "training_pairs": training_data.training_pairs,
+        "feature_schema": training_data.feature_schema,
+        "eligible_for_training": training_data.training_pairs.len() >= 50,
+    })))
 }
 
 /// Export training data snapshot for LLM fine-tuning

@@ -43,6 +43,7 @@ pub struct UserPreferences {
     pub min_age: Option<i32>,
     pub max_age: Option<i32>,
     pub preferred_genders: Vec<String>,
+    pub preferred_professions: Vec<String>,
     pub max_distance_km: Option<i32>,
     pub only_verified: bool,
     pub only_students: bool,
@@ -163,6 +164,7 @@ pub struct PreferencesInput {
     pub min_age: Option<i32>,
     pub max_age: Option<i32>,
     pub preferred_genders: Option<Vec<String>>,
+    pub preferred_professions: Option<Vec<String>>,
     pub max_distance_km: Option<i32>,
     pub only_verified: Option<bool>,
     pub only_students: Option<bool>,
@@ -326,7 +328,7 @@ impl QueryRoot {
 
         let row = sqlx::query_as::<_, PreferencesRow>(
             r#"
-            SELECT min_age, max_age, preferred_genders, max_distance, only_verified, only_students
+            SELECT min_age, max_age, preferred_genders, preferred_professions, max_distance, only_verified, only_students
             FROM user_preferences WHERE user_id = $1
             "#,
         )
@@ -338,6 +340,9 @@ impl QueryRoot {
             min_age: r.min_age,
             max_age: r.max_age,
             preferred_genders: r.preferred_genders
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            preferred_professions: r.preferred_professions
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default(),
             max_distance_km: r.max_distance,
@@ -378,7 +383,7 @@ impl QueryRoot {
                    u.profile_photo_1, u.profile_photo_2, u.profile_photo_3, u.profile_photos,
                    u.interests, u.languages, u.is_verified, u.attractiveness_score,
                    u.voice_intro_url, u.voice_intro_duration,
-                   u.profession_title, u.looking_for, u.height_cm
+                   u.profession_title, u.profession_category, u.looking_for, u.height_cm
             FROM users u
             WHERE u.id != $1
               AND u.is_profile_complete = true
@@ -421,6 +426,17 @@ impl QueryRoot {
         let current_looking_for = current_user.as_ref()
             .and_then(|u| u.looking_for.clone());
 
+        // Load user's preferred professions for scoring boost
+        let preferred_professions: Vec<String> = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT preferred_professions FROM user_preferences WHERE user_id = $1"
+        )
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await?
+        .flatten()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+
         Ok(rows.into_iter().map(|r| {
             let age = r.dob.map(|dob| {
                 let today = chrono::Utc::now().date_naive();
@@ -453,9 +469,11 @@ impl QueryRoot {
                 &current_interests,
                 &current_languages,
                 &current_looking_for,
+                &preferred_professions,
                 &interests,
                 &languages,
                 &r.looking_for,
+                &r.profession_category,
                 r.voice_intro_url.is_some(),
                 r.is_verified.unwrap_or(false),
             );
@@ -958,17 +976,21 @@ impl MutationRoot {
         let preferred_genders = input.preferred_genders
             .map(|g| serde_json::to_value(g).unwrap_or_default());
 
+        let preferred_professions = input.preferred_professions
+            .map(|p| serde_json::to_value(p).unwrap_or_default());
+
         sqlx::query(
             r#"
-            INSERT INTO user_preferences (user_id, min_age, max_age, preferred_genders, max_distance, only_verified, only_students, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+            INSERT INTO user_preferences (user_id, min_age, max_age, preferred_genders, preferred_professions, max_distance, only_verified, only_students, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
             ON CONFLICT (user_id) DO UPDATE SET
                 min_age = COALESCE($2, user_preferences.min_age),
                 max_age = COALESCE($3, user_preferences.max_age),
                 preferred_genders = COALESCE($4, user_preferences.preferred_genders),
-                max_distance = COALESCE($5, user_preferences.max_distance),
-                only_verified = COALESCE($6, user_preferences.only_verified),
-                only_students = COALESCE($7, user_preferences.only_students),
+                preferred_professions = COALESCE($5, user_preferences.preferred_professions),
+                max_distance = COALESCE($6, user_preferences.max_distance),
+                only_verified = COALESCE($7, user_preferences.only_verified),
+                only_students = COALESCE($8, user_preferences.only_students),
                 updated_at = NOW()
             "#,
         )
@@ -976,6 +998,7 @@ impl MutationRoot {
         .bind(input.min_age)
         .bind(input.max_age)
         .bind(&preferred_genders)
+        .bind(&preferred_professions)
         .bind(input.max_distance_km)
         .bind(input.only_verified)
         .bind(input.only_students)
@@ -984,7 +1007,7 @@ impl MutationRoot {
 
         // Fetch and return
         let row = sqlx::query_as::<_, PreferencesRow>(
-            "SELECT min_age, max_age, preferred_genders, max_distance, only_verified, only_students FROM user_preferences WHERE user_id = $1",
+            "SELECT min_age, max_age, preferred_genders, preferred_professions, max_distance, only_verified, only_students FROM user_preferences WHERE user_id = $1",
         )
         .bind(user_id)
         .fetch_one(&state.db)
@@ -994,6 +1017,9 @@ impl MutationRoot {
             min_age: row.min_age,
             max_age: row.max_age,
             preferred_genders: row.preferred_genders
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            preferred_professions: row.preferred_professions
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default(),
             max_distance_km: row.max_distance,
@@ -1404,6 +1430,7 @@ struct PreferencesRow {
     min_age: Option<i32>,
     max_age: Option<i32>,
     preferred_genders: Option<serde_json::Value>,
+    preferred_professions: Option<serde_json::Value>,
     max_distance: Option<i32>,
     only_verified: Option<bool>,
     only_students: Option<bool>,
@@ -1430,6 +1457,7 @@ struct DiscoverRow {
     voice_intro_duration: Option<i32>,
     // Enhanced fields
     profession_title: Option<String>,
+    profession_category: Option<String>,
     looking_for: Option<String>,
     height_cm: Option<i32>,
 }
@@ -1488,9 +1516,11 @@ fn calculate_compatibility(
     my_interests: &[String],
     my_languages: &[String],
     my_looking_for: &Option<String>,
+    my_preferred_professions: &[String],
     their_interests: &[String],
     their_languages: &[String],
     their_looking_for: &Option<String>,
+    their_profession_category: &Option<String>,
     has_voice_intro: bool,
     is_verified: bool,
 ) -> f64 {
@@ -1520,6 +1550,16 @@ fn calculate_compatibility(
     if let (Some(mine), Some(theirs)) = (my_looking_for, their_looking_for) {
         if mine.to_lowercase() == theirs.to_lowercase() {
             score += 10.0;
+        }
+    }
+
+    // Profession preference match (+10 points) - boost if candidate matches preferred profession
+    if !my_preferred_professions.is_empty() {
+        if let Some(their_prof) = their_profession_category {
+            let pref_set: std::collections::HashSet<_> = my_preferred_professions.iter().map(|s| s.to_lowercase()).collect();
+            if pref_set.contains(&their_prof.to_lowercase()) {
+                score += 10.0;
+            }
         }
     }
 

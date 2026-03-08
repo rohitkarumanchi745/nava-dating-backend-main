@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 /// LinUCB contextual bandit for candidate scoring.
-/// Each "arm" is a candidate user; context is the 14-dim feature vector.
+/// Each "arm" is a candidate user; context is the 28-dim feature vector.
 
-const FEATURE_DIM: usize = 14;
+const FEATURE_DIM: usize = 28;
 
 /// Per-arm state: A matrix (d×d) and b vector (d×1).
 #[derive(Debug, Clone)]

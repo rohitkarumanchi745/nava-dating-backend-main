@@ -1,17 +1,30 @@
 use sqlx::PgPool;
 
-/// 7-dimensional user feature vector for ML scoring.
-/// Extracted from nava's `users` + `user_features` tables.
+/// Number of features per user in the ML feature vector.
+pub const USER_FEATURE_DIM: usize = 14;
+
+/// 14-dimensional user feature vector for ML scoring.
+/// Covers profile attributes, richness signals, swipe behavior, and engagement.
 #[derive(Debug, Clone)]
 pub struct UserFeatures {
     pub user_id: i32,
-    pub age_norm: f64,           // normalized age (0-1)
-    pub attractiveness: f64,     // attractiveness_score from users table
+    // --- Profile attributes (8) ---
+    pub age_norm: f64,             // normalized age 0-1 (18-60)
+    pub attractiveness: f64,       // attractiveness_score from users table
     pub profile_completeness: f64, // ratio of filled fields
-    pub verification_score: f64, // is_verified + is_student_verified
-    pub activity_score: f64,     // based on recent interactions
-    pub photo_count: f64,        // normalized photo count (0-1)
-    pub height_norm: f64,        // normalized height (0-1)
+    pub verification_score: f64,   // is_verified + is_student_verified
+    pub photo_count: f64,          // normalized photo count (0-1)
+    pub height_norm: f64,          // normalized height (0-1)
+    pub has_profession: f64,       // 1.0 if profession_category is set
+    pub gender_enc: f64,           // male=0.0, female=1.0, non_binary=0.5
+    // --- Richness signals (3) ---
+    pub intent_enc: f64,           // relationship=1.0, casual=0.5, friendship=0.25, unset=0.0
+    pub language_count: f64,       // normalized language count (0-1, capped at 5)
+    pub interest_count: f64,       // normalized interest count (0-1, capped at 10)
+    // --- Swipe & engagement (3) ---
+    pub activity_score: f64,       // recent interaction count normalized
+    pub like_rate: f64,            // fraction of swipes that were likes (0-1)
+    pub match_rate: f64,           // fraction of likes that became mutual matches (0-1)
 }
 
 impl UserFeatures {
@@ -26,17 +39,22 @@ impl UserFeatures {
             height_cm: Option<i32>,
             name: Option<String>,
             bio: Option<String>,
+            gender: Option<String>,
             profile_photo_url: Option<String>,
             profile_photo_1: Option<String>,
             profile_photo_2: Option<String>,
             profile_photo_3: Option<String>,
             looking_for: Option<String>,
+            profession_category: Option<String>,
+            interests: Option<serde_json::Value>,
+            languages: Option<serde_json::Value>,
         }
 
         let row = sqlx::query_as::<_, Row>(
             r#"SELECT dob, attractiveness_score, is_verified, is_student_verified,
-                      height_cm, name, bio, profile_photo_url,
-                      profile_photo_1, profile_photo_2, profile_photo_3, looking_for
+                      height_cm, name, bio, gender, profile_photo_url,
+                      profile_photo_1, profile_photo_2, profile_photo_3, looking_for,
+                      profession_category, interests, languages
                FROM users WHERE id = $1"#,
         )
         .bind(user_id)
@@ -54,6 +72,40 @@ impl UserFeatures {
 
         let attractiveness = row.attractiveness_score.unwrap_or(0.5);
 
+        let has_profession = if row.profession_category.is_some() { 1.0 } else { 0.0 };
+
+        // Gender encoding
+        let gender_enc = match row.gender.as_deref() {
+            Some("male") => 0.0,
+            Some("female") => 1.0,
+            Some("non_binary") => 0.5,
+            _ => 0.5, // default neutral
+        };
+
+        // Intent encoding
+        let intent_enc = match row.looking_for.as_deref() {
+            Some("relationship") | Some("long_term") => 1.0,
+            Some("casual") | Some("short_term") => 0.5,
+            Some("friendship") => 0.25,
+            _ => 0.0,
+        };
+
+        // Language count (JSONB array)
+        let language_count = row
+            .languages
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .map(|arr| (arr.len() as f64 / 5.0).min(1.0))
+            .unwrap_or(0.0);
+
+        // Interest count (JSONB array)
+        let interest_count = row
+            .interests
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .map(|arr| (arr.len() as f64 / 10.0).min(1.0))
+            .unwrap_or(0.0);
+
         // Count filled profile fields
         let filled: f64 = [
             row.name.is_some(),
@@ -61,11 +113,15 @@ impl UserFeatures {
             row.profile_photo_url.is_some(),
             row.looking_for.is_some(),
             row.height_cm.is_some(),
+            row.profession_category.is_some(),
+            row.gender.is_some(),
+            row.interests.is_some(),
+            row.languages.is_some(),
         ]
         .iter()
         .filter(|&&v| v)
         .count() as f64;
-        let profile_completeness = filled / 5.0;
+        let profile_completeness = filled / 9.0;
 
         let verification_score = match (
             row.is_verified.unwrap_or(false),
@@ -76,7 +132,7 @@ impl UserFeatures {
             _ => 0.0,
         };
 
-        // Activity score from recent interactions
+        // Activity score from recent interactions (7 days)
         let interaction_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM interaction_events WHERE user_id = $1 AND created_at > NOW() - INTERVAL '7 days'",
         )
@@ -85,6 +141,53 @@ impl UserFeatures {
         .await
         .unwrap_or(0);
         let activity_score = (interaction_count as f64 / 50.0).min(1.0);
+
+        // Swipe stats: like_rate and match_rate from interaction_events + matches
+        #[derive(sqlx::FromRow)]
+        struct SwipeStats {
+            total_swipes: Option<i64>,
+            total_likes: Option<i64>,
+        }
+
+        let swipe_stats = sqlx::query_as::<_, SwipeStats>(
+            r#"SELECT
+                COUNT(*) AS total_swipes,
+                COUNT(*) FILTER (WHERE event_type = 'like') AS total_likes
+               FROM interaction_events
+               WHERE user_id = $1 AND event_type IN ('like', 'pass')"#,
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(SwipeStats {
+            total_swipes: Some(0),
+            total_likes: Some(0),
+        });
+
+        let total_swipes = swipe_stats.total_swipes.unwrap_or(0);
+        let total_likes = swipe_stats.total_likes.unwrap_or(0);
+        let like_rate = if total_swipes > 0 {
+            (total_likes as f64 / total_swipes as f64).clamp(0.0, 1.0)
+        } else {
+            0.5 // neutral default
+        };
+
+        // Match rate: mutual matches / total likes
+        let mutual_match_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM matches
+               WHERE is_mutual_match = TRUE
+                 AND (user1_id = $1 OR user2_id = $1)"#,
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+        let match_rate = if total_likes > 0 {
+            (mutual_match_count as f64 / total_likes as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
 
         // Photo count
         let photos = [
@@ -109,29 +212,163 @@ impl UserFeatures {
             attractiveness,
             profile_completeness,
             verification_score,
-            activity_score,
             photo_count,
             height_norm,
+            has_profession,
+            gender_enc,
+            intent_enc,
+            language_count,
+            interest_count,
+            activity_score,
+            like_rate,
+            match_rate,
         })
     }
 
-    /// Convert to 7-dim feature vector.
+    /// Convert to 14-dim feature vector.
     pub fn to_vec(&self) -> Vec<f64> {
         vec![
             self.age_norm,
             self.attractiveness,
             self.profile_completeness,
             self.verification_score,
-            self.activity_score,
             self.photo_count,
             self.height_norm,
+            self.has_profession,
+            self.gender_enc,
+            self.intent_enc,
+            self.language_count,
+            self.interest_count,
+            self.activity_score,
+            self.like_rate,
+            self.match_rate,
         ]
     }
 }
 
-/// Combine user + candidate features into a 14-dim state vector for RL.
+/// Combine user + candidate features into a 28-dim state vector for RL.
 pub fn combine_features(user: &UserFeatures, candidate: &UserFeatures) -> Vec<f64> {
     let mut v = user.to_vec();
     v.extend(candidate.to_vec());
     v
+}
+
+/// Feature schema describing each dimension — sent to FL clients so they
+/// know what the model's input features represent.
+pub fn feature_schema() -> serde_json::Value {
+    serde_json::json!({
+        "user_feature_dim": USER_FEATURE_DIM,
+        "combined_state_dim": USER_FEATURE_DIM * 2,
+        "features": [
+            {"index": 0,  "name": "age_norm",             "type": "profile",    "range": [0.0, 1.0]},
+            {"index": 1,  "name": "attractiveness",       "type": "profile",    "range": [0.0, 1.0]},
+            {"index": 2,  "name": "profile_completeness", "type": "profile",    "range": [0.0, 1.0]},
+            {"index": 3,  "name": "verification_score",   "type": "profile",    "range": [0.0, 1.0]},
+            {"index": 4,  "name": "photo_count",          "type": "profile",    "range": [0.0, 1.0]},
+            {"index": 5,  "name": "height_norm",          "type": "profile",    "range": [0.0, 1.0]},
+            {"index": 6,  "name": "has_profession",       "type": "profile",    "range": [0.0, 1.0]},
+            {"index": 7,  "name": "gender_enc",           "type": "profile",    "range": [0.0, 1.0]},
+            {"index": 8,  "name": "intent_enc",           "type": "profile",    "range": [0.0, 1.0]},
+            {"index": 9,  "name": "language_count",       "type": "richness",   "range": [0.0, 1.0]},
+            {"index": 10, "name": "interest_count",       "type": "richness",   "range": [0.0, 1.0]},
+            {"index": 11, "name": "activity_score",       "type": "engagement", "range": [0.0, 1.0]},
+            {"index": 12, "name": "like_rate",            "type": "swipe",      "range": [0.0, 1.0]},
+            {"index": 13, "name": "match_rate",           "type": "swipe",      "range": [0.0, 1.0]},
+        ]
+    })
+}
+
+/// FL training data for on-device model training.
+/// Contains the user's profile features + their swipe history as labeled
+/// training pairs, so the FL client can train a local recommendation model.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FLTrainingData {
+    /// The user's own 14-dim feature vector
+    pub user_features: Vec<f64>,
+    /// Labeled training pairs: (candidate_features, label)
+    /// label = 1.0 for like, 0.0 for pass, 1.5 for mutual match
+    pub training_pairs: Vec<FLTrainingPair>,
+    /// Feature schema so the client knows dimensions
+    pub feature_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FLTrainingPair {
+    /// 28-dim combined state: user_features ++ candidate_features
+    pub state: Vec<f64>,
+    /// Reward label: 1.0 = liked, 0.0 = passed, 1.5 = mutual match
+    pub label: f64,
+    /// Candidate user's 14-dim features
+    pub candidate_features: Vec<f64>,
+}
+
+impl FLTrainingData {
+    /// Build FL training data for a user from their swipe history.
+    /// Fetches the user's recent interactions and the features of each candidate.
+    pub async fn build(pool: &PgPool, user_id: i32, max_pairs: i64) -> Result<Self, sqlx::Error> {
+        let user_features = UserFeatures::from_db(pool, user_id).await?;
+        let user_vec = user_features.to_vec();
+
+        // Fetch recent swipe interactions with their outcomes
+        #[derive(sqlx::FromRow)]
+        struct InteractionRow {
+            target_user_id: i32,
+            event_type: String,
+        }
+
+        let interactions = sqlx::query_as::<_, InteractionRow>(
+            r#"SELECT target_user_id, event_type
+               FROM interaction_events
+               WHERE user_id = $1 AND event_type IN ('like', 'pass')
+               ORDER BY created_at DESC
+               LIMIT $2"#,
+        )
+        .bind(user_id)
+        .bind(max_pairs)
+        .fetch_all(pool)
+        .await?;
+
+        // Check which likes became mutual matches
+        let mutual_match_ids: Vec<i32> = sqlx::query_scalar(
+            r#"SELECT CASE WHEN user1_id = $1 THEN user2_id ELSE user1_id END
+               FROM matches
+               WHERE is_mutual_match = TRUE AND (user1_id = $1 OR user2_id = $1)"#,
+        )
+        .bind(user_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        let mut training_pairs = Vec::with_capacity(interactions.len());
+        for interaction in &interactions {
+            let candidate = match UserFeatures::from_db(pool, interaction.target_user_id).await {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let candidate_vec = candidate.to_vec();
+            let state = combine_features(&user_features, &candidate);
+
+            let label = if interaction.event_type == "like" {
+                if mutual_match_ids.contains(&interaction.target_user_id) {
+                    1.5 // mutual match — strongest positive signal
+                } else {
+                    1.0 // liked
+                }
+            } else {
+                0.0 // passed
+            };
+
+            training_pairs.push(FLTrainingPair {
+                state,
+                label,
+                candidate_features: candidate_vec,
+            });
+        }
+
+        Ok(FLTrainingData {
+            user_features: user_vec,
+            training_pairs,
+            feature_schema: feature_schema(),
+        })
+    }
 }
