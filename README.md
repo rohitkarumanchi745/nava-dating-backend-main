@@ -102,7 +102,7 @@ All endpoints require `Authorization: Bearer <jwt>` header unless noted.
 |----------|--------|-------------|
 | `/ml/rl/rank` | POST | Rank candidate user IDs using Q-learning RL agent |
 | `/ml/linucb/score` | POST | Score a candidate arm using LinUCB contextual bandit |
-| `/ml/stats` | GET | RL agent stats (epsilon, replay buffer), LinUCB stats, FL stats |
+| `/ml/stats` | GET | RL agent stats (epsilon, replay buffer, scoring latency), LinUCB stats, FL stats, shadow agreement rate |
 | `/ml/embeddings` | POST/GET | Store/retrieve user embedding vectors |
 | `/ml/bandit` | POST/GET | Store/retrieve LinUCB arm states (A-matrix, b-vector) |
 | `/ml/reward` | POST | Log reward signal for ML training |
@@ -113,6 +113,7 @@ All endpoints require `Authorization: Bearer <jwt>` header unless noted.
 | `/fl/update` | POST | Submit client model update |
 | `/fl/aggregate` | POST | FedAvg aggregation with differential privacy |
 | `/fl/model` | GET | Get active global model weights for deployment |
+| `/fl/training-data` | GET | Get labeled swipe pairs (28-dim state + reward labels) for on-device FL training |
 
 ### Preferences (GraphQL)
 
@@ -386,30 +387,54 @@ All ML computation runs in-process for sub-millisecond scoring latency:
 
 | Component | Algorithm | Details |
 |-----------|-----------|---------|
-| **RL Agent** | Q-Learning | 14-dim state (7 user + 7 candidate features), epsilon-greedy (0.3→0.01, decay 0.995), per-user model blending (70% global + 30% personal), 10K experience replay buffer |
-| **LinUCB Bandit** | Contextual Bandit | UCB scoring with Gauss-Jordan matrix inverse, per-arm A-matrix + b-vector, alpha=0.6, observation decay 0.995, JSONB persistence to PostgreSQL |
+| **RL Agent** | Q-Learning | 28-dim state (14 user + 14 candidate features), epsilon-greedy (0.3→0.01, decay 0.995), per-user model blending (70% global + 30% personal), 10K experience replay buffer, warm-start from DB checkpoint |
+| **LinUCB Bandit** | Contextual Bandit | UCB scoring with Gauss-Jordan matrix inverse, per-arm A-matrix + b-vector, alpha=0.6, observation decay 0.995, JSONB persistence to PostgreSQL, warm-start on boot |
+| **Shadow Scoring** | RL vs LinUCB | Top-half agreement tracking between RL and LinUCB rankings for model comparison and observability |
 | **FedAvg** | Federated Learning | Weighted averaging by sample count, Laplace noise differential privacy (scale 0.1), min 2 clients per round, global learning rate 0.1 |
 
 **Discovery Flow:**
 ```
-SQL candidates → RL scoring → Re-rank by Q-value → Return to client
-     ↓                                                    ↓
-  Filters (age, distance,           Like/Pass feeds back into
-   verified, not-yet-swiped)         RL agent training loop
+SQL candidates → RL scoring (primary) → Re-rank by Q-value → Return to client
+     ↓              ↓                                              ↓
+  Filters       LinUCB shadow               Like/Pass feeds back into
+  (age, dist,   scoring (observability)      RL + LinUCB training
+   verified)                                 (every 10 swipes → checkpoint)
 ```
 
-**Feature Vector (7 dimensions per user):**
-1. Age (normalized 18-60)
-2. Attractiveness score
-3. Profile completeness
-4. Verification score (selfie + student)
-5. Activity score (7-day interactions)
-6. Photo count
-7. Height (normalized)
+**2s timeout on ML ranking** — if scoring takes too long, falls back to `attractiveness_score` ordering. Fallback rate tracked via `app_ml_fallback_total` with SLO alert at >5%.
+
+**Feature Vector (14 dimensions per user):**
+
+| # | Feature | Category | Range | Source |
+|---|---------|----------|-------|--------|
+| 1 | `age_norm` | Profile | 0-1 | Normalized age (18-60) |
+| 2 | `attractiveness` | Profile | 0-1 | Attractiveness score from users table |
+| 3 | `profile_completeness` | Profile | 0-1 | Ratio of filled fields (9 total) |
+| 4 | `verification_score` | Profile | 0-1 | Selfie (0.5) + student (0.5) verification |
+| 5 | `photo_count` | Profile | 0-1 | Normalized photo count (max 4) |
+| 6 | `height_norm` | Profile | 0-1 | Normalized height (140-200cm) |
+| 7 | `has_profession` | Profile | 0/1 | Whether profession_category is set |
+| 8 | `gender_enc` | Profile | 0-1 | male=0.0, female=1.0, non_binary=0.5 |
+| 9 | `intent_enc` | Richness | 0-1 | relationship=1.0, casual=0.5, friendship=0.25 |
+| 10 | `language_count` | Richness | 0-1 | Languages spoken (capped at 5) |
+| 11 | `interest_count` | Richness | 0-1 | Interests listed (capped at 10) |
+| 12 | `activity_score` | Engagement | 0-1 | 7-day interaction count (normalized) |
+| 13 | `like_rate` | Swipe | 0-1 | Fraction of swipes that were likes |
+| 14 | `match_rate` | Swipe | 0-1 | Fraction of likes that became mutual matches |
+
+**RL state** = user features (14) + candidate features (14) = **28 dimensions**
+
+**Feature Defaults:** Population-level means computed from DB on startup, with hardcoded neutral fallback if DB is unavailable. Used when per-user features can't be fetched.
+
+**Model Persistence:**
+- RL checkpoint saved to `fl_models` table (versioned, active flag) every 10 swipes
+- LinUCB arms saved to `bandit_arm_stats` table (A-matrix, b-vector, pulls, reward)
+- Both warm-started from DB on service boot
 
 ### On-Device Federated Learning
 - **Privacy-preserving model aggregation** across clients (min 10 clients, 10% fraction per round)
 - **Differential Privacy** — Noise multiplier (1.0) + gradient clipping (norm 1.0) for user data protection
+- **FL Training Data** — `/fl/training-data` endpoint provides labeled swipe pairs (like=1.0, pass=0.0, mutual=1.5) with 28-dim combined state vectors and feature schema
 - **Config:** `FL_ENABLED`, `FL_MIN_CLIENTS`, `FL_CLIENT_FRACTION`, `FL_LOCAL_EPOCHS`, `FL_LEARNING_RATE`, `FL_DP_ENABLED`
 
 ### LLM Integration (LLaMA 3)
@@ -456,11 +481,12 @@ dlq.events         →  dead letter queue for failed events
 ├── rust-backend/              # Main Rust backend (Axum)
 │   ├── src/
 │   │   ├── handlers/          # REST + GraphQL endpoint handlers (150+)
-│   │   ├── ml/                # ML computation engine
-│   │   │   ├── rl_agent.rs    # Q-learning RL for discovery ranking
-│   │   │   ├── linucb.rs      # LinUCB contextual bandit
-│   │   │   ├── federated.rs   # FedAvg aggregation + differential privacy
-│   │   │   ├── features.rs    # 7-dim user feature extraction
+│   │   ├── ml/                # ML computation engine (in-process, sub-ms latency)
+│   │   │   ├── mod.rs         # MlService: warm-start, shadow scoring, checkpoint persistence
+│   │   │   ├── rl_agent.rs    # Q-learning RL (28-dim state, per-user model blending)
+│   │   │   ├── linucb.rs      # LinUCB contextual bandit (Gauss-Jordan, per-arm A/b)
+│   │   │   ├── federated.rs   # FedAvg aggregation + Laplace DP
+│   │   │   ├── features.rs    # 14-dim feature extraction + population defaults + FL training data
 │   │   │   └── math.rs        # softmax, laplace noise, cosine similarity
 │   │   ├── services/          # Business logic layer
 │   │   ├── middleware/        # Auth, CORS, rate limiting, dual-write
