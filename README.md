@@ -213,10 +213,13 @@ Call states: `idle → connecting → ringing → active → idle`
 | **Real-Time** | WebSocket pub/sub (chat + call signaling), typing indicators, read receipts |
 | **Databases** | PostgreSQL 16 (primary + read replicas), PgBouncer (connection pooling), Redis 7, Neo4j 5, ClickHouse |
 | **Event Streaming** | Apache Kafka (user, payment, match, chat, analytics topics) |
-| **ML Engine** | Q-Learning RL (14-dim state, epsilon-greedy), LinUCB Contextual Bandit (UCB scoring), FedAvg with Differential Privacy |
-| **Computer Vision** | tract-onnx (ArcFace, FER+, NSFW, NIMA, Liveness), face verification, emotion detection |
+| **ML Engine** | Q-Learning RL (28-dim state, epsilon-greedy), LinUCB Contextual Bandit (UCB scoring), Shadow Scoring, FedAvg with Differential Privacy |
+| **Computer Vision** | tract-onnx (ArcFace, FER+, NSFW CNN/ViT, NIMA, Liveness), blur/low-light detection, photo ranking, duplicate face detection |
+| **Trust & Safety** | Graph anomaly detection (Neo4j), device fingerprinting, GBDT behavioral classifiers, ban evasion detection |
+| **Content Moderation** | NLP toxicity/hate/harassment classifiers, URL/spam filters, messaging graph anomaly detection, moderation transparency + appeals |
 | **LLM** | LLaMA 3 (content labeling, moderation), batch inference pipeline |
-| **Recommendations** | RL-scored discovery ranking, pgvector 512-dim embeddings, collaborative filtering |
+| **Recommendations** | RL-scored discovery ranking, pgvector 512-dim embeddings, collaborative filtering, content freshness decay |
+| **Media Pipeline** | Responsive image variants (150/400/1080px), AV1/WEBP transcoding, adaptive bitrate reels, CDN smallest-rendition serving |
 | **File Storage** | AWS S3 + CloudFront CDN (photos, voice intros, reels) |
 | **Payments** | Apple StoreKit 2 (iOS), RevenueCat (React Native), Razorpay, Stripe |
 | **Infrastructure** | Docker, Kubernetes (EKS), Kustomize, PgBouncer, Prometheus, Grafana, Alertmanager, PagerDuty, GitHub Actions CI/CD |
@@ -446,8 +449,52 @@ SQL candidates → RL scoring (primary) → Re-rank by Q-value → Return to cli
 - **Face Recognition** — ArcFace embedding extraction + cosine similarity matching
 - **Selfie Liveness Detection** — LBP entropy + FFT frequency + HSV color analysis (weights 0.4/0.4/0.2)
 - **Emotion Detection** — FER+ 8-emotion classification
-- **NSFW Detection** — Content quality scoring and moderation
-- **Image Quality** — NIMA aesthetic scoring
+- **NSFW Detection** — CNN/ViT classification for explicit content, nudity scoring, and moderation flagging
+- **Image Quality** — NIMA aesthetic scoring + blur detection (Laplacian variance) + low-light detection (luminance histogram)
+- **Photo Ranking** — Composite score from aesthetic quality, face ratio checks (face area / frame area), blur/noise levels; auto-ranks user photos for optimal profile ordering
+- **Duplicate Face Detection** — Cross-user ArcFace embedding comparison to detect stolen/catfish photos
+
+### Trust & Safety ML
+- **Graph Anomaly Detection** — Neo4j-based models detecting suspicious swipe/match/message patterns (ring detection, velocity anomalies, fan-out clusters)
+- **Device Fingerprinting** — Device model, OS version, screen resolution, timezone, language; hashed fingerprint stored for multi-account detection and ban evasion tracking
+- **Behavioral Classifiers (GBDT)** — Gradient-boosted decision tree models on behavioral signals: swipe velocity, like-to-match ratio, message response time distribution, report frequency; produces per-user trust score (0-1)
+- **Ban Evasion Detection** — Device fingerprint + IP + behavioral similarity matching against banned accounts; auto-flags accounts with >80% similarity
+
+### Content Moderation Pipeline
+
+| Layer | Technique | Coverage |
+|-------|-----------|----------|
+| **Visual** | CNN/ViT NSFW detection, face/liveness verification, duplicate face detection | Photos, selfies, reels |
+| **Text (NLP)** | Toxicity classifiers (hate, harassment, threats), intent detection | Bios, chat messages, reel captions |
+| **Spam** | URL/link detection, keyword blocklist, regex patterns, message frequency throttling | Chat, bios, reel captions |
+| **Graph** | Anomaly detection on messaging/swipe graphs, coordinated behavior detection | Cross-user interaction patterns |
+
+**Moderation Transparency:**
+- Blocked/blurred photos and muted messages include user-facing reason codes (e.g., `nsfw_detected`, `spam_url`, `hate_speech`)
+- Lightweight appeal path: users can submit appeals via `/moderation/appeal` with the decision trace ID
+- All moderation decisions logged with trace IDs for support team review and audit
+- Moderation dashboard shows false positive rates, appeal outcomes, and per-model accuracy
+
+### Content Freshness & Anti-Gaming
+- **Profile Decay Scoring** — Time-weighted freshness decay on profiles and media; stale profiles (no activity >30 days) receive reduced discover ranking via exponential decay multiplier
+- **Media Freshness** — Photos/reels older than 90 days flagged for refresh prompt; fresh content receives temporary ranking boost
+- **Profile Edit Rate Limiting** — Sliding window rate limits on profile field updates (max 10 edits/hour, 50/day) to prevent gaming/A-B testing of bios and photos
+- **Score Recalculation** — Attractiveness and ML scores periodically recomputed to reflect current engagement patterns, not historical peaks
+
+### Media Optimization
+- **Responsive Image Variants** — Pre-generate multiple photo sizes on upload: thumbnail (150px), card (400px), full (1080px), original
+- **Modern Formats** — AV1/WEBP transcoding for avatars and thumbnails; JPEG fallback for older clients
+- **Smallest Rendition Serving** — CDN serves the smallest acceptable rendition based on `Accept` header, device pixel ratio, and requested viewport size
+- **Reel Compression** — Adaptive bitrate encoding for video reels (720p/1080p); HLS-ready segments for streaming
+
+### Client Adaptive Behavior
+- **Battery-Aware Throttling** — Client reports battery level + charging state; server defers non-critical work (reel transcoding notifications, background sync) when battery <20%
+- **Temperature Throttling** — Thermal state reported by client; server reduces media quality and defers heavy uploads when device is thermally throttled
+- **Network-Class Adaptation** — Client reports connection type (WiFi/5G/4G/3G/2G); server adjusts response payloads:
+  - **2G/3G:** Compressed JSON, thumbnail-only photos, no auto-play reels
+  - **4G/WiFi:** Full payloads, card-size photos, reel previews
+  - **5G/WiFi:** Full resolution, HD reels, prefetch next page
+- **Deferred Uploads** — Reel and high-res photo uploads queued client-side when on low battery (<15%) or 2G; auto-resume on WiFi/charging
 
 ## Microservices
 
