@@ -987,7 +987,7 @@ app_cache_misses {}
 app_websocket_connections {}
 
 # HELP app_uptime_seconds Server uptime in seconds
-# TYPE app_uptime_seconds counter
+# TYPE app_uptime_seconds gauge
 app_uptime_seconds {}
 
 # HELP app_db_pool_size Database connection pool size
@@ -1099,6 +1099,8 @@ dlq_entries_abandoned_total{{queue="webhooks"}} {}
         uptime,
         db_pool_size,
         db_pool_idle,
+        chat_rooms,
+        chat_subscribers,
         db_read_pool_size,
         db_read_pool_idle,
         metrics.replica_lag_ms.load(Ordering::Relaxed),
@@ -1116,8 +1118,6 @@ dlq_entries_abandoned_total{{queue="webhooks"}} {}
         metrics.moderation_actions_total.load(Ordering::Relaxed),
         metrics.trust_safety_flags_total.load(Ordering::Relaxed),
         metrics.upload_deferrals_total.load(Ordering::Relaxed),
-        chat_rooms,
-        chat_subscribers,
         dlq_stats.payments_pending,
         dlq_stats.webhooks_pending,
         dlq_stats.payments_resolved,

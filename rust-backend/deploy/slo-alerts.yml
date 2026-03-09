@@ -321,7 +321,7 @@ groups:
     rules:
       # ALERT: Statement timeouts increasing (requires pg_stat_statements or log parsing)
       - alert: StatementTimeoutsRising
-        expr: increase(pg_stat_activity_max_tx_duration{datname="nava"} > 15)[5m:] > 5
+        expr: increase((pg_stat_activity_max_tx_duration{datname="nava"} > bool 15)[5m:]) > 5
         for: 0m
         labels:
           severity: warning
@@ -336,3 +336,49 @@ groups:
           severity: warning
         annotations:
           summary: "Dead tuple count {{ $value }} on {{ $labels.relname }} — autovacuum may be behind"
+
+  # ===========================================================================
+  # Trust & Safety, Moderation, Quality — Content Pipeline Alerts
+  # ===========================================================================
+  - name: content_pipeline_alerts
+    interval: 30s
+    rules:
+      # ALERT: Photo quality rejection rate unusually high (broken scorer or upload issue)
+      - alert: PhotoRejectionRateHigh
+        expr: increase(app_photos_rejected_quality[15m]) > 50
+        for: 5m
+        labels:
+          severity: warning
+          slo: quality
+        annotations:
+          summary: "{{ $value }} photos rejected in 15m — check quality scorer thresholds"
+
+      # ALERT: Content moderation actions spiking (potential abuse wave)
+      - alert: ModerationActionsSpike
+        expr: increase(app_moderation_actions_total[1h]) > 200
+        for: 5m
+        labels:
+          severity: warning
+          slo: moderation
+        annotations:
+          summary: "{{ $value }} moderation actions in 1h — possible content abuse wave"
+
+      # ALERT: Trust & safety flags high (coordinated abuse or false positives)
+      - alert: TrustSafetyFlagsHigh
+        expr: rate(app_trust_safety_flags_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+          slo: trust_safety
+        annotations:
+          summary: "Trust/safety flagging >1/s for 10m — investigate for coordinated abuse or scorer drift"
+
+      # ALERT: Upload deferrals high (client-side degradation)
+      - alert: UploadDeferralsHigh
+        expr: increase(app_upload_deferrals_total[15m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+          slo: client_adaptive
+        annotations:
+          summary: "{{ $value }} upload deferrals in 15m — many clients on low battery/poor network"
