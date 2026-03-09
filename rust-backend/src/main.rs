@@ -14,6 +14,7 @@ mod state;
 mod storage;
 mod telemetry;
 mod ml;
+mod modules;
 mod vision;
 mod websocket;
 
@@ -592,6 +593,23 @@ async fn main() {
         info!("Freshness decay job started (interval: 6h)");
     }
 
+    // ── Modular Monolith: Event Bus + Domain Modules ──────────────────
+    let event_bus = Arc::new(modules::events::EventBus::new(4096));
+
+    // Notification module (replaces notification-service microservice)
+    let notif_module = Arc::new(
+        modules::notifications::NotificationModule::new(state.db.clone()).await,
+    );
+    notif_module.start_listener(event_bus.subscribe());
+    info!("Notification module started (event-bus subscriber)");
+
+    // Analytics module (replaces analytics-service + adds DataFusion)
+    let analytics_module = Arc::new(
+        modules::analytics::AnalyticsModule::new(state.db.clone()).await,
+    );
+    analytics_module.start_listener(event_bus.subscribe());
+    info!("Analytics module started (ClickHouse sink + DataFusion engine)");
+
     // Start instance heartbeat for horizontal scaling (if Redis is available)
     if let Some(ref redis_conn) = state.redis {
         let redis_service = RedisService::new(redis_conn.clone());
@@ -833,6 +851,12 @@ async fn main() {
         .with_state(Arc::new(state.clone()))
         // Graph-powered endpoints (Neo4j + PostgreSQL fallback)
         .nest("/api/graph", graph_routes().with_state(Arc::new(state.clone())))
+        // DataFusion Analytics (modular monolith)
+        .nest("/analytics", modules::analytics::routes::analytics_routes(
+            modules::analytics::routes::AnalyticsState {
+                engine: analytics_module.engine.clone(),
+            }
+        ))
         // Merge GraphQL routes
         .merge(graphql_routes)
         // Middleware stack (order matters - bottom runs first)

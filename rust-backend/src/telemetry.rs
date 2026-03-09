@@ -35,13 +35,13 @@ use tracing_opentelemetry::OpenTelemetryLayer;
 ///
 /// When the `otel` feature is enabled, this sets up distributed tracing
 /// with OTLP export. Otherwise, it uses standard tracing-subscriber.
-pub fn init_telemetry(service_name: &str, is_production: bool) {
+pub fn init_telemetry(_service_name: &str, is_production: bool) {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn,tower_http=debug"));
 
     #[cfg(feature = "otel")]
     {
-        match init_otel_telemetry(service_name, is_production, env_filter) {
+        match init_otel_telemetry(_service_name, is_production, env_filter) {
             Ok(_) => tracing::info!("OpenTelemetry tracing initialized"),
             Err(e) => {
                 eprintln!("Failed to initialize OpenTelemetry: {}. Using standard tracing.", e);

@@ -56,6 +56,9 @@ image = "0.25"
 # ML - ONNX Runtime
 tract-onnx = "0.21"
 
+# DataFusion SQL Analytics Engine
+datafusion = "44"
+
 # Utilities
 rand = "0.8"
 thiserror = "1.0"

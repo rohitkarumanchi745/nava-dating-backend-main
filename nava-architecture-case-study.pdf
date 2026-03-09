@@ -1,0 +1,100 @@
+%PDF-1.4
+1 0 obj<< /Type /Catalog /Pages 2 0 R >>endobj
+2 0 obj<< /Type /Pages /Kids [3 0 R] /Count 1 >>endobj
+4 0 obj<< /Length 3222 >>stream
+BT /F1 12 Tf
+50 742 Td (From Swipe to Safety: Nava Architecture Case Study) Tj
+0 -14 Td
+50 742 Td (Performance, Trust, Personalization, and Operability) Tj
+0 -14 Td
+50 724 Td (High-Level Architecture:) Tj
+0 -14 Td
+50 724 Td ([iOS [SwiftUI]] -> Rust/Axum Edge + PgBouncer -> domain services [Auth, Matching, Chat WS,) Tj
+0 -14 Td
+50 724 Td (Payments, Notification Policy] -> Postgres [partitioned] with Redis/Kafka/S3/Vision-) Tj
+0 -14 Td
+50 724 Td (ML/ClickHouse; ML services [RL+Geo+Affinity+Churn] + FL aggregator [DP].) Tj
+0 -14 Td
+50 706 Td (Media Pipeline:) Tj
+0 -14 Td
+50 706 Td (EXIF strip -> resize -> quality/blur/low-light -> face+liveness -> NSFW -> duplicate-face) Tj
+0 -14 Td
+50 706 Td (-> verdict [approve/review/reject] -> 6 renditions -> S3.) Tj
+0 -14 Td
+50 688 Td (Notification Flow:) Tj
+0 -14 Td
+50 688 Td (Events -> policy gate [opt-out, cap, cooldown, quiet hours, send-time] -> Thompson bandit) Tj
+0 -14 Td
+50 688 Td ([shadow/live] -> APNs -> outcome logging [delivered/opened/deeplinked].) Tj
+0 -14 Td
+50 670 Td (Backend Highlights:) Tj
+0 -14 Td
+50 670 Td (Partitioned DB, read replicas, latency histograms, strict timeouts. Photo pipeline with) Tj
+0 -14 Td
+50 670 Td (timeouts/fallbacks. Safety/appeals with SLOs. ML rank blend: RL 55% + geo 20% +) Tj
+0 -14 Td
+50 670 Td (affinity/CF/intent 20% + churn boost. FL tiny personalization head + DP drift/stall) Tj
+0 -14 Td
+50 670 Td (gauges.) Tj
+0 -14 Td
+50 652 Td (iOS Highlights:) Tj
+0 -14 Td
+50 652 Td (SSL pinning, typed GraphQL, retries, URLCache; token refresh + session-expired UX. WS) Tj
+0 -14 Td
+50 652 Td (state machine with backoff/queueing; offline/error banners. Encrypted local cache with) Tj
+0 -14 Td
+50 652 Td (LRU; blurred photos with 'Why?' + appeal chip. APNs with deep-link prefetch; notification) Tj
+0 -14 Td
+50 652 Td (preferences & quiet hours; outcome tracking. Telemetry with backoff/circuit breaker.) Tj
+0 -14 Td
+50 634 Td (Notifications:) Tj
+0 -14 Td
+50 634 Td (6-stage gate + shadow bandit; region-aware TZ; caps/cooldown/quiet hours/send-time;) Tj
+0 -14 Td
+50 634 Td (metrics & alerts for throttle, opt-out, skew, engagement, zero-send; canary script with) Tj
+0 -14 Td
+50 634 Td (guardrails.) Tj
+0 -14 Td
+50 616 Td (ML & FL:) Tj
+0 -14 Td
+50 616 Td (Blended ranker; geo gravity with density smoothing & km/mi; affinity CF; churn predictor &) Tj
+0 -14 Td
+50 616 Td (send-time optimizer; FL personalization head, cold-start bias, click predictor priors, DP) Tj
+0 -14 Td
+50 616 Td (on, drift/stall alerts.) Tj
+0 -14 Td
+50 598 Td (Ops & Quality:) Tj
+0 -14 Td
+50 598 Td (150+ tests; canary/rollback scripts; SLOs/alerts/runbooks; exporter docs. Prometheus) Tj
+0 -14 Td
+50 598 Td (metrics across policy gates, ML drift, photo pipeline, replica lag. Warning-free builds.) Tj
+0 -14 Td
+50 580 Td (Key Wins:) Tj
+0 -14 Td
+50 580 Td (UX never blocks on ML [timeouts/fallbacks]; respectful push; transparent moderation &) Tj
+0 -14 Td
+50 580 Td (appeals; rich observability; lightweight personalization without heavy FL cost.) Tj
+0 -14 Td
+50 562 Td (Next Steps:) Tj
+0 -14 Td
+50 562 Td (Execute write sharding when TPS/lag alerts fire; chaos drills; keep A/Bs on bandit) Tj
+0 -14 Td
+50 562 Td (variants and photo thresholds.) Tj
+0 -14 Td
+ET
+endstream endobj
+3 0 obj<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>endobj
+5 0 obj<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>endobj
+xref
+0 6
+0000000000 65535 f 
+0000000000 00000 n 
+0000000009 00000 n 
+0000000056 00000 n 
+0000000111 00000 n 
+0000003383 00000 n 
+0000003507 00000 n 
+trailer<< /Size 6 /Root 1 0 R >>
+startxref
+3575
+%%EOF
