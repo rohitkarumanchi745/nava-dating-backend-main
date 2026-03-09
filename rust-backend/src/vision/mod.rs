@@ -1,3 +1,5 @@
+pub mod quality;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -66,6 +68,11 @@ pub struct VisionAnalysis {
     pub smile_intensity: f32,
     pub style_embedding: Vec<f32>,
     pub confidence_scores: HashMap<String, f32>,
+    // Extended quality scoring
+    pub blur_score: f32,
+    pub low_light_score: f32,
+    pub face_ratio: f32,
+    pub quality_flags: Vec<String>,
 }
 
 impl VisionAnalyzer {
@@ -100,8 +107,6 @@ impl VisionAnalyzer {
         let inappropriate_content = nsfw_score >= 0.7;
 
         let aesthetic_score = self.run_nima(&rgb)?;
-        let quality_score = aesthetic_score;
-        let attractiveness_score = aesthetic_score;
 
         let smile_intensity = self.run_fer(&center)?;
         let face_detected = smile_intensity >= 0.2;
@@ -109,11 +114,28 @@ impl VisionAnalyzer {
         let authenticity_score = self.run_liveness(&center)?;
         let style_embedding = self.run_arcface(&center)?;
 
+        // Extended quality scoring
+        let blur = quality::blur_score(&rgb);
+        let low_light = quality::low_light_score(&rgb);
+        let face_bbox = if face_detected {
+            // Approximate face region from center crop
+            let size = rgb.width().min(rgb.height());
+            Some((size / 4, size / 4, size / 2, size / 2))
+        } else {
+            None
+        };
+        let face_ratio_val = quality::face_ratio_score(rgb.width(), rgb.height(), face_bbox);
+        let quality_result = quality::composite_quality(aesthetic_score, blur, low_light, face_ratio_val);
+        let quality_score = quality_result.composite_score;
+        let attractiveness_score = aesthetic_score;
+
         let mut confidence_scores = HashMap::new();
         confidence_scores.insert("nsfw".to_string(), nsfw_score);
         confidence_scores.insert("aesthetic".to_string(), aesthetic_score);
         confidence_scores.insert("smile".to_string(), smile_intensity);
         confidence_scores.insert("authenticity".to_string(), authenticity_score);
+        confidence_scores.insert("blur".to_string(), blur);
+        confidence_scores.insert("low_light".to_string(), low_light);
 
         Ok(VisionAnalysis {
             attractiveness_score,
@@ -124,6 +146,10 @@ impl VisionAnalyzer {
             smile_intensity,
             style_embedding,
             confidence_scores,
+            blur_score: blur,
+            low_light_score: low_light,
+            face_ratio: face_ratio_val,
+            quality_flags: quality_result.flags,
         })
     }
 

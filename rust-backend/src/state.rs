@@ -16,6 +16,8 @@ use crate::vision::VisionAnalyzer;
 use crate::services::graph_service::GraphService;
 use crate::services::payments::PaymentService;
 use crate::services::ads::AdsService;
+use crate::services::trust_safety::TrustSafetyService;
+use crate::services::moderation::ModerationPipeline;
 use crate::middleware::dual_write::DualWriteManager;
 use crate::ml::MlService;
 
@@ -41,6 +43,10 @@ pub struct AppState {
     pub ads_service: Option<Arc<AdsService>>,
     // ML service (RL, LinUCB, Federated Learning)
     pub ml: Arc<RwLock<MlService>>,
+    // Trust & Safety service
+    pub trust_safety: Option<Arc<TrustSafetyService>>,
+    // Content moderation pipeline
+    pub moderation: Option<Arc<ModerationPipeline>>,
 }
 
 // Allow extracting AppState from Arc<AppState>
@@ -117,6 +123,14 @@ pub struct AppMetrics {
     pub vision_unavailable_total: AtomicU64,
     /// Total swipe write operations (like + pass) for TPS monitoring
     pub swipe_writes_total: AtomicU64,
+    /// Photos rejected by quality scoring
+    pub photos_rejected_quality: AtomicU64,
+    /// Content moderation actions taken
+    pub moderation_actions_total: AtomicU64,
+    /// Trust safety flags raised
+    pub trust_safety_flags_total: AtomicU64,
+    /// Upload deferrals due to client conditions
+    pub upload_deferrals_total: AtomicU64,
 }
 
 impl AppMetrics {
@@ -137,6 +151,10 @@ impl AppMetrics {
             discover_requests_total: AtomicU64::new(0),
             vision_unavailable_total: AtomicU64::new(0),
             swipe_writes_total: AtomicU64::new(0),
+            photos_rejected_quality: AtomicU64::new(0),
+            moderation_actions_total: AtomicU64::new(0),
+            trust_safety_flags_total: AtomicU64::new(0),
+            upload_deferrals_total: AtomicU64::new(0),
         }
     }
 
@@ -187,6 +205,22 @@ impl AppMetrics {
 
     pub fn inc_swipe_writes(&self) {
         self.swipe_writes_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_photos_rejected(&self) {
+        self.photos_rejected_quality.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_moderation_actions(&self) {
+        self.moderation_actions_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_trust_safety_flags(&self) {
+        self.trust_safety_flags_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_upload_deferrals(&self) {
+        self.upload_deferrals_total.fetch_add(1, Ordering::Relaxed);
     }
 }
 

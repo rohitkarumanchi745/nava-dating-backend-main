@@ -52,6 +52,27 @@ impl AppError {
     pub fn service_unavailable(message: impl Into<String>) -> Self {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, message)
     }
+
+    pub fn too_many_requests(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, message)
+    }
+}
+
+/// Structured moderation rejection response.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModerationRejection {
+    pub detail: String,
+    pub trace_id: String,
+    pub decision_id: Option<i64>,
+    pub reason_code: String,
+    pub can_appeal: bool,
+}
+
+impl ModerationRejection {
+    pub fn into_response(self) -> axum::response::Response {
+        let body = axum::Json(self);
+        (StatusCode::UNPROCESSABLE_ENTITY, body).into_response()
+    }
 }
 
 impl IntoResponse for AppError {

@@ -48,6 +48,9 @@ use vision::VisionAnalyzer;
 use services::graph_service::GraphService;
 use services::payments::PaymentService;
 use services::ads::AdsService;
+use services::trust_safety::TrustSafetyService;
+use services::moderation::ModerationPipeline;
+use services::freshness::FreshnessDecayJob;
 use middleware::dual_write::DualWriteManager;
 use middleware::security::security_headers_middleware;
 use handlers::graph_handlers::graph_routes;
@@ -514,6 +517,27 @@ async fn main() {
     // Initialize ML service with warm-start from DB (before db moves into AppState)
     let ml_service = ml::MlService::new(&db).await;
 
+    // Initialize Trust & Safety service
+    let trust_safety = if config.trust_safety_enabled {
+        info!("Trust & Safety service initialized (auto-ban threshold: {})", config.trust_safety_auto_ban_threshold);
+        Some(Arc::new(TrustSafetyService::new(config.trust_safety_auto_ban_threshold)))
+    } else {
+        info!("Trust & Safety service disabled");
+        None
+    };
+
+    // Initialize Content Moderation pipeline
+    let moderation = if config.moderation_enabled {
+        info!("Content moderation pipeline initialized");
+        Some(Arc::new(ModerationPipeline::new(
+            config.moderation_toxicity_threshold,
+            config.moderation_nsfw_threshold as f32,
+        )))
+    } else {
+        info!("Content moderation disabled");
+        None
+    };
+
     let state = AppState {
         db,
         db_read: db_read_replica,
@@ -530,6 +554,8 @@ async fn main() {
         payment_service,
         ads_service,
         ml: Arc::new(RwLock::new(ml_service)),
+        trust_safety,
+        moderation,
     };
 
     // Run startup sync if Neo4j is connected
@@ -553,6 +579,12 @@ async fn main() {
             dlq_runner.start().await;
         });
         info!("DLQ processor started for payment retries");
+    }
+
+    // Start freshness decay background job
+    if state.config.freshness_decay_enabled {
+        FreshnessDecayJob::spawn(state.db.clone());
+        info!("Freshness decay job started (interval: 6h)");
     }
 
     // Start instance heartbeat for horizontal scaling (if Redis is available)
@@ -1026,6 +1058,22 @@ app_vision_unavailable_total {}
 # TYPE app_swipe_writes_total counter
 app_swipe_writes_total {}
 
+# HELP app_photos_rejected_quality Photos rejected by quality scoring
+# TYPE app_photos_rejected_quality counter
+app_photos_rejected_quality {}
+
+# HELP app_moderation_actions_total Content moderation actions taken
+# TYPE app_moderation_actions_total counter
+app_moderation_actions_total {}
+
+# HELP app_trust_safety_flags_total Trust safety flags raised
+# TYPE app_trust_safety_flags_total counter
+app_trust_safety_flags_total {}
+
+# HELP app_upload_deferrals_total Upload deferrals due to client conditions
+# TYPE app_upload_deferrals_total counter
+app_upload_deferrals_total {}
+
 # HELP dlq_entries_pending Pending entries in dead letter queue
 # TYPE dlq_entries_pending gauge
 dlq_entries_pending{{queue="payments"}} {}
@@ -1064,6 +1112,10 @@ dlq_entries_abandoned_total{{queue="webhooks"}} {}
         metrics.discover_requests_total.load(Ordering::Relaxed),
         metrics.vision_unavailable_total.load(Ordering::Relaxed),
         metrics.swipe_writes_total.load(Ordering::Relaxed),
+        metrics.photos_rejected_quality.load(Ordering::Relaxed),
+        metrics.moderation_actions_total.load(Ordering::Relaxed),
+        metrics.trust_safety_flags_total.load(Ordering::Relaxed),
+        metrics.upload_deferrals_total.load(Ordering::Relaxed),
         chat_rooms,
         chat_subscribers,
         dlq_stats.payments_pending,

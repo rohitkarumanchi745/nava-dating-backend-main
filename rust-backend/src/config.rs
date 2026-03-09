@@ -164,6 +164,18 @@ pub struct Config {
 
     // Connection Pooling (for PgBouncer)
     pub pgbouncer_mode: bool,  // Enables PgBouncer-compatible settings
+
+    // Trust & Safety
+    pub trust_safety_enabled: bool,
+    pub trust_safety_auto_ban_threshold: f64,
+
+    // Content Moderation
+    pub moderation_enabled: bool,
+    pub moderation_toxicity_threshold: f64,
+    pub moderation_nsfw_threshold: f64,
+
+    // Content Freshness
+    pub freshness_decay_enabled: bool,
 }
 
 impl Config {
@@ -510,6 +522,36 @@ impl Config {
             .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(is_prod);  // Auto-enable in production
 
+        // Trust & Safety
+        let trust_safety_enabled = env::var("TRUST_SAFETY_ENABLED")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+        let trust_safety_auto_ban_threshold = env::var("TRUST_SAFETY_AUTO_BAN_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.85);
+
+        // Content Moderation
+        let moderation_enabled = env::var("MODERATION_ENABLED")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+        let moderation_toxicity_threshold = env::var("MODERATION_TOXICITY_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.7);
+        let moderation_nsfw_threshold = env::var("MODERATION_NSFW_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.7);
+
+        // Content Freshness
+        let freshness_decay_enabled = env::var("FRESHNESS_DECAY_ENABLED")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+
         Self {
             bind_addr,
             database_url,
@@ -606,6 +648,12 @@ impl Config {
             health_check_path,
             ready_check_enabled,
             pgbouncer_mode,
+            trust_safety_enabled,
+            trust_safety_auto_ban_threshold,
+            moderation_enabled,
+            moderation_toxicity_threshold,
+            moderation_nsfw_threshold,
+            freshness_decay_enabled,
         }
     }
 
