@@ -956,6 +956,35 @@ async fn prometheus_metrics(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
+    // Federated learning stats
+    let fl_stats = ml_stats.get("federated");
+    let fl_rounds = fl_stats
+        .and_then(|v| v.get("rounds_completed"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let fl_head_weights: f64 = fl_stats
+        .and_then(|v| v.get("personalization_head"))
+        .and_then(|v| v.get("weights_sample"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_f64()).map(|x| x * x).sum::<f64>().sqrt())
+        .unwrap_or(0.0);
+    let fl_cold_start_buckets = fl_stats
+        .and_then(|v| v.get("cold_start"))
+        .and_then(|v| v.get("buckets"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.len() as u64)
+        .unwrap_or(0);
+    let fl_notif_pred_norm: f64 = fl_stats
+        .and_then(|v| v.get("notif_predictor"))
+        .and_then(|v| v.get("weights"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_f64()).map(|x| x * x).sum::<f64>().sqrt())
+        .unwrap_or(0.0);
+    let fl_dp_enabled = fl_stats
+        .and_then(|v| v.get("dp_enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     // Get WebSocket room stats
     let (chat_rooms, chat_subscribers) = {
         let rooms = state.chat_rooms.read().await;
@@ -1079,6 +1108,26 @@ app_trust_safety_flags_total {}
 # TYPE app_upload_deferrals_total counter
 app_upload_deferrals_total {}
 
+# HELP app_fl_rounds_completed Federated learning aggregation rounds completed
+# TYPE app_fl_rounds_completed counter
+app_fl_rounds_completed {}
+
+# HELP app_fl_head_weight_norm L2 norm of personalization head weights (stability signal)
+# TYPE app_fl_head_weight_norm gauge
+app_fl_head_weight_norm {}
+
+# HELP app_fl_cold_start_buckets Number of active cold-start intent buckets
+# TYPE app_fl_cold_start_buckets gauge
+app_fl_cold_start_buckets {}
+
+# HELP app_fl_notif_predictor_norm L2 norm of notification click predictor weights
+# TYPE app_fl_notif_predictor_norm gauge
+app_fl_notif_predictor_norm {}
+
+# HELP app_fl_dp_enabled Whether differential privacy is enabled for FL (1=yes, 0=no)
+# TYPE app_fl_dp_enabled gauge
+app_fl_dp_enabled {}
+
 # HELP dlq_entries_pending Pending entries in dead letter queue
 # TYPE dlq_entries_pending gauge
 dlq_entries_pending{{queue="payments"}} {}
@@ -1123,6 +1172,11 @@ dlq_entries_abandoned_total{{queue="webhooks"}} {}
         metrics.moderation_actions_total.load(Ordering::Relaxed),
         metrics.trust_safety_flags_total.load(Ordering::Relaxed),
         metrics.upload_deferrals_total.load(Ordering::Relaxed),
+        fl_rounds,
+        fl_head_weights,
+        fl_cold_start_buckets,
+        fl_notif_pred_norm,
+        if fl_dp_enabled { 1 } else { 0 },
         dlq_stats.payments_pending,
         dlq_stats.webhooks_pending,
         dlq_stats.payments_resolved,

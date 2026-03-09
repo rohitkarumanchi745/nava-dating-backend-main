@@ -1,5 +1,8 @@
+pub mod affinity;
+pub mod engagement;
 pub mod features;
 pub mod federated;
+pub mod geo;
 pub mod linucb;
 pub mod math;
 pub mod rl_agent;
@@ -7,12 +10,16 @@ pub mod rl_agent;
 use sqlx::PgPool;
 use tracing::{info, warn};
 
+use self::affinity::{AffinityScorer, CoLikeMatrix};
+use self::engagement::EngagementScorer;
 use self::features::{combine_features, FeatureDefaults, UserFeatures, USER_FEATURE_DIM};
 use self::federated::FederatedCoordinator;
+use self::geo::GeoScorer;
 use self::linucb::{ArmState, LinUcbBandit};
 use self::rl_agent::{RlAgent, RlCheckpoint, SwipeExperience};
 
-/// Unified ML service combining RL, LinUCB, and Federated Learning.
+/// Unified ML service combining RL, LinUCB, Federated Learning, geo scoring,
+/// affinity scoring, and engagement optimization.
 /// Lives in `AppState` behind `Arc<RwLock<MlService>>`.
 pub struct MlService {
     pub rl_agent: RlAgent,
@@ -21,6 +28,15 @@ pub struct MlService {
     train_counter: u64,
     /// Cached population-level feature defaults for fallback
     feature_defaults: FeatureDefaults,
+    // --- New scoring layers ---
+    /// Gravity model distance scoring + density smoothing
+    pub geo: GeoScorer,
+    /// Interest/language overlap + collaborative filtering
+    pub affinity: AffinityScorer,
+    /// Co-like matrix for CF signals (rebuilt periodically)
+    pub co_likes: CoLikeMatrix,
+    /// Churn prediction + send-time optimization + notification bandit
+    pub engagement: EngagementScorer,
     // --- Shadow scoring metrics ---
     shadow_agreement_count: u64,
     shadow_total_count: u64,
@@ -55,12 +71,23 @@ impl MlService {
             info!("LinUCB warm-started with {} arms from DB", arms_loaded);
         }
 
+        // Build co-like matrix and engagement scorer from DB
+        let co_likes = CoLikeMatrix::build(pool, 30, 50_000).await;
+        info!("Co-like matrix built for collaborative filtering");
+
+        let engagement = EngagementScorer::build(pool).await;
+        info!("Engagement scorer initialized with send-time histograms");
+
         Self {
             rl_agent,
             linucb,
             federated: FederatedCoordinator::new(),
             train_counter: 0,
             feature_defaults,
+            geo: GeoScorer::default(),
+            affinity: AffinityScorer::default(),
+            co_likes,
+            engagement,
             shadow_agreement_count: 0,
             shadow_total_count: 0,
         }
@@ -74,6 +101,10 @@ impl MlService {
             federated: FederatedCoordinator::new(),
             train_counter: 0,
             feature_defaults: FeatureDefaults::hardcoded(),
+            geo: GeoScorer::default(),
+            affinity: AffinityScorer::default(),
+            co_likes: CoLikeMatrix::new(),
+            engagement: EngagementScorer::new(),
             shadow_agreement_count: 0,
             shadow_total_count: 0,
         }
@@ -200,7 +231,11 @@ impl MlService {
     // -------------------------------------------------------------------------
 
     /// Score and rank candidate user IDs for a given user.
-    /// Uses RL for primary ranking, shadow-scores via LinUCB for observability.
+    /// Blends RL score with geo, affinity, and engagement boosts.
+    /// Shadow-scores via LinUCB for observability.
+    ///
+    /// Final score = 0.55 * rl_score + 0.20 * geo_score + 0.20 * affinity_score
+    ///             + churn_boost (up to 0.15 for at-risk users)
     pub async fn rank_candidates(
         &mut self,
         pool: &PgPool,
@@ -212,8 +247,21 @@ impl MlService {
             Err(_) => self.feature_defaults.for_user(user_id),
         };
 
+        // Fetch user tags for affinity scoring
+        let (user_interests, user_langs, user_intent) =
+            affinity::fetch_user_tags(pool, user_id).await;
+
+        // Fetch user location for geo scoring
+        let user_loc = Self::fetch_user_location(pool, user_id).await;
+
+        // Churn boost for the requesting user
+        let churn_features = engagement::ChurnPredictor::extract_features(pool, user_id).await;
+        let churn_pred = self.engagement.churn.predict(&churn_features);
+        let churn_boost = self.engagement.churn_boost(&churn_pred);
+
         let mut rl_scored: Vec<(i32, f64)> = Vec::with_capacity(candidate_ids.len());
         let mut linucb_scored: Vec<(i32, f64)> = Vec::with_capacity(candidate_ids.len());
+        let mut blended: Vec<(i32, f64)> = Vec::with_capacity(candidate_ids.len());
 
         for &cid in candidate_ids {
             let candidate_features = match UserFeatures::from_db(pool, cid).await {
@@ -227,17 +275,53 @@ impl MlService {
             let rl_score = self.rl_agent.score_candidate(user_id, &state);
             rl_scored.push((cid, rl_score));
 
-            // Shadow: LinUCB scoring (for observability, not used for ranking)
+            // Shadow: LinUCB scoring (for observability, not used for final ranking)
             let arm_id = format!("user_{}", cid);
             let linucb_score = self.linucb.score(&arm_id, &state);
             linucb_scored.push((cid, linucb_score));
+
+            // Geo scoring
+            let geo_score = if let Some((ulat, ulng)) = user_loc {
+                let cloc = Self::fetch_user_location(pool, cid).await;
+                if let Some((clat, clng)) = cloc {
+                    let dist = geo::GeoScorer::haversine(ulat, ulng, clat, clng);
+                    let density = self.geo.local_density(pool, cid).await;
+                    self.geo.score(dist, density).density_adjusted_score
+                } else {
+                    0.5 // Unknown location — neutral
+                }
+            } else {
+                0.5
+            };
+
+            // Affinity scoring
+            let (cand_interests, cand_langs, cand_intent) =
+                affinity::fetch_user_tags(pool, cid).await;
+            let cf_score = self.co_likes.cf_score(user_id, cid);
+            let affinity_result = self.affinity.score(
+                &user_interests,
+                &cand_interests,
+                &user_langs,
+                &cand_langs,
+                user_intent.as_deref(),
+                cand_intent.as_deref(),
+                cf_score,
+            );
+
+            // Blend: RL 55% + Geo 20% + Affinity 20% + Churn boost (additive)
+            let final_score = 0.55 * rl_score
+                + 0.20 * geo_score
+                + 0.20 * affinity_result.total
+                + churn_boost;
+
+            blended.push((cid, final_score));
         }
 
         // Shadow agreement: compare top-half sets
         if candidate_ids.len() >= 4 {
             let half = candidate_ids.len() / 2;
             let mut rl_sorted = rl_scored.clone();
-            let mut linucb_sorted = linucb_scored.clone();
+            let mut linucb_sorted = linucb_scored;
             rl_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             linucb_sorted
                 .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -254,8 +338,28 @@ impl MlService {
             }
         }
 
-        rl_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        rl_scored
+        blended.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        blended
+    }
+
+    /// Fetch lat/lng for a user (returns None if not set).
+    async fn fetch_user_location(pool: &PgPool, user_id: i32) -> Option<(f64, f64)> {
+        #[derive(sqlx::FromRow)]
+        struct LocRow {
+            latitude: Option<f64>,
+            longitude: Option<f64>,
+        }
+        let row = sqlx::query_as::<_, LocRow>(
+            "SELECT latitude, longitude FROM users WHERE id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .ok()??;
+        match (row.latitude, row.longitude) {
+            (Some(lat), Some(lng)) => Some((lat, lng)),
+            _ => None,
+        }
     }
 
     /// Record a swipe (like/pass) and trigger periodic training + checkpointing.
@@ -312,6 +416,29 @@ impl MlService {
             "rl_agent": self.rl_agent.stats(),
             "linucb": self.linucb.stats(),
             "federated": self.federated.stats(),
+            "geo": {
+                "beta": self.geo.beta,
+                "max_distance_km": self.geo.max_distance_km,
+                "max_distance_miles": self.geo.max_distance_km * 0.621371,
+                "density_bandwidth_km": self.geo.density_bandwidth_km,
+                "display_unit": match self.geo.display_unit {
+                    geo::DistanceUnit::Kilometers => "km",
+                    geo::DistanceUnit::Miles => "miles",
+                },
+            },
+            "affinity": {
+                "interest_weight": self.affinity.interest_weight,
+                "language_weight": self.affinity.language_weight,
+                "intent_weight": self.affinity.intent_weight,
+                "cf_weight": self.affinity.cf_weight,
+            },
+            "engagement": self.engagement.stats(),
+            "ranking_blend": {
+                "rl_weight": 0.55,
+                "geo_weight": 0.20,
+                "affinity_weight": 0.20,
+                "churn_boost_max": 0.15,
+            },
             "train_counter": self.train_counter,
             "feature_dim": USER_FEATURE_DIM,
             "state_dim": USER_FEATURE_DIM * 2,

@@ -19,3 +19,4 @@ pub mod trust_safety;
 pub mod moderation;
 pub mod freshness;
 pub mod media_optimizer;
+pub mod photo_pipeline;

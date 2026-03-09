@@ -114,6 +114,10 @@ All endpoints require `Authorization: Bearer <jwt>` header unless noted.
 | `/fl/aggregate` | POST | FedAvg aggregation with differential privacy |
 | `/fl/model` | GET | Get active global model weights for deployment |
 | `/fl/training-data` | GET | Get labeled swipe pairs (28-dim state + reward labels) for on-device FL training |
+| `/fl/head/global` | GET | Download current global personalization head weights (33 params) |
+| `/fl/head/delta` | POST | Upload on-device personalization head weight deltas |
+| `/fl/cold-start` | POST | Submit cold-start affinity bias observations |
+| `/fl/notif-predictor` | POST | Submit on-device notification click predictor deltas |
 
 ### Preferences (GraphQL)
 
@@ -213,7 +217,7 @@ Call states: `idle → connecting → ringing → active → idle`
 | **Real-Time** | WebSocket pub/sub (chat + call signaling), typing indicators, read receipts |
 | **Databases** | PostgreSQL 16 (primary + read replicas), PgBouncer (connection pooling), Redis 7, Neo4j 5, ClickHouse |
 | **Event Streaming** | Apache Kafka (user, payment, match, chat, analytics topics) |
-| **ML Engine** | Q-Learning RL (28-dim state, epsilon-greedy), LinUCB Contextual Bandit (UCB scoring), Shadow Scoring, FedAvg with Differential Privacy |
+| **ML Engine** | Q-Learning RL (28-dim state, epsilon-greedy), LinUCB Contextual Bandit (UCB scoring), Shadow Scoring, FedAvg with Differential Privacy, On-Device Personalization Head, Cold-Start Biasing, Notification Click Predictor |
 | **Computer Vision** | tract-onnx (ArcFace, FER+, NSFW CNN/ViT, NIMA, Liveness), blur/low-light detection, photo ranking, duplicate face detection |
 | **Trust & Safety** | Graph anomaly detection (Neo4j), device fingerprinting, GBDT behavioral classifiers, ban evasion detection |
 | **Content Moderation** | NLP toxicity/hate/harassment classifiers, URL/spam filters, messaging graph anomaly detection, moderation transparency + appeals |
@@ -222,6 +226,7 @@ Call states: `idle → connecting → ringing → active → idle`
 | **Media Pipeline** | Responsive image variants (150/400/1080px), AV1/WEBP transcoding, adaptive bitrate reels, CDN smallest-rendition serving |
 | **File Storage** | AWS S3 + CloudFront CDN (photos, voice intros, reels) |
 | **Payments** | Apple StoreKit 2 (iOS), RevenueCat (React Native), Razorpay, Stripe |
+| **Notification Intelligence** | Thompson Sampling bandit (variant selection), send-time optimization, per-user daily caps, quiet hours, opt-out respect, shadow-mode A/B canary |
 | **Infrastructure** | Docker, Kubernetes (EKS), Kustomize, PgBouncer, Prometheus, Grafana, Alertmanager, PagerDuty, GitHub Actions CI/CD |
 | **iOS** | SwiftUI, Combine, StoreKit 2 |
 | **Cross-Platform** | React Native, Expo, TypeScript |
@@ -282,6 +287,7 @@ Call states: `idle → connecting → ringing → active → idle`
 | **gRPC** | `tonic` | 0.10 | gRPC framework for inter-service communication |
 | | `prost` | 0.12 | Protocol Buffers code generation |
 | **Error Handling** | `anyhow` | 1.x | Error context and chaining |
+| **Randomness** | `rand` | 0.8 | Thompson Sampling (Beta distribution), notification variant selection |
 
 ### Python Packages (ML & API)
 
@@ -394,6 +400,10 @@ All ML computation runs in-process for sub-millisecond scoring latency:
 | **LinUCB Bandit** | Contextual Bandit | UCB scoring with Gauss-Jordan matrix inverse, per-arm A-matrix + b-vector, alpha=0.6, observation decay 0.995, JSONB persistence to PostgreSQL, warm-start on boot |
 | **Shadow Scoring** | RL vs LinUCB | Top-half agreement tracking between RL and LinUCB rankings for model comparison and observability |
 | **FedAvg** | Federated Learning | Weighted averaging by sample count, Laplace noise differential privacy (scale 0.1), min 2 clients per round, global learning rate 0.1 |
+| **Personalization Head** | On-Device FL | 33-param last-layer (32 weights + 1 bias), devices fine-tune via SGD on local swipe outcomes, FedAvg deltas aggregated server-side with DP |
+| **Cold-Start Biasing** | Affinity FL | Per-intent-bucket weight adjustments (5-dim: interest, language, intent, CF, geo), EMA smoothing (0.7/0.3), ±0.3 clamping, DP noise |
+| **Notif Click Predictor** | Engagement FL | 6-feature on-device logistic regression (hour, day, category, recency, daily count, match flag), federated updates, feeds bandit priors |
+| **Federation Safety** | Privacy Boundary | Explicit allow/deny list for federated data, gradient clipping (\|val\| < 100), NaN/Inf validation, dimension checks per update type |
 
 **Discovery Flow:**
 ```
@@ -438,6 +448,10 @@ SQL candidates → RL scoring (primary) → Re-rank by Q-value → Return to cli
 - **Privacy-preserving model aggregation** across clients (min 10 clients, 10% fraction per round)
 - **Differential Privacy** — Noise multiplier (1.0) + gradient clipping (norm 1.0) for user data protection
 - **FL Training Data** — `/fl/training-data` endpoint provides labeled swipe pairs (like=1.0, pass=0.0, mutual=1.5) with 28-dim combined state vectors and feature schema
+- **Personalization Head** — 33-param last-layer fine-tuned on-device; server aggregates deltas via FedAvg with DP noise; head norm monitored for weight divergence (alert at L2 > 10.0)
+- **Cold-Start Biasing** — Per-intent affinity weight adjustments aggregated from early swipe patterns; EMA smoothing prevents oscillation; clamped to ±0.3 to prevent wild swings
+- **Notification Click Predictor** — 6-feature on-device logistic regression predicting push notification open probability; federated updates feed Thompson Sampling bandit priors
+- **Federation Safety Boundary** — Explicit allow/deny for federated data: behavioral gradients (allowed), face embeddings/device-risk/location (forbidden); gradient clipping at |val| < 100, NaN/Inf rejection
 - **Config:** `FL_ENABLED`, `FL_MIN_CLIENTS`, `FL_CLIENT_FRACTION`, `FL_LOCAL_EPOCHS`, `FL_LEARNING_RATE`, `FL_DP_ENABLED`
 
 ### LLM Integration (LLaMA 3)
@@ -507,7 +521,7 @@ SQL candidates → RL scoring (primary) → Re-rank by Q-value → Return to cli
 | Chat Service | 8004 | WebSocket messaging + call signaling, typing indicators, read receipts |
 | Payment Service | 8005 | Apple/RevenueCat receipt validation, subscriptions, webhooks |
 | Ambassador Service | 8006 | Referral program, partner tracking |
-| Notification Service | — | FCM/APNs push notifications |
+| Notification Service | 8007 | FCM/APNs push notifications, Thompson Sampling variant selection, send-time optimization, per-user daily caps, quiet hours, opt-out, shadow-mode A/B |
 | Analytics Service | 8008 | Kafka consumer → ClickHouse OLAP, DAU, event counts |
 
 ## Kafka Event Topics
@@ -532,8 +546,11 @@ dlq.events         →  dead letter queue for failed events
 │   │   │   ├── mod.rs         # MlService: warm-start, shadow scoring, checkpoint persistence
 │   │   │   ├── rl_agent.rs    # Q-learning RL (28-dim state, per-user model blending)
 │   │   │   ├── linucb.rs      # LinUCB contextual bandit (Gauss-Jordan, per-arm A/b)
-│   │   │   ├── federated.rs   # FedAvg aggregation + Laplace DP
+│   │   │   ├── federated.rs   # FedAvg aggregation + Laplace DP + PersonalizationHead + ColdStart + NotifPredictor + FederationSafety
 │   │   │   ├── features.rs    # 14-dim feature extraction + population defaults + FL training data
+│   │   │   ├── affinity.rs    # Interest/language/intent overlap + collaborative filtering
+│   │   │   ├── engagement.rs  # Churn prediction + send-time optimization + notification bandit
+│   │   │   ├── geo.rs         # Gravity model distance scoring + density smoothing
 │   │   │   └── math.rs        # softmax, laplace noise, cosine similarity
 │   │   ├── services/          # Business logic layer
 │   │   ├── middleware/        # Auth, CORS, rate limiting, dual-write
@@ -544,13 +561,13 @@ dlq.events         →  dead letter queue for failed events
 │   │   ├── base/              # Ingress, NetworkPolicy, PDB, ServiceAccount
 │   │   ├── overlays/dev/      # Dev: in-cluster Postgres + Redis
 │   │   └── overlays/prod/     # Prod: RDS + ElastiCache, higher resources
-│   ├── deploy/                # Ops runbook, SLO alerts, PgBouncer + PostgreSQL configs
+│   ├── deploy/                # Ops runbook, SLO alerts, PgBouncer + PostgreSQL configs, canary scripts
 │   ├── monitoring/            # Prometheus scrape config, Alertmanager routing
 │   ├── migrations/            # PostgreSQL migrations (incl. hash-partitioned swipes)
 │   └── Dockerfile             # Multi-stage build, non-root, healthcheck
 ├── microservices/             # Event-driven microservices
 │   ├── gateway/               # API Gateway
-│   ├── services/              # Auth, User, Match, Chat, Payment, etc.
+│   ├── services/              # Auth, User, Match, Chat, Payment, Notification (with policy.rs bandit + send-time), etc.
 │   ├── shared/                # Common lib (auth, config, events, models)
 │   ├── k8s/                   # K8s manifests (base + dev/prod overlays)
 │   └── docker-compose.yml
@@ -628,8 +645,8 @@ Automated via GitHub Actions (`.github/workflows/rust-ci.yml`):
 ## Testing
 
 ```bash
-# Unit & integration tests (63 tests)
-cd rust-backend && cargo test --lib
+# Unit & integration tests (127 tests: 84 unit + 43 integration)
+cd rust-backend && cargo test
 
 # Database integration tests (CI-automated)
 psql -f rust-backend/tests/swipes_partition_test.sql    # Partition regression
@@ -668,6 +685,8 @@ tests/chaos/chaos_tests.sh      # Resilience testing
 | DB pool utilization | < 80% | > 80% for 3m |
 | Write TPS capacity | ~5,000-8,000 | > 500 TPS sustained 10m |
 | Replica lag | < 2s | > 2s auto-fallback to primary |
+| Notif throttle rate | < 40% | > 40% blocked/deferred for 15m |
+| FL head weight norm | < 10.0 | > 10.0 for 15m (weight divergence) |
 
 ## Data Models
 
@@ -823,6 +842,21 @@ University-tiered pricing to drive campus adoption:
 | `app_reads_from_replica` | Counter | Reads served by replica |
 | `app_reads_fallback_to_primary` | Counter | Reads that fell back to primary |
 | `dlq_entries_pending` | Gauge | Pending DLQ entries by queue |
+| `app_fl_rounds_completed` | Counter | Federated learning aggregation rounds completed |
+| `app_fl_head_weight_norm` | Gauge | L2 norm of personalization head weights (stability signal) |
+| `app_fl_cold_start_buckets` | Gauge | Number of active cold-start intent buckets |
+| `app_fl_notif_predictor_norm` | Gauge | L2 norm of notification click predictor weights |
+| `app_fl_dp_enabled` | Gauge | Whether differential privacy is enabled for FL (1/0) |
+| `notif_sent_total` | Counter | Total notifications sent (notification service) |
+| `notif_blocked_cap` | Counter | Notifications blocked by daily cap |
+| `notif_blocked_cooldown` | Counter | Notifications blocked by cooldown period |
+| `notif_blocked_optout` | Counter | Notifications blocked by user opt-out |
+| `notif_deferred_quiet` | Counter | Notifications deferred due to quiet hours |
+| `notif_deferred_timing` | Counter | Notifications deferred by send-time optimizer |
+| `notif_engagement_success` | Counter | Notification opens/clicks (success) |
+| `notif_engagement_failure` | Counter | Notification ignores (failure) |
+| `notif_variant_sends` | Gauge | Per-variant send count (bandit arms) |
+| `notif_variant_expected_rate` | Gauge | Per-variant expected open rate (Thompson Sampling) |
 
 ### SLO Definitions
 
@@ -836,6 +870,13 @@ University-tiered pricing to drive campus adoption:
 | **ML Scoring** | avg < 10ms | > 10ms for 5m |
 | **ML Fallback Rate** | < 5% | > 5% for 5m (warning), > 20% (critical) |
 | **WebSocket Capacity** | < 8,000 connections | > 8,000 for 5m |
+| **Notif Throttle Rate** | < 40% blocked/deferred | > 40% for 15m |
+| **Notif Engagement** | > 5% open rate | < 5% for 2h |
+| **Notif Variant Skew** | No single variant > 80% | > 80% for 1h |
+| **FL Aggregation** | Continuous rounds | Stalled for 6h (warning) |
+| **FL Weight Stability** | Head norm < 10.0 | > 10.0 for 15m |
+| **FL DP Enabled** | Always on in prod | Disabled for 5m (critical) |
+| **Canary Staleness** | Evaluate within 48h | Shadow mode > 48h without eval |
 
 ### Alert Routing
 
@@ -845,7 +886,9 @@ University-tiered pricing to drive campus adoption:
 | **Critical** | Slack urgent channels + PagerDuty on-call |
 | **Security** | `#nava-security-alerts` + email to security team |
 
-Alert rules defined in `rust-backend/deploy/slo-alerts.yml`. Alertmanager config in `rust-backend/monitoring/alertmanager.yaml`.
+**Alert Groups (15):** availability, latency, database, payments, ML scoring, vision, WebSocket, infrastructure, replica, PgBouncer, query, notification policy, content pipeline, FL stability, canary.
+
+Alert rules defined in `rust-backend/deploy/slo-alerts.yml` (38 alerts). Alertmanager config in `rust-backend/monitoring/alertmanager.yaml`.
 
 ### Health Probes
 
@@ -893,6 +936,9 @@ Alert rules defined in `rust-backend/deploy/slo-alerts.yml`. Alertmanager config
 | **Read replica** | Auto-fallback to primary (lag >2s) | No user impact, higher primary load |
 | **Neo4j (graph)** | Dual-write manager queues, PG-only fallback | No user impact |
 | **Redis (cache)** | App runs without cache | Slightly slower responses |
+| **Notification bandit** | Shadow mode sends control variant | No variant optimization, baseline behavior |
+| **FL aggregation** | Stalled rounds, head weights frozen | Personalization stops improving, cold-start biases stale |
+| **Notif click predictor** | Falls back to uniform bandit priors | Bandit explores without informative priors |
 
 ### Webhook Resilience
 - Razorpay and Stripe webhooks catch processing failures and auto-enqueue to DLQ
@@ -904,8 +950,26 @@ Alert rules defined in `rust-backend/deploy/slo-alerts.yml`. Alertmanager config
 Full ops runbook at `rust-backend/deploy/ops-runbook.md` covering:
 - K8s secret rotation procedure (`SECRET_KEY_FILE` pattern)
 - SLO definitions and burn rate windows
-- Alert response playbooks for every alert
+- Alert response playbooks for every alert (38 alerts across 15 groups)
 - ML fallback investigation and remediation
 - PgBouncer admin commands and scaling
 - Read replica monitoring and scaling
 - Write scaling roadmap and sharding strategy
+- Notification policy operations (bandit, caps, quiet hours, send-time)
+- Shadow-mode canary rollout procedure (6-step with SQL validation)
+- FL aggregation monitoring and weight drift investigation
+
+### Shadow-Mode Canary Script
+
+Operational script at `rust-backend/deploy/canary-shadow-notif.sh` for safe notification variant rollout:
+
+```bash
+./canary-shadow-notif.sh --enable     # Enable shadow mode (bandit selects but sends control)
+./canary-shadow-notif.sh --monitor    # Check canary health: metrics, alerts, DB outcomes
+./canary-shadow-notif.sh --evaluate   # Evaluate uplift with safety gates (sample size, skew, throttle)
+./canary-shadow-notif.sh --promote    # Promote bandit to live (sends winning variant)
+./canary-shadow-notif.sh --rollback   # Roll back to shadow mode
+```
+
+**Guardrails:** min 200 samples, throttle rate < 40%, variant skew < 80%, uplift threshold 2pp.
+Dry-run test harness at `rust-backend/deploy/test-canary-guardrails.sh` (28 tests).

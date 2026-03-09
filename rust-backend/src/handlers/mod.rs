@@ -34,6 +34,7 @@ use crate::{
     config::Config,
     error::AppError,
     models::*,
+    services::photo_pipeline::{self, PhotoVerdict, PipelineTimeouts},
     state::AppState,
     vision::VisionAnalysis,
     websocket,
@@ -338,7 +339,8 @@ pub async fn update_profile(
     let mut name: Option<String> = None;
     let mut dob_raw: Option<String> = None;
     let mut gender: Option<String> = None;
-    let mut photos: Vec<Option<PhotoInput>> = vec![None, None, None];
+    // Collect raw photo bytes first; pipeline runs after multipart parsing.
+    let mut photo_bytes: Vec<Option<Vec<u8>>> = vec![None, None, None];
 
     while let Some(mut field) = multipart
         .next_field()
@@ -383,31 +385,7 @@ pub async fn update_profile(
                     )));
                 }
                 let bytes = read_binary_field(&mut field, state.config.max_photo_bytes).await?;
-
-                if let Some(ref v) = vision {
-                    let photo = analyze_photo_bytes(v.clone(), bytes).await?;
-                    if let Some(ref analysis) = photo.analysis {
-                        if analysis.inappropriate_content {
-                            return Err(AppError::bad_request(format!(
-                                "Photo {} contains inappropriate content",
-                                idx + 1
-                            )));
-                        }
-                    }
-                    photos[idx] = Some(photo);
-                } else {
-                    // Vision disabled - just load image
-                    let image = task::spawn_blocking(move || {
-                        image::load_from_memory(&bytes)
-                            .map_err(|_| AppError::bad_request("Invalid image"))
-                    })
-                    .await
-                    .map_err(|_| AppError::internal("Image task failed"))??;
-                    photos[idx] = Some(PhotoInput {
-                        image,
-                        analysis: None,
-                    });
-                }
+                photo_bytes[idx] = Some(bytes);
             }
             _ => {}
         }
@@ -427,10 +405,11 @@ pub async fn update_profile(
         return Err(AppError::bad_request("Must be at least 18 years old"));
     }
 
-    let mut photo_inputs = Vec::new();
-    for (idx, entry) in photos.into_iter().enumerate() {
+    // Validate all 3 photos are present
+    let mut raw_photos: Vec<(usize, Vec<u8>)> = Vec::new();
+    for (idx, entry) in photo_bytes.into_iter().enumerate() {
         match entry {
-            Some(photo) => photo_inputs.push((idx + 1, photo)),
+            Some(bytes) => raw_photos.push((idx + 1, bytes)),
             None => {
                 return Err(AppError::bad_request(format!(
                     "profile_photo_{} is required",
@@ -440,18 +419,61 @@ pub async fn update_profile(
         }
     }
 
-    let upload_dir = &state.config.upload_dir;
-    fs::create_dir_all(upload_dir)
-        .await
-        .map_err(|_| AppError::internal("Failed to create upload directory"))?;
-
+    // ── Run async photo pipeline on each photo ──────────────────────────
+    let pipeline_timeouts = PipelineTimeouts::default();
     let mut saved_paths = Vec::new();
     let mut insights = Vec::new();
     let mut avg_attractiveness: Option<f64> = None;
     let mut attractiveness_sum = 0.0;
     let mut attractiveness_count = 0;
+    let mut rejection_reason = String::new();
 
-    for (idx, photo) in photo_inputs.into_iter() {
+    let upload_dir = &state.config.upload_dir;
+    fs::create_dir_all(upload_dir)
+        .await
+        .map_err(|_| AppError::internal("Failed to create upload directory"))?;
+
+    for (idx, bytes) in raw_photos.into_iter() {
+        let photo_slot = format!("profile_photo_{}", idx);
+
+        // Run the full pipeline: resize → quality → NSFW → liveness → duplicate-face
+        let pipeline_result = photo_pipeline::run_pipeline(
+            bytes,
+            user_id,
+            &photo_slot,
+            vision.clone(),
+            state.moderation.clone(),
+            &state.db,
+            &pipeline_timeouts,
+        )
+        .await?;
+
+        // Track metrics
+        if pipeline_result.verdict == PhotoVerdict::Rejected {
+            state.metrics.inc_photos_rejected();
+            // Find the failing stage for the user-facing message
+            if let Some(failed) = pipeline_result.stages.iter().find(|s| !s.passed) {
+                rejection_reason = format!(
+                    "Photo {} rejected: {}",
+                    idx,
+                    failed.detail.as_deref().unwrap_or("policy violation")
+                );
+            }
+            // Clean up any files already saved in this request
+            cleanup_files(&saved_paths).await;
+            return Err(AppError::bad_request(&rejection_reason));
+        }
+
+        if pipeline_result.verdict == PhotoVerdict::NeedsReview {
+            state.metrics.inc_moderation_actions();
+        }
+
+        // Save processed image to disk (EXIF-stripped, resized)
+        let image = pipeline_result
+            .processed_image
+            .as_ref()
+            .ok_or_else(|| AppError::internal("Pipeline did not produce image"))?;
+
         let filename = format!(
             "{}_photo_{}_{}_{}.jpg",
             user_id,
@@ -460,9 +482,9 @@ pub async fn update_profile(
             Uuid::new_v4()
         );
         let path = Path::new(upload_dir).join(&filename);
-        let jpeg_bytes = encode_jpeg(&photo.image)
+        let jpeg_bytes = encode_jpeg(image)
             .map_err(|_| AppError::internal("Failed to encode image"))?;
-        if let Err(err) = fs::write(&path, jpeg_bytes).await {
+        if let Err(err) = fs::write(&path, &jpeg_bytes).await {
             cleanup_files(&saved_paths).await;
             return Err(AppError::internal(format!(
                 "Failed to save photo: {err}"
@@ -470,22 +492,53 @@ pub async fn update_profile(
         }
         saved_paths.push(path.to_string_lossy().to_string());
 
-        if let Some(ref analysis) = photo.analysis {
-            attractiveness_sum += analysis.attractiveness_score as f64;
+        // Build insights from pipeline quality scores
+        if let Some(ref qr) = pipeline_result.quality {
+            attractiveness_sum += qr.composite_score as f64;
             attractiveness_count += 1;
             insights.push(json!({
-                "quality": analysis.quality_score,
-                "smile_detected": analysis.smile_intensity > 0.5,
-                "authenticity": analysis.authenticity_score,
-                "attractiveness": analysis.attractiveness_score,
+                "quality": qr.composite_score,
+                "blur_score": qr.blur_score,
+                "low_light_score": qr.low_light_score,
+                "face_ratio": qr.face_ratio,
+                "flags": qr.flags,
+                "verdict": pipeline_result.verdict,
+                "stages": pipeline_result.stages,
             }));
         } else {
             insights.push(json!({
                 "quality": null,
-                "smile_detected": null,
-                "authenticity": null,
+                "verdict": pipeline_result.verdict,
+                "stages": pipeline_result.stages,
             }));
         }
+
+        // Generate renditions in the background (non-blocking)
+        let base_key = format!("users/{}/photos/{}", user_id, filename);
+        let renditions = photo_pipeline::generate_renditions(image, &base_key);
+        // Store rendition metadata (S3 upload would go here in production)
+        let rendition_meta: Vec<_> = renditions
+            .iter()
+            .map(|r| json!({
+                "name": r.rendition.name,
+                "format": r.rendition.format,
+                "width": r.rendition.width,
+                "height": r.rendition.height,
+                "size_bytes": r.rendition.size_bytes,
+                "key": r.rendition.key,
+            }))
+            .collect();
+
+        // Log renditions to media_renditions table
+        let _ = sqlx::query(
+            r#"INSERT INTO media_renditions (user_id, original_key, renditions)
+               VALUES ($1, $2, $3)"#,
+        )
+        .bind(user_id as i64)
+        .bind(&base_key)
+        .bind(serde_json::to_value(&rendition_meta).unwrap_or_default())
+        .execute(&state.db)
+        .await;
     }
 
     if attractiveness_count > 0 {
@@ -508,7 +561,8 @@ pub async fn update_profile(
             profile_photos = $8,
             attractiveness_score = $9,
             is_profile_complete = TRUE,
-            updated_at = NOW()
+            updated_at = NOW(),
+            last_photo_updated_at = NOW()
         WHERE id = $10
         "#,
     )

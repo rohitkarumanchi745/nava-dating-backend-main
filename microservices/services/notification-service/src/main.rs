@@ -20,10 +20,12 @@ use tracing::{error, info, Level};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod handlers;
+mod policy;
 mod providers;
 pub mod push;
 
 use handlers::NotificationHandlers;
+use policy::NotificationPolicy;
 
 #[tokio::main]
 async fn main() {
@@ -53,8 +55,27 @@ async fn main() {
 
     info!("Connected to database");
 
-    // Initialize notification handlers with database pool
-    let handlers = Arc::new(NotificationHandlers::new(Some(pool)).await);
+    // Ensure policy tables exist
+    policy::ensure_policy_tables(&pool).await;
+
+    // Initialize notification policy (bandit + send-time + caps)
+    let notif_policy = Arc::new(NotificationPolicy::new(pool.clone()).await);
+    info!("Notification policy initialized");
+
+    // Initialize notification handlers with database pool and policy
+    let handlers = Arc::new(NotificationHandlers::new(Some(pool), notif_policy.clone()).await);
+
+    // Periodically refresh send-time histograms (every 6 hours)
+    let policy_refresh = notif_policy.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        interval.tick().await; // Skip first immediate tick
+        loop {
+            interval.tick().await;
+            info!("Refreshing send-time histograms");
+            policy_refresh.refresh_send_time().await;
+        }
+    });
 
     // Start Kafka consumers in background
     let handlers_clone = handlers.clone();
@@ -62,10 +83,38 @@ async fn main() {
         start_kafka_consumers(handlers_clone).await;
     });
 
-    // Health check API
+    // Health check API + metrics
+    let metrics_policy = notif_policy.clone();
+    let metrics_handlers = handlers.clone();
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/ready", get(readiness_check))
+        .route("/metrics", get(move || {
+            let policy = metrics_policy.clone();
+            let hdlrs = metrics_handlers.clone();
+            async move {
+                let mut out = policy.metrics_prometheus();
+                // Append bandit variant stats as Prometheus gauges
+                let stats = hdlrs.notification_stats();
+                if let Some(variants) = stats.get("variants").and_then(|v| v.as_array()) {
+                    out.push_str("# HELP notif_variant_sends Per-variant send count\n");
+                    out.push_str("# TYPE notif_variant_sends gauge\n");
+                    out.push_str("# HELP notif_variant_expected_rate Per-variant expected open rate\n");
+                    out.push_str("# TYPE notif_variant_expected_rate gauge\n");
+                    for v in variants {
+                        let name = v.get("variant").and_then(|n| n.as_str()).unwrap_or("unknown");
+                        let sends = v.get("sends").and_then(|n| n.as_u64()).unwrap_or(0);
+                        let rate = v.get("expected_rate").and_then(|n| n.as_f64()).unwrap_or(0.0);
+                        out.push_str(&format!(
+                            "notif_variant_sends{{variant=\"{}\"}} {}\n\
+                             notif_variant_expected_rate{{variant=\"{}\"}} {:.4}\n",
+                            name, sends, name, rate
+                        ));
+                    }
+                }
+                out
+            }
+        }))
         .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))

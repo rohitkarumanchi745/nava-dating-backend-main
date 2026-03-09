@@ -4,7 +4,7 @@
 use image::RgbImage;
 
 /// Result of photo quality analysis.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PhotoQualityResult {
     /// Overall composite quality score (0.0-1.0, higher is better)
     pub composite_score: f32,

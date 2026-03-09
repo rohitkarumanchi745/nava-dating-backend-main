@@ -338,6 +338,81 @@ groups:
           summary: "Dead tuple count {{ $value }} on {{ $labels.relname }} — autovacuum may be behind"
 
   # ===========================================================================
+  # Notification Policy — Throttling, Bandit Health, Engagement
+  # ===========================================================================
+  - name: notification_policy_alerts
+    interval: 30s
+    rules:
+      # ALERT: Over-throttling — more than 40% of notifications blocked/deferred
+      - alert: NotifThrottleRateHigh
+        expr: |
+          (
+            notif_blocked_cap + notif_blocked_cooldown + notif_blocked_optout
+            + notif_deferred_quiet + notif_deferred_timing
+          )
+          /
+          (notif_sent_total + notif_blocked_cap + notif_blocked_cooldown
+           + notif_blocked_optout + notif_deferred_quiet + notif_deferred_timing + 1)
+          > 0.40
+        for: 15m
+        labels:
+          severity: warning
+          slo: notifications
+        annotations:
+          summary: "Notification throttle rate {{ $value | humanizePercentage }} — over 40% blocked/deferred"
+          runbook: "Check daily_cap, cooldown_secs, quiet hours config. May need to relax caps."
+
+      # ALERT: Opt-out rate climbing — possible notification fatigue
+      - alert: NotifOptOutRateHigh
+        expr: |
+          rate(notif_blocked_optout[1h])
+          /
+          (rate(notif_sent_total[1h]) + rate(notif_blocked_optout[1h]) + 1)
+          > 0.10
+        for: 30m
+        labels:
+          severity: warning
+          slo: notifications
+        annotations:
+          summary: "Notification opt-out rate {{ $value | humanizePercentage }} — users may be fatigued"
+
+      # ALERT: Bandit variant skew — one variant getting >80% of sends
+      - alert: NotifVariantSkew
+        expr: |
+          max(notif_variant_sends) / (sum(notif_variant_sends) + 1) > 0.80
+        for: 1h
+        labels:
+          severity: warning
+          slo: notifications
+        annotations:
+          summary: "Bandit variant skew — one variant has >80% of sends, exploration may be stuck"
+          runbook: "Check bandit alpha/beta values. Consider resetting priors if one arm dominated too early."
+
+      # ALERT: Low engagement rate — open/click rate below 5%
+      - alert: NotifEngagementLow
+        expr: |
+          rate(notif_engagement_success[1h])
+          /
+          (rate(notif_engagement_success[1h]) + rate(notif_engagement_failure[1h]) + 1)
+          < 0.05
+        for: 2h
+        labels:
+          severity: warning
+          slo: notifications
+        annotations:
+          summary: "Notification engagement rate {{ $value | humanizePercentage }} below 5% — copy or timing may be off"
+
+      # ALERT: No notifications sent at all (service may be down)
+      - alert: NotifSendRateZero
+        expr: rate(notif_sent_total[15m]) == 0
+        for: 30m
+        labels:
+          severity: critical
+          slo: notifications
+        annotations:
+          summary: "Zero notifications sent in 30 minutes — check notification service health"
+
+  # ===========================================================================
   # Trust & Safety, Moderation, Quality — Content Pipeline Alerts
   # ===========================================================================
   - name: content_pipeline_alerts
@@ -382,3 +457,97 @@ groups:
           slo: client_adaptive
         annotations:
           summary: "{{ $value }} upload deferrals in 15m — many clients on low battery/poor network"
+
+  # ===========================================================================
+  # Federated Learning — Aggregation Stability & Weight Drift
+  # ===========================================================================
+  - name: fl_stability_alerts
+    interval: 60s
+    rules:
+      # ALERT: FL aggregation stalled (no new rounds for 6+ hours)
+      - alert: FlAggregationStalled
+        expr: increase(app_fl_rounds_completed[6h]) == 0 and app_fl_rounds_completed > 0
+        for: 30m
+        labels:
+          severity: warning
+          slo: ml_scoring
+        annotations:
+          summary: "No FL aggregation rounds in 6h — check client upload pipeline"
+          runbook: "Verify device update submissions, min_clients threshold, aggregation cron health"
+
+      # ALERT: Personalization head weight norm diverging (potential poisoning or instability)
+      - alert: FlHeadWeightDrift
+        expr: app_fl_head_weight_norm > 10.0
+        for: 15m
+        labels:
+          severity: warning
+          slo: ml_scoring
+        annotations:
+          summary: "FL personalization head L2 norm {{ $value }} exceeds 10.0 — possible weight divergence"
+          runbook: "Check gradient clipping in FederationSafety, review recent client deltas for outliers"
+
+      # ALERT: Notification click predictor weights diverging
+      - alert: FlNotifPredictorDrift
+        expr: app_fl_notif_predictor_norm > 15.0
+        for: 15m
+        labels:
+          severity: warning
+          slo: ml_scoring
+        annotations:
+          summary: "FL notif predictor L2 norm {{ $value }} exceeds 15.0 — weights may be unstable"
+
+      # ALERT: Cold-start buckets disappeared (aggregation regression)
+      - alert: FlColdStartBucketsEmpty
+        expr: app_fl_cold_start_buckets == 0 and app_fl_rounds_completed > 5
+        for: 30m
+        labels:
+          severity: warning
+          slo: ml_scoring
+        annotations:
+          summary: "Zero cold-start intent buckets after {{ $value }} FL rounds — check aggregation pipeline"
+
+      # ALERT: DP disabled in production (safety regression)
+      - alert: FlDpDisabled
+        expr: app_fl_dp_enabled == 0
+        for: 5m
+        labels:
+          severity: critical
+          slo: privacy
+        annotations:
+          summary: "Differential privacy disabled for FL — all federated updates are unprotected"
+          runbook: "Re-enable DP immediately. Check deployment config for DP_ENABLED env var."
+
+  # ===========================================================================
+  # Shadow-Mode Canary — Notification A/B Validation
+  # ===========================================================================
+  - name: canary_alerts
+    interval: 60s
+    rules:
+      # ALERT: Shadow mode running too long without evaluation (stale canary)
+      - alert: CanaryShadowModeStale
+        expr: |
+          (notif_sent_total > 0)
+          and
+          (max(notif_variant_sends) / (sum(notif_variant_sends) + 1) > 0.95)
+        for: 48h
+        labels:
+          severity: warning
+          slo: notifications
+        annotations:
+          summary: "Shadow mode appears active for 48h+ — one variant has >95% of sends. Evaluate or promote."
+          runbook: "Run ./canary-shadow-notif.sh --evaluate to check uplift, then --promote or --rollback."
+
+      # ALERT: Canary engagement regression (control doing worse than baseline)
+      - alert: CanaryEngagementRegression
+        expr: |
+          rate(notif_engagement_success[2h])
+          /
+          (rate(notif_engagement_success[2h]) + rate(notif_engagement_failure[2h]) + 1)
+          < 0.03
+        for: 3h
+        labels:
+          severity: warning
+          slo: notifications
+        annotations:
+          summary: "Notification engagement {{ $value | humanizePercentage }} below 3% during canary — possible regression"
+          runbook: "Check if shadow mode is interfering with send timing. Consider rollback."

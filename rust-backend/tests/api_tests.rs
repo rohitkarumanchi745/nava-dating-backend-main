@@ -810,3 +810,273 @@ mod security_tests {
         assert_eq!(redact_email("ab@test.com"), "ab***@test.com");
     }
 }
+
+// =============================================================================
+// Alert Route Validation Tests — verify slo-alerts.yml structure
+// =============================================================================
+
+#[cfg(test)]
+mod alert_route_tests {
+    use std::collections::HashSet;
+
+    /// Parse slo-alerts.yml and verify all expected alert rules exist with correct config
+    #[test]
+    fn test_slo_alerts_yaml_has_all_expected_rules() {
+        let yaml_content = include_str!("../deploy/slo-alerts.yml");
+
+        // All alert names that must exist
+        let expected_alerts = vec![
+            // Availability
+            "HighErrorRate",
+            "ServiceUnhealthy",
+            // Latency
+            "HighApiLatency",
+            "HighDiscoverLatency",
+            // Database
+            "DbPoolSaturated",
+            "DbPoolExhausted",
+            "SwipeWriteTpsHigh",
+            // Payments
+            "PaymentDlqBacklog",
+            "PaymentDlqAbandoned",
+            // ML Scoring
+            "MlScoringLatencyHigh",
+            "MlFallbackRateHigh",
+            "MlFallbackRateCritical",
+            // Vision
+            "VisionServiceUnavailable",
+            // WebSocket
+            "WebSocketConnectionsHigh",
+            // Infrastructure
+            "InstanceHeartbeatLost",
+            "HighCacheMissRate",
+            // Replica
+            "ReplicaLagHigh",
+            "ReplicaUnhealthy",
+            "ReplicaFallbackRateHigh",
+            // PgBouncer
+            "PgBouncerPoolExhausted",
+            "PgBouncerClientWaiting",
+            // Query
+            "StatementTimeoutsRising",
+            "AutovacuumBehind",
+            // Notification Policy
+            "NotifThrottleRateHigh",
+            "NotifOptOutRateHigh",
+            "NotifVariantSkew",
+            "NotifEngagementLow",
+            "NotifSendRateZero",
+            // Content Pipeline
+            "PhotoRejectionRateHigh",
+            "ModerationActionsSpike",
+            "TrustSafetyFlagsHigh",
+            "UploadDeferralsHigh",
+            // FL Stability (new)
+            "FlAggregationStalled",
+            "FlHeadWeightDrift",
+            "FlNotifPredictorDrift",
+            "FlColdStartBucketsEmpty",
+            "FlDpDisabled",
+            // Canary (new)
+            "CanaryShadowModeStale",
+            "CanaryEngagementRegression",
+        ];
+
+        let mut found: HashSet<String> = HashSet::new();
+
+        for line in yaml_content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("- alert:") {
+                let name = trimmed.trim_start_matches("- alert:").trim().to_string();
+                found.insert(name);
+            }
+        }
+
+        let mut missing = Vec::new();
+        for alert in &expected_alerts {
+            if !found.contains(*alert) {
+                missing.push(*alert);
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "Missing alert rules in slo-alerts.yml: {:?}\nFound: {:?}",
+            missing,
+            found
+        );
+
+        // Verify total count matches
+        assert_eq!(
+            found.len(),
+            expected_alerts.len(),
+            "Alert count mismatch — found {} but expected {}. Extra: {:?}",
+            found.len(),
+            expected_alerts.len(),
+            found.difference(&expected_alerts.iter().map(|s| s.to_string()).collect::<HashSet<_>>())
+        );
+    }
+
+    #[test]
+    fn test_fl_alerts_have_correct_severity() {
+        let yaml_content = include_str!("../deploy/slo-alerts.yml");
+        let lines: Vec<&str> = yaml_content.lines().collect();
+
+        let severity_checks = vec![
+            ("FlAggregationStalled", "warning"),
+            ("FlHeadWeightDrift", "warning"),
+            ("FlNotifPredictorDrift", "warning"),
+            ("FlColdStartBucketsEmpty", "warning"),
+            ("FlDpDisabled", "critical"),       // DP off is critical
+            ("CanaryShadowModeStale", "warning"),
+            ("CanaryEngagementRegression", "warning"),
+        ];
+
+        for (alert_name, expected_severity) in &severity_checks {
+            // Find the alert line
+            let alert_idx = lines.iter().position(|l| {
+                l.trim().starts_with("- alert:") && l.contains(alert_name)
+            });
+
+            assert!(
+                alert_idx.is_some(),
+                "Alert {} not found in slo-alerts.yml",
+                alert_name
+            );
+
+            let idx = alert_idx.unwrap();
+
+            // Search for severity within next 10 lines
+            let severity_found = lines[idx..std::cmp::min(idx + 10, lines.len())]
+                .iter()
+                .any(|l| {
+                    let t = l.trim();
+                    t.starts_with("severity:") && t.contains(expected_severity)
+                });
+
+            assert!(
+                severity_found,
+                "Alert {} should have severity: {} but doesn't",
+                alert_name, expected_severity
+            );
+        }
+    }
+
+    #[test]
+    fn test_fl_alerts_have_slo_labels() {
+        let yaml_content = include_str!("../deploy/slo-alerts.yml");
+        let lines: Vec<&str> = yaml_content.lines().collect();
+
+        // FL alerts should have slo: ml_scoring or slo: privacy
+        let slo_checks = vec![
+            ("FlAggregationStalled", "ml_scoring"),
+            ("FlHeadWeightDrift", "ml_scoring"),
+            ("FlNotifPredictorDrift", "ml_scoring"),
+            ("FlColdStartBucketsEmpty", "ml_scoring"),
+            ("FlDpDisabled", "privacy"),
+        ];
+
+        for (alert_name, expected_slo) in &slo_checks {
+            let alert_idx = lines.iter().position(|l| {
+                l.trim().starts_with("- alert:") && l.contains(alert_name)
+            }).unwrap_or_else(|| panic!("Alert {} not found", alert_name));
+
+            let slo_found = lines[alert_idx..std::cmp::min(alert_idx + 10, lines.len())]
+                .iter()
+                .any(|l| {
+                    let t = l.trim();
+                    t.starts_with("slo:") && t.contains(expected_slo)
+                });
+
+            assert!(
+                slo_found,
+                "Alert {} should have slo: {} label",
+                alert_name, expected_slo
+            );
+        }
+    }
+
+    #[test]
+    fn test_canary_alerts_have_notifications_slo() {
+        let yaml_content = include_str!("../deploy/slo-alerts.yml");
+        let lines: Vec<&str> = yaml_content.lines().collect();
+
+        for alert_name in &["CanaryShadowModeStale", "CanaryEngagementRegression"] {
+            let alert_idx = lines.iter().position(|l| {
+                l.trim().starts_with("- alert:") && l.contains(alert_name)
+            }).unwrap_or_else(|| panic!("Alert {} not found", alert_name));
+
+            let slo_found = lines[alert_idx..std::cmp::min(alert_idx + 10, lines.len())]
+                .iter()
+                .any(|l| {
+                    let t = l.trim();
+                    t.starts_with("slo:") && t.contains("notifications")
+                });
+
+            assert!(
+                slo_found,
+                "Canary alert {} should have slo: notifications label",
+                alert_name
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_alerts_have_summary_annotation() {
+        let yaml_content = include_str!("../deploy/slo-alerts.yml");
+        let lines: Vec<&str> = yaml_content.lines().collect();
+
+        let mut alert_indices: Vec<(usize, String)> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("- alert:") {
+                let name = trimmed.trim_start_matches("- alert:").trim().to_string();
+                alert_indices.push((i, name));
+            }
+        }
+
+        for (idx, name) in &alert_indices {
+            // Each alert should have a summary annotation within 20 lines
+            let has_summary = lines[*idx..std::cmp::min(*idx + 20, lines.len())]
+                .iter()
+                .any(|l| l.trim().starts_with("summary:"));
+
+            assert!(
+                has_summary,
+                "Alert {} at line {} is missing summary annotation",
+                name, idx + 1
+            );
+        }
+    }
+
+    #[test]
+    fn test_alert_groups_exist() {
+        let yaml_content = include_str!("../deploy/slo-alerts.yml");
+
+        let expected_groups = vec![
+            "slo_availability",
+            "slo_latency",
+            "slo_database",
+            "slo_payments",
+            "slo_ml",
+            "slo_vision",
+            "slo_websocket",
+            "infra_alerts",
+            "replica_alerts",
+            "pgbouncer_alerts",
+            "query_alerts",
+            "notification_policy_alerts",
+            "content_pipeline_alerts",
+            "fl_stability_alerts",
+            "canary_alerts",
+        ];
+
+        for group in &expected_groups {
+            assert!(
+                yaml_content.contains(&format!("name: {}", group)),
+                "Alert group '{}' not found in slo-alerts.yml",
+                group
+            );
+        }
+    }
+}

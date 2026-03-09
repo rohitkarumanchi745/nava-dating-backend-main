@@ -6,10 +6,11 @@
 3. [Alert Response Playbooks](#alert-response-playbooks)
 4. [ML Fallback Monitoring](#ml-fallback-monitoring)
 5. [Vision/LLM Service Degradation](#visionllm-service-degradation)
-6. [PgBouncer Operations](#pgbouncer-operations)
-7. [Read Replica Operations](#read-replica-operations)
-8. [Write Scaling Roadmap](#write-scaling-roadmap)
-9. [External Exporters](#external-exporters)
+6. [Notification Policy Operations](#notification-policy-operations)
+7. [PgBouncer Operations](#pgbouncer-operations)
+8. [Read Replica Operations](#read-replica-operations)
+9. [Write Scaling Roadmap](#write-scaling-roadmap)
+10. [External Exporters](#external-exporters)
 
 ---
 
@@ -65,6 +66,8 @@ curl -s https://nava-api/health/detailed | jq .status
 | ML Scoring | avg < 10ms | `app_ml_avg_scoring_latency_us` | > 10000us for 5m | 5m |
 | ML Fallback Rate | < 5% | `app_ml_fallback_total / app_discover_requests_total` | > 5% for 5m | 5m |
 | WebSocket Capacity | < 8000 connections | `app_websocket_connections` | > 8000 for 5m | 5m |
+| Notif Throttle Rate | < 40% blocked | `notif_blocked_* / notif_sent_total` | > 40% for 15m | 15m |
+| Notif Engagement | > 5% open rate | `notif_engagement_success / total` | < 5% for 2h | 2h |
 
 **SLO alert rules are defined in:** `deploy/slo-alerts.yml`
 
@@ -158,6 +161,100 @@ The discover endpoint uses RL-based ranking (`rank_candidates`) with a 2-second 
 - **Short-term:** Scale horizontally (more pods) to reduce per-pod concurrency
 - **Medium-term:** Move ML scoring to a read-only snapshot (RwLock → read lock) if possible
 - **Long-term:** Offload ML scoring to a sidecar or dedicated service with pre-computed scores
+
+---
+
+## Notification Policy Operations
+
+### Architecture
+The notification service (`microservices/services/notification-service/`) gates every notification through a policy layer before delivery. The policy enforces:
+- **Per-user daily cap** (default: 12/day)
+- **Cooldown** (default: 5 minutes between sends to same user)
+- **Quiet hours** (default: 22:00–07:00 in user's local time)
+- **Send-time optimization** (defers if user's current-hour activity < 0.3)
+- **Thompson Sampling bandit** for variant selection on match and re-engage notifications
+
+### Database Tables
+
+| Table | Purpose |
+|-------|---------|
+| `notification_outcomes` | Logs every sent notification: variant_id, bandit_selected, sent_at_hour, engaged |
+| `notification_preferences` | Per-user opt-out by category (or `category='all'` for global opt-out) |
+
+Tables are auto-created on startup via `ensure_policy_tables()`.
+
+### Metrics (Prometheus)
+Exported at `notification-service:8007/metrics`:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `notif_sent_total` | counter | Notifications that passed the gate |
+| `notif_blocked_cap` | counter | Blocked by daily cap |
+| `notif_blocked_cooldown` | counter | Blocked by cooldown |
+| `notif_blocked_optout` | counter | Blocked by user opt-out |
+| `notif_deferred_quiet` | counter | Deferred to after quiet hours |
+| `notif_deferred_timing` | counter | Deferred due to low-activity hour |
+| `notif_engagement_success` | counter | Notification opens/clicks |
+| `notif_engagement_failure` | counter | Notification ignores |
+| `notif_variant_sends{variant}` | gauge | Per-variant send count |
+| `notif_variant_expected_rate{variant}` | gauge | Per-variant expected open rate |
+
+### Shadow Mode (Bandit A/B Safety Net)
+The bandit can run in **shadow mode** where it selects a variant via Thompson Sampling but always sends the default (control) copy. This is controlled by `PolicyConfig::bandit_shadow_mode`.
+
+**Rollout procedure:**
+1. Deploy with `bandit_shadow_mode: true` (default)
+2. Monitor `notif_variant_sends` and `notif_variant_expected_rate` in Grafana
+3. After 1-2 weeks, verify the bandit has converged (one variant clearly ahead)
+4. Compare engagement rates between shadow-selected variants using the `notification_outcomes` table:
+   ```sql
+   SELECT variant_id,
+          COUNT(*) AS sends,
+          COUNT(*) FILTER (WHERE engaged) AS opens,
+          ROUND(COUNT(*) FILTER (WHERE engaged)::numeric / COUNT(*)::numeric, 4) AS open_rate
+   FROM notification_outcomes
+   WHERE sent_at > NOW() - INTERVAL '7 days'
+   GROUP BY variant_id
+   ORDER BY open_rate DESC;
+   ```
+5. If the bandit-preferred variant shows meaningful lift (>10% relative), set `bandit_shadow_mode: false`
+6. Monitor `NotifEngagementLow` and `NotifVariantSkew` alerts for 48 hours post-enable
+
+### Alert Response
+
+**NotifThrottleRateHigh** — Over 40% blocked/deferred for 15m:
+1. Check which gate is firing most: `curl notification-service:8007/metrics | grep notif_blocked`
+2. If `notif_blocked_cap` is dominant, consider raising `daily_cap` from 12
+3. If `notif_deferred_quiet` is dominant, check if quiet hours are too wide for your user base
+4. If `notif_blocked_cooldown` is dominant, reduce `cooldown_secs` (default: 300)
+
+**NotifOptOutRateHigh** — Opt-out rate > 10% for 30m:
+1. Check which category is driving opt-outs:
+   ```sql
+   SELECT category, COUNT(*) FROM notification_preferences
+   WHERE opted_out = TRUE AND updated_at > NOW() - INTERVAL '24 hours'
+   GROUP BY category ORDER BY count DESC;
+   ```
+2. If `re_engage` is highest, reduce re-engagement frequency
+3. Consider user fatigue — may need to lower daily cap
+
+**NotifVariantSkew** — One variant getting >80% of sends:
+1. Check bandit stats: `curl notification-service:8007/metrics | grep notif_variant`
+2. If the dominant variant genuinely has higher open rates, this is expected convergence
+3. If it's early in deployment (low send counts), the bandit may have locked on too fast — consider resetting priors by restarting the service
+
+**NotifSendRateZero** — No sends for 30m:
+1. Check notification service health: `curl notification-service:8007/health`
+2. Check Kafka consumer groups: `kafka-consumer-groups.sh --describe --group notification-consumer-group`
+3. Check database connectivity from the service pod
+
+### Timezone Resolution
+User UTC offset is resolved in this order:
+1. **Device-reported offset** — from `user_devices.utc_offset_hours` (set during push registration)
+2. **Country code** — from `users.country_code`, mapped to approximate offset (e.g., `IN` → +5, `US` → -5)
+3. **UTC (0)** — global fallback
+
+To improve accuracy, ensure the mobile app sends `utc_offset_hours` during device registration.
 
 ---
 

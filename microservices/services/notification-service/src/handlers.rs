@@ -2,20 +2,26 @@
 //!
 //! Contains business logic for sending notifications via different channels.
 
+use std::sync::Arc;
+
+use chrono::{Timelike, Utc};
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 
+use crate::policy::{GateDecision, NotifCategory, NotificationPolicy};
 use crate::providers::{EmailProvider, InAppProvider, PushProvider, SmsProvider};
 
 pub struct NotificationHandlers {
+    pool: Option<PgPool>,
     push: PushProvider,
     email: EmailProvider,
     sms: SmsProvider,
     in_app: Option<InAppProvider>,
+    policy: Arc<NotificationPolicy>,
 }
 
 impl NotificationHandlers {
-    pub async fn new(pool: Option<PgPool>) -> Self {
+    pub async fn new(pool: Option<PgPool>, policy: Arc<NotificationPolicy>) -> Self {
         let push = if let Some(ref p) = pool {
             PushProvider::new(p.clone()).await
         } else {
@@ -40,10 +46,77 @@ impl NotificationHandlers {
         };
 
         Self {
+            pool: pool.clone(),
             push,
             email: EmailProvider::new(),
             sms: SmsProvider::new(),
             in_app,
+            policy,
+        }
+    }
+
+    /// Run a notification through the policy gate and send if approved.
+    /// Returns Ok(true) if sent, Ok(false) if suppressed/deferred.
+    async fn gated_send(
+        &self,
+        user_id: i32,
+        category: NotifCategory,
+        utc_offset_hours: i32,
+        data: Option<&serde_json::Value>,
+    ) -> Result<bool, String> {
+        let decision = self.policy.gate(user_id, category, utc_offset_hours).await;
+
+        match decision {
+            GateDecision::Send { variant, bandit_selected } => {
+                let sent_hour = ((Utc::now().hour() as i32 + utc_offset_hours).rem_euclid(24)) as u8;
+
+                // Send push
+                self.push.send(user_id, &variant.title, &variant.body, data).await?;
+
+                // In-app
+                if let Some(ref in_app) = self.in_app {
+                    let _ = in_app.create(
+                        user_id, &variant.title, &variant.body,
+                        category.as_str(), data,
+                    ).await;
+                }
+
+                // Log for offline eval
+                self.policy.log_outcome(
+                    user_id, category.as_str(), &variant.variant_id,
+                    bandit_selected, sent_hour,
+                ).await;
+
+                info!(
+                    user_id,
+                    category = category.as_str(),
+                    variant = %variant.variant_id,
+                    bandit = bandit_selected,
+                    "Notification sent via policy"
+                );
+
+                Ok(true)
+            }
+            GateDecision::Defer { optimal_hour, reason } => {
+                info!(
+                    user_id,
+                    category = category.as_str(),
+                    optimal_hour,
+                    reason = %reason,
+                    "Notification deferred"
+                );
+                // TODO: Enqueue for later delivery at optimal_hour
+                Ok(false)
+            }
+            GateDecision::Suppress { reason } => {
+                info!(
+                    user_id,
+                    category = category.as_str(),
+                    reason = %reason,
+                    "Notification suppressed"
+                );
+                Ok(false)
+            }
         }
     }
 
@@ -165,50 +238,23 @@ impl NotificationHandlers {
             "matched_user_id": matched_with,
         });
 
-        self.push
-            .send(
-                user_id,
-                "It's a Match!",
-                "You have a new match! Start a conversation now.",
-                Some(&data),
-            )
-            .await?;
-
-        if let Some(ref in_app) = self.in_app {
-            in_app
-                .create(
-                    user_id,
-                    "It's a Match!",
-                    "You have a new match! Start a conversation now.",
-                    "match",
-                    Some(&data),
-                )
-                .await?;
-        }
+        // Use policy-gated send with bandit variant selection.
+        // UTC offset 0 as default; in production, resolve from user's profile/device.
+        let utc_offset = self.user_utc_offset(user_id).await;
+        self.gated_send(user_id, NotifCategory::NewMatch, utc_offset, Some(&data)).await?;
 
         Ok(())
     }
 
     pub async fn send_like_notification(&self, user_id: i32, is_premium: bool) -> Result<(), String> {
-        if is_premium {
-            self.push
-                .send(
-                    user_id,
-                    "Someone Likes You!",
-                    "Check out who likes you in the Likes tab.",
-                    None,
-                )
-                .await
-        } else {
-            self.push
-                .send(
-                    user_id,
-                    "Someone Likes You!",
-                    "Upgrade to Premium to see who likes you.",
-                    None,
-                )
-                .await
-        }
+        let data = serde_json::json!({
+            "type": "like",
+            "is_premium": is_premium,
+        });
+
+        let utc_offset = self.user_utc_offset(user_id).await;
+        self.gated_send(user_id, NotifCategory::Like, utc_offset, Some(&data)).await?;
+        Ok(())
     }
 
     pub async fn send_super_like_notification(
@@ -241,16 +287,15 @@ impl NotificationHandlers {
         sender_id: i32,
         content_preview: Option<&str>,
     ) -> Result<(), String> {
-        let body = content_preview.unwrap_or("You have a new message");
-
         let data = serde_json::json!({
             "type": "new_message",
             "sender_id": sender_id,
+            "preview": content_preview.unwrap_or(""),
         });
 
-        self.push
-            .send(recipient_id, "New Message", body, Some(&data))
-            .await
+        let utc_offset = self.user_utc_offset(recipient_id).await;
+        self.gated_send(recipient_id, NotifCategory::Message, utc_offset, Some(&data)).await?;
+        Ok(())
     }
 
     pub async fn send_read_receipt_notification(
@@ -427,5 +472,117 @@ impl NotificationHandlers {
 
     pub async fn send_otp(&self, phone_number: &str, otp: &str) -> Result<(), String> {
         self.sms.send_otp(phone_number, otp).await
+    }
+
+    // ============================================
+    // Engagement Tracking
+    // ============================================
+
+    /// Record that a user opened/tapped a notification.
+    /// Called from push-receipt webhook or analytics pipeline.
+    pub async fn record_notification_engagement(
+        &self,
+        user_id: i32,
+        variant_id: &str,
+        engaged: bool,
+    ) {
+        self.policy.record_engagement(user_id, variant_id, engaged).await;
+    }
+
+    /// Get bandit statistics for monitoring dashboard.
+    pub fn notification_stats(&self) -> serde_json::Value {
+        self.policy.bandit_stats()
+    }
+
+    // ============================================
+    // Private Helpers
+    // ============================================
+
+    /// Look up user's UTC offset. Resolution order:
+    /// 1. Device-reported offset (most accurate, from push registration)
+    /// 2. Country code from user profile → approximate offset
+    /// 3. UTC (0) as global fallback
+    async fn user_utc_offset(&self, user_id: i32) -> i32 {
+        let Some(ref pool) = self.pool else {
+            return 0;
+        };
+
+        // 1. Try device-reported offset
+        let device_offset: Option<i32> = sqlx::query_scalar(
+            r#"SELECT utc_offset_hours FROM user_devices
+               WHERE user_id = $1 AND is_active = TRUE
+               ORDER BY last_used_at DESC NULLS LAST
+               LIMIT 1"#,
+        )
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(offset) = device_offset {
+            return offset;
+        }
+
+        // 2. Fall back to country code from user profile
+        let country: Option<String> = sqlx::query_scalar(
+            "SELECT country_code FROM users WHERE id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(cc) = country {
+            return country_to_utc_offset(&cc);
+        }
+
+        0 // UTC fallback
+    }
+}
+
+/// Map ISO 3166-1 alpha-2 country code to approximate UTC offset.
+/// Uses the most populous timezone for countries with multiple zones.
+fn country_to_utc_offset(country_code: &str) -> i32 {
+    match country_code.to_uppercase().as_str() {
+        // South Asia
+        "IN" => 5,  // IST +5:30, rounded
+        "LK" => 5,  // Sri Lanka
+        "NP" => 5,  // Nepal +5:45
+        "BD" => 6,  // Bangladesh
+        "PK" => 5,  // Pakistan
+        // Southeast Asia
+        "SG" | "MY" | "PH" => 8,
+        "TH" | "VN" | "ID" => 7,
+        // East Asia
+        "JP" => 9,
+        "KR" => 9,
+        "CN" | "TW" | "HK" => 8,
+        // Middle East
+        "AE" | "OM" => 4,
+        "SA" | "QA" | "BH" | "KW" => 3,
+        // Africa
+        "NG" | "GH" => 1,
+        "KE" | "ET" | "TZ" => 3,
+        "ZA" | "EG" => 2,
+        // Europe
+        "GB" | "IE" | "PT" => 0,
+        "FR" | "DE" | "ES" | "IT" | "NL" | "BE" | "AT" | "CH" | "PL" | "SE" | "NO" | "DK" => 1,
+        "FI" | "GR" | "RO" | "BG" | "UA" => 2,
+        "RU" => 3,  // Moscow time
+        "TR" => 3,
+        // Americas
+        "US" => -5, // EST (most populous)
+        "CA" => -5,
+        "MX" => -6,
+        "BR" => -3,
+        "AR" => -3,
+        "CL" => -4,
+        "CO" | "PE" => -5,
+        // Oceania
+        "AU" => 10, // AEST
+        "NZ" => 12,
+        _ => 0,
     }
 }
