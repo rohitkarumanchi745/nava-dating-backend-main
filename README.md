@@ -1,6 +1,6 @@
 # Nava - High-Performance Dating Platform Backend
 
-Production backend powering the Nava dating apps (SwiftUI iOS + React Native cross-platform). Built with Rust/Axum microservices, event-driven Kafka architecture, real-time WebSocket chat & calling, and ML-powered matching.
+Production backend powering the Nava dating apps (SwiftUI iOS + React Native cross-platform). Built as a Rust/Axum modular monolith with in-process event bus, DataFusion SQL analytics, real-time WebSocket chat & calling, and ML-powered matching.
 
 ## Architecture
 
@@ -11,33 +11,36 @@ Production backend powering the Nava dating apps (SwiftUI iOS + React Native cro
             └───────┬───────┘     └─────────┬──────────┘
                     └──────────┬────────────┘
                                │
-                  ┌────────────▼────────────┐
-                  │    API Gateway (Rust)    │
-                  │  JWT · Rate Limiting     │
-                  │  GraphQL · REST · WS     │
-                  └────────────┬────────────┘
-        ┌──────────┬───────────┼───────────┬──────────┐
-        ▼          ▼           ▼           ▼          ▼
-   ┌────────┐ ┌────────┐ ┌─────────┐ ┌────────┐ ┌────────┐
-   │  Auth  │ │  User  │ │  Match  │ │  Chat  │ │Payment │
-   │Service │ │Service │ │ Service │ │Service │ │Service │
-   └───┬────┘ └───┬────┘ └────┬────┘ └───┬────┘ └───┬────┘
-       └──────────┴────────────┴──────────┴──────────┘
+         ┌─────────────────────▼──────────────────────┐
+         │        Rust Modular Monolith (Axum)        │
+         │   JWT · Rate Limiting · GraphQL · REST · WS │
+         │                                             │
+         │  ┌────────┐ ┌────────┐ ┌────────┐ ┌──────┐ │
+         │  │  Auth  │ │  User  │ │  Match │ │ Chat │ │
+         │  │Handler │ │Handler │ │Handler │ │  WS  │ │
+         │  └────────┘ └────────┘ └────────┘ └──────┘ │
+         │  ┌────────┐ ┌──────────────┐ ┌───────────┐ │
+         │  │Payment │ │ Notification │ │ Analytics │ │
+         │  │Handler │ │   Module     │ │  Module   │ │
+         │  └────────┘ └──────────────┘ └───────────┘ │
+         │                                             │
+         │  ┌──────────────────────────────────────┐   │
+         │  │      In-Process Event Bus            │   │
+         │  │   (tokio::broadcast, typed events)   │   │
+         │  └──────────────────────────────────────┘   │
+         │                                             │
+         │  ┌────────────┐  ┌────────────┐             │
+         │  │  ML Engine │  │  Vision    │             │
+         │  │ RL · LinUCB│  │  Pipeline  │             │
+         │  │  FedAvg    │  │ Face·NSFW  │             │
+         │  └────────────┘  └────────────┘             │
+         │                                             │
+         │  ┌────────────────────────────────────┐     │
+         │  │  DataFusion SQL Analytics Engine   │     │
+         │  │  Arrow RecordBatch · In-Process SQL│     │
+         │  └────────────────────────────────────┘     │
+         └─────────────────────────────────────────────┘
                                │
-          ┌────────────────────┼────────────────────┐
-          ▼                    ▼                     ▼
-   ┌────────────┐     ┌──────────────┐      ┌────────────┐
-   │  ML Engine │     │ Apache Kafka │      │  Vision    │
-   │ RL · LinUCB│     │   Events     │      │  Pipeline  │
-   │  FedAvg    │     │              │      │ Face·NSFW  │
-   └────────────┘     └──────┬───────┘      └────────────┘
-                   ┌─────────┼─────────┐
-                   ▼         ▼         ▼
-            ┌───────────┐ ┌──────┐ ┌──────┐
-            │Notification│ │Analyt│ │  ML  │
-            │  Service   │ │ ics  │ │Train │
-            └───────────┘ └──────┘ └──────┘
-
  ┌──────────────────────────────────────────────────┐
  │              Data Layer                          │
  │  ┌──────────┐ ┌───────┐ ┌───────┐ ┌─────┐       │
@@ -252,7 +255,8 @@ Call states: `idle → connecting → ringing → active → idle`
 | **Backend** | Rust, Axum, Tokio, SQLx, async-graphql |
 | **Real-Time** | WebSocket pub/sub (chat + call signaling), typing indicators, read receipts |
 | **Databases** | PostgreSQL 16 (primary + read replicas), PgBouncer (connection pooling), Redis 7, Neo4j 5, ClickHouse |
-| **Event Streaming** | Apache Kafka (user, payment, match, chat, analytics topics) |
+| **Event Bus** | In-process `tokio::broadcast` (typed DomainEvent enum, 17 event variants, 4096 capacity) |
+| **Analytics Engine** | Apache DataFusion v44 (Arrow RecordBatch, in-process SQL over Postgres data) |
 | **ML Engine** | Q-Learning RL (28-dim state, epsilon-greedy), LinUCB Contextual Bandit (UCB scoring), Shadow Scoring, FedAvg with Differential Privacy, On-Device Personalization Head, Cold-Start Biasing, Notification Click Predictor |
 | **Computer Vision** | tract-onnx (ArcFace, FER+, NSFW CNN/ViT, NIMA, Liveness), blur/low-light detection, photo ranking, duplicate face detection |
 | **Trust & Safety** | Graph anomaly detection (Neo4j), device fingerprinting, GBDT behavioral classifiers, ban evasion detection |
@@ -297,6 +301,7 @@ Call states: `idle → connecting → ringing → active → idle`
 | **Computer Vision** | `tract-onnx` | 0.21 | ONNX model inference (ArcFace, FER+, NSFW, NIMA, Liveness) |
 | | `image` | 0.25 | Image decoding, resizing, pixel manipulation |
 | | `base64` | 0.22 | Base64 encoding/decoding for image data |
+| **Analytics** | `datafusion` | 44 | Apache DataFusion SQL engine (Arrow RecordBatch, in-process OLAP) |
 | **ML** | `rand` | 0.8 | Random number generation (epsilon-greedy, Laplace noise) |
 | **HTTP Client** | `reqwest` | 0.12 | HTTP client with rustls-tls (S3, external APIs) |
 | **Crypto** | `sha2` | 0.10 | SHA-256 hashing (AWS Signature V4) |
@@ -565,38 +570,71 @@ SQL candidates → Multi-signal scoring → Re-rank by blended score → Return 
 - **DLQ Processor** — Auto-retry dead letter queue entries with exponential backoff; stats endpoint at `/api/payments/dlq/stats`
 - **Send-Time Refresh** — Notification send-time histograms rebuilt every 6 hours from engagement data
 
-## Microservices
+## Modular Monolith Architecture
 
-| Service | Port | Responsibility |
-|---------|------|----------------|
-| API Gateway | 8000 | Routing, JWT validation, rate limiting, GraphQL/REST/WS |
-| Auth Service | 8001 | Phone OTP, JWT tokens, session management |
-| User Service | 8002 | Profile CRUD, photos, voice intros, preferences |
-| Match Service | 8003 | Discovery algorithm, swipes, AI compatibility scoring |
-| Chat Service | 8004 | WebSocket messaging + call signaling, typing indicators, read receipts |
-| Payment Service | 8005 | Apple/RevenueCat receipt validation, subscriptions, webhooks |
-| Ambassador Service | 8006 | Referral program, partner tracking |
-| Notification Service | 8007 | FCM/APNs push notifications, Thompson Sampling variant selection, send-time optimization, per-user daily caps, quiet hours, opt-out, shadow-mode A/B |
-| Analytics Service | 8008 | Kafka consumer → ClickHouse OLAP, DAU, event counts |
+Single Rust binary with clean domain boundaries, replacing the previous microservices + Kafka setup.
 
-## Kafka Event Topics
+### Domain Modules
+
+| Module | Location | Responsibility |
+|--------|----------|----------------|
+| Auth | `handlers/` | Phone OTP, JWT tokens, session management |
+| User | `handlers/` | Profile CRUD, photos, voice intros, preferences |
+| Match | `handlers/` | Discovery algorithm, swipes, AI compatibility scoring |
+| Chat | `handlers/`, `websocket.rs` | WebSocket messaging + call signaling, typing indicators, read receipts |
+| Payment | `handlers/payments.rs`, `services/payments/` | Apple StoreKit 2, Razorpay, Stripe, subscriptions, webhooks, DLQ |
+| Ambassador | `handlers/` | Referral program, partner tracking |
+| Notification | `modules/notifications/` | FCM/APNs push, email (SMTP), SMS (Twilio), in-app; Thompson Sampling variant selection, send-time optimization, per-user daily caps, quiet hours |
+| Analytics | `modules/analytics/` | DataFusion SQL engine (7 pre-built queries + custom SQL), ClickHouse OLAP sink |
+| Events | `modules/events/` | In-process event bus (`tokio::broadcast`, typed `DomainEvent` enum) |
+
+### Event Bus (replaces Kafka)
 
 ```
-user.events        →  registration, verification, profile updates, premium activation
-payment.events     →  orders, completions, subscriptions, refunds
-match.events       →  swipe.like, swipe.pass, match.created, match.unmatched
-chat.events        →  message.sent, message.read
-analytics.events   →  generic tracking
-notification.cmds  →  push, email, SMS commands
-dlq.events         →  dead letter queue for failed events
+DomainEvent::UserRegistered       →  welcome notification, analytics
+DomainEvent::UserVerified         →  engagement notification
+DomainEvent::MatchCreated         →  match notification to both users
+DomainEvent::MessageSent          →  push notification to recipient
+DomainEvent::PaymentCompleted     →  premium activation, analytics
+DomainEvent::SubscriptionActivated →  confirmation notification
+DomainEvent::ReferralSignup       →  ambassador commission tracking
+DomainEvent::AnalyticsEvent       →  ClickHouse sink
+DomainEvent::SendPush/Email/Sms  →  notification delivery (FCM, APNs, SMTP, Twilio)
 ```
+
+### DataFusion Analytics Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/analytics/refresh` | POST | Reload Postgres tables into Arrow RecordBatches |
+| `/analytics/dau` | GET | Daily active users (configurable lookback) |
+| `/analytics/funnel` | GET | Engagement funnel (registration → match → message) |
+| `/analytics/match-rate` | GET | Match rate breakdown by gender |
+| `/analytics/surfaces` | GET | Surface/discovery performance metrics |
+| `/analytics/students` | GET | Student demographic breakdown |
+| `/analytics/hourly` | GET | Hourly activity patterns |
+| `/analytics/bandit` | GET | Bandit arm performance (ML A/B results) |
+| `/analytics/query` | POST | Custom SQL (SELECT-only, write keywords blocked) |
 
 ## Project Structure
 
 ```
-├── rust-backend/              # Main Rust backend (Axum)
+├── rust-backend/              # Modular Monolith (single Axum binary)
 │   ├── src/
 │   │   ├── handlers/          # REST + GraphQL endpoint handlers (150+)
+│   │   ├── modules/           # Domain modules (modular monolith)
+│   │   │   ├── events/        # In-process event bus (tokio::broadcast)
+│   │   │   │   └── mod.rs     # EventBus, DomainEvent (17 variants), EventEnvelope
+│   │   │   ├── notifications/ # Notification module (replaces notification-service)
+│   │   │   │   ├── mod.rs     # NotificationModule, event listener, handler dispatch
+│   │   │   │   ├── policy.rs  # Thompson Sampling bandit, send-time optimization, daily caps, quiet hours
+│   │   │   │   ├── providers.rs # Push (FCM/APNs), Email (SMTP), SMS (Twilio), In-App
+│   │   │   │   └── push/      # FCM HTTP v1, APNs JWT, device registry
+│   │   │   └── analytics/     # Analytics module (replaces analytics-service)
+│   │   │       ├── mod.rs     # AnalyticsModule, ClickHouse event sink
+│   │   │       ├── datafusion_engine.rs # DataFusion SQL engine, Arrow RecordBatch loading
+│   │   │       ├── clickhouse.rs # ClickHouse HTTP client, materialized views
+│   │   │       └── routes.rs  # Analytics HTTP endpoints (DAU, funnel, match-rate, custom SQL)
 │   │   ├── ml/                # ML computation engine (in-process, sub-ms latency)
 │   │   │   ├── mod.rs         # MlService: warm-start, shadow scoring, checkpoint persistence
 │   │   │   ├── rl_agent.rs    # Q-learning RL (28-dim state, per-user model blending)
@@ -629,11 +667,10 @@ dlq.events         →  dead letter queue for failed events
 │   ├── monitoring/            # Prometheus scrape config, Alertmanager routing
 │   ├── migrations/            # PostgreSQL migrations (incl. hash-partitioned swipes)
 │   └── Dockerfile             # Multi-stage build, non-root, healthcheck
-├── microservices/             # Event-driven microservices
-│   ├── gateway/               # API Gateway
-│   ├── services/              # Auth, User, Match, Chat, Payment, Notification (with policy.rs bandit + send-time), etc.
+├── microservices/             # Legacy microservices (superseded by modular monolith)
+│   ├── gateway/               # API Gateway (now handled by rust-backend directly)
+│   ├── services/              # Auth, User, Match, Chat, Payment, Notification, Analytics
 │   ├── shared/                # Common lib (auth, config, events, models)
-│   ├── k8s/                   # K8s manifests (base + dev/prod overlays)
 │   └── docker-compose.yml
 ├── ambassador-dashboard/      # React/TypeScript analytics dashboard
 ├── tests/                     # E2E, Load (k6 PgBouncer+replica), Contract, Smoke, Fuzz, Chaos
@@ -654,10 +691,10 @@ cargo build --release
 cargo run                  # serves on http://127.0.0.1:8080
 ```
 
-### Microservices (Docker Compose)
+### Legacy Microservices (superseded)
 ```bash
-cd microservices
-docker compose up -d       # all services + Kafka + Postgres + Redis
+# The microservices/ directory is preserved for reference but all functionality
+# is now consolidated in the rust-backend modular monolith.
 ```
 
 ### Ambassador Dashboard
