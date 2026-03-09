@@ -114,10 +114,46 @@ All endpoints require `Authorization: Bearer <jwt>` header unless noted.
 | `/fl/aggregate` | POST | FedAvg aggregation with differential privacy |
 | `/fl/model` | GET | Get active global model weights for deployment |
 | `/fl/training-data` | GET | Get labeled swipe pairs (28-dim state + reward labels) for on-device FL training |
-| `/fl/head/global` | GET | Download current global personalization head weights (33 params) |
-| `/fl/head/delta` | POST | Upload on-device personalization head weight deltas |
-| `/fl/cold-start` | POST | Submit cold-start affinity bias observations |
-| `/fl/notif-predictor` | POST | Submit on-device notification click predictor deltas |
+| `/fl/local-data` | POST | Report local dataset stats (sample count, quality score) |
+
+### LLM Content Labeling
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/llm/queue` | POST | Queue a reel/profile for LLM labeling |
+| `/llm/batch` | GET | Get a batch of items for LLM labeling |
+| `/llm/labels/reel` | POST/GET | Submit/retrieve reel labels (genre, mood, tags) |
+| `/llm/labels/message` | POST | Submit message labels (toxicity, intent) |
+| `/llm/labels/user` | POST | Submit user-level labels from profile analysis |
+| `/llm/failed` | POST | Mark labeling job as failed |
+| `/llm/export` | GET | Export training snapshot for offline analysis |
+
+### University & Student Discovery
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/universities/search` | GET | Search universities by name |
+| `/universities/countries` | GET | List countries with universities |
+| `/universities/discover` | GET | Discover profiles from same university |
+| `/universities/reels` | GET | University-specific reel feed |
+| `/universities/passes` | POST/GET | Purchase/get student discovery passes |
+
+### Reel Conversations
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/reels/conversation` | GET | Get conversation history for a reel |
+| `/reels/patterns` | GET | Get learned content preferences from reel engagement |
+| `/reels/inbox` | GET | Get messages received from reel viewers |
+| `/reels/reply` | POST | Reply to a reel message |
+| `/reels/message/read` | POST | Mark reel messages as read |
+
+### Admin
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/admin/stats` | GET | Comprehensive admin statistics (users, matches, revenue) |
+| `/admin/secrets/status` | GET | Check which secrets would change on rotation |
 
 ### Preferences (GraphQL)
 
@@ -404,14 +440,20 @@ All ML computation runs in-process for sub-millisecond scoring latency:
 | **Cold-Start Biasing** | Affinity FL | Per-intent-bucket weight adjustments (5-dim: interest, language, intent, CF, geo), EMA smoothing (0.7/0.3), ±0.3 clamping, DP noise |
 | **Notif Click Predictor** | Engagement FL | 6-feature on-device logistic regression (hour, day, category, recency, daily count, match flag), federated updates, feeds bandit priors |
 | **Federation Safety** | Privacy Boundary | Explicit allow/deny list for federated data, gradient clipping (\|val\| < 100), NaN/Inf validation, dimension checks per update type |
+| **Geo Scorer** | Gravity Model | Haversine distance + local density smoothing (KDE bandwidth 50km), gravity beta=1.5, configurable max distance + units (km/miles) |
+| **Affinity Scorer** | Multi-Signal Overlap | Interest Jaccard (35%), language overlap (15%), intent alignment (20%), collaborative filtering via CoLikeMatrix (30%) |
+| **Engagement Scorer** | Churn + Timing | Logistic regression churn predictor (5 features), per-user send-time histograms (24 hourly buckets), Thompson Sampling notification bandit |
+| **CoLike Matrix** | Collaborative Filtering | User-user co-like signals rebuilt periodically, feeds into affinity scorer CF weight |
 
-**Discovery Flow:**
+**Discovery Ranking Blend (multi-signal):**
 ```
-SQL candidates → RL scoring (primary) → Re-rank by Q-value → Return to client
-     ↓              ↓                                              ↓
-  Filters       LinUCB shadow               Like/Pass feeds back into
-  (age, dist,   scoring (observability)      RL + LinUCB training
-   verified)                                 (every 10 swipes → checkpoint)
+SQL candidates → Multi-signal scoring → Re-rank by blended score → Return to client
+     ↓                ↓                                                 ↓
+  Filters       ┌─── 55% RL score (Q-learning)                  Like/Pass feeds back
+  (age, dist,   ├─── 20% Geo score (gravity model + density)    into RL + LinUCB training
+   verified)    ├─── 20% Affinity score (interest/lang/intent/CF)(every 10 swipes → checkpoint)
+                └─── + churn boost (up to 0.15 for at-risk users)
+                      LinUCB shadow scoring (observability, top-half agreement)
 ```
 
 **2s timeout on ML ranking** — if scoring takes too long, falls back to `attractiveness_score` ordering. Fallback rate tracked via `app_ml_fallback_total` with SLO alert at >5%.
@@ -510,6 +552,19 @@ SQL candidates → RL scoring (primary) → Re-rank by Q-value → Return to cli
   - **5G/WiFi:** Full resolution, HD reels, prefetch next page
 - **Deferred Uploads** — Reel and high-res photo uploads queued client-side when on low battery (<15%) or 2G; auto-resume on WiFi/charging
 
+### Notification Intelligence
+- **Thompson Sampling Bandit** — Beta-distributed arms for 4 notification categories (NewMatch, ReEngage, Like, Message), each with 3 copy variants; shadow mode logs bandit choice but sends control for safe A/B
+- **Send-Time Optimization** — Per-user engagement hour histograms (24 buckets), defers notifications outside peak activity windows
+- **Policy Gate Chain** — 6-stage check: opt-out → daily cap (12/day) → cooldown (5 min) → quiet hours (22:00-07:00 local) → send-time activity → variant selection
+- **Region-Aware Timezone** — 3-tier resolution: device offset → country_code mapping (50+ ISO codes) → UTC fallback
+- **Variant Logging** — All sends logged to `notification_outcomes` table with variant_id, category, sent_at, opened_at for offline evaluation
+- **Shadow-Mode Canary** — Bandit selects variant but always sends control; evaluate uplift with safety gates before promoting to live
+
+### Background Jobs
+- **Neo4j Sync** — Dual-write consistency: health check (30s), incremental sync (60s), full sync (1h), queue processor for failed operations
+- **DLQ Processor** — Auto-retry dead letter queue entries with exponential backoff; stats endpoint at `/api/payments/dlq/stats`
+- **Send-Time Refresh** — Notification send-time histograms rebuilt every 6 hours from engagement data
+
 ## Microservices
 
 | Service | Port | Responsibility |
@@ -553,7 +608,16 @@ dlq.events         →  dead letter queue for failed events
 │   │   │   ├── geo.rs         # Gravity model distance scoring + density smoothing
 │   │   │   └── math.rs        # softmax, laplace noise, cosine similarity
 │   │   ├── services/          # Business logic layer
-│   │   ├── middleware/        # Auth, CORS, rate limiting, dual-write
+│   │   │   ├── freshness.rs   # Profile decay scoring + media freshness
+│   │   │   ├── media_optimizer.rs # Responsive variants, AV1/WEBP, smallest-rendition
+│   │   │   ├── moderation.rs  # Text toxicity, spam, URL detection
+│   │   │   ├── trust_safety.rs # Device fingerprinting, behavioral classifiers
+│   │   │   ├── photo_pipeline.rs # Photo quality scoring, duplicate face detection
+│   │   │   └── payments/      # Stripe/Razorpay retry logic, DLQ processor
+│   │   ├── middleware/        # Auth, CORS, rate limiting, dual-write, client-adaptive
+│   │   │   ├── security.rs    # Input sanitization, email/phone redaction
+│   │   │   ├── client_adaptive.rs # Battery/thermal/network-class throttling
+│   │   │   └── dual_write.rs  # PostgreSQL ↔ Neo4j consistency with circuit breaker
 │   │   ├── graphql.rs         # GraphQL schema & resolvers
 │   │   ├── websocket.rs       # WebSocket chat + call signaling
 │   │   └── vision/            # Face recognition, liveness, emotion, NSFW
@@ -734,6 +798,30 @@ status: idle → connecting → ringing → active → idle
 minAge, maxAge, maxDistanceKm, preferredGenders[], onlyVerified, onlyStudents
 ```
 
+### Internal Database Tables
+
+| Table | Purpose |
+|-------|---------|
+| `notification_outcomes` | Sent notifications with variant_id, category, sent_at, opened_at for offline eval |
+| `notification_preferences` | Per-user opt-outs, daily caps, quiet hours |
+| `in_app_notifications` | In-app notification feed |
+| `fl_local_data` | Per-user FL local dataset stats (sample count, quality) |
+| `llm_labeling_queue` | Queue of reels/messages for LLM labeling |
+| `reel_llm_labels` | LLM-generated labels for reels (genre, mood, tags) |
+| `message_llm_labels` | NLP labels for messages (toxicity, intent) |
+| `user_llm_labels` | User-level labels from profile analysis |
+| `llm_training_snapshots` | Exported snapshots for model training |
+| `device_fingerprints` | Device model, OS, screen, timezone, language hashes |
+| `trust_safety_events` | Flagged anomalies (ring detection, velocity) |
+| `moderation_appeals` | User appeals of moderation decisions |
+| `content_moderation` | Moderation decisions (blurred, muted, etc.) |
+| `photo_quality_log` | Photo scoring and rejection reasons |
+| `media_renditions` | Image variants (150px, 400px, 1080px) |
+| `user_content_preferences` | Learned engagement scores with content genres |
+| `universities` | University database (name, country, domain) |
+| `student_discovery_swipes` | Swipes from university-specific discovery |
+| `payment_retry_tracking` | Webhook retry state for idempotency |
+
 ## Revenue Model
 
 ### 1. Subscriptions (Passes)
@@ -832,6 +920,10 @@ University-tiered pricing to drive campus adoption:
 | `http_request_duration_seconds` | Histogram | Request latency by endpoint |
 | `app_db_pool_size` / `app_db_pool_idle` | Gauge | Database connection pool utilization |
 | `app_websocket_connections` | Gauge | Active WebSocket connections |
+| `app_photos_rejected_quality` | Counter | Photos rejected by aesthetic/blur/light scoring |
+| `app_moderation_actions_total` | Counter | Content moderation decisions applied |
+| `app_trust_safety_flags_total` | Counter | Trust & safety suspicious behavior flags |
+| `app_upload_deferrals_total` | Counter | Uploads deferred due to client battery/thermal state |
 | `app_ml_fallback_total` | Counter | Discover requests that fell back to attractiveness scoring |
 | `app_discover_requests_total` | Counter | Total discover requests (for fallback rate calculation) |
 | `app_ml_avg_scoring_latency_us` | Gauge | Average ML scoring latency in microseconds |
