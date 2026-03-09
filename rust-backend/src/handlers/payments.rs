@@ -10,7 +10,7 @@
 //! - POST /webhook/stripe - Stripe webhook
 
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,

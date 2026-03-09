@@ -20,7 +20,6 @@
 //! - DataDog
 //! - Any OTLP-compatible backend
 
-use tracing::Subscriber;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry};
 
 #[cfg(feature = "otel")]

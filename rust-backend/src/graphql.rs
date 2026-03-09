@@ -7,8 +7,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::auth::{create_access_token, decode_access_token};
-use crate::config::Config;
+use crate::auth::create_access_token;
 use crate::state::AppState;
 
 // ============================================================================
@@ -306,7 +305,7 @@ pub struct QueryRoot;
 impl QueryRoot {
     /// Get current authenticated user's profile
     async fn me(&self, ctx: &Context<'_>) -> Result<Option<User>> {
-        let state = ctx.data::<AppState>()?;
+        let _state = ctx.data::<AppState>()?;
         let user_id = get_user_id_from_context(ctx)?;
 
         let loader = ctx.data::<DataLoader<UserLoader>>()?;
@@ -648,7 +647,7 @@ pub struct MutationRoot;
 #[Object]
 impl MutationRoot {
     /// Send OTP to phone number
-    async fn send_otp(&self, ctx: &Context<'_>, phone_number: String) -> Result<OtpResponse> {
+    async fn send_otp(&self, _ctx: &Context<'_>, phone_number: String) -> Result<OtpResponse> {
         if phone_number.trim().is_empty() {
             return Err(Error::new("Phone number is required"));
         }

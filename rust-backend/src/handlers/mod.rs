@@ -959,7 +959,7 @@ pub async fn discover(
 
     // Get user and preferences (read-replica safe)
     let read_db = state.read_pool();
-    let user = fetch_user_by_id(read_db, user_id)
+    let _user = fetch_user_by_id(read_db, user_id)
         .await?
         .ok_or_else(|| AppError::not_found("User not found"))?;
 
@@ -2122,7 +2122,7 @@ pub async fn verify_student(
     let otp_code = format!("{:06}", rand::thread_rng().gen_range(100000..999999));
 
     // OTP expires in 10 minutes
-    let otp_expires_at = Utc::now().naive_utc() + chrono::Duration::minutes(10);
+    let _otp_expires_at = Utc::now().naive_utc() + chrono::Duration::minutes(10);
     let verification_expires_at = Utc::now().naive_utc() + chrono::Duration::days(365);
 
     // First, delete any existing record for this user

@@ -256,7 +256,7 @@ async fn process_payment_entry(state: &AppState, entry: &crate::services::paymen
                 .and_then(|v| v.as_str())
                 .ok_or("Missing payment_id in payload")?;
 
-            let amount_cents = entry.payload.get("amount_cents")
+            let _amount_cents = entry.payload.get("amount_cents")
                 .and_then(|v| v.as_i64());
 
             let gateway_str = entry.payload.get("gateway")
@@ -266,7 +266,7 @@ async fn process_payment_entry(state: &AppState, entry: &crate::services::paymen
             let gateway = PaymentGateway::from_str(gateway_str)
                 .ok_or_else(|| format!("Unknown gateway: {}", gateway_str))?;
 
-            let payment_service = state.payment_service.as_ref()
+            let _payment_service = state.payment_service.as_ref()
                 .ok_or("Payment service not available")?;
 
             // Get the provider and process refund

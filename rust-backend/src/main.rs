@@ -1,3 +1,5 @@
+#![allow(dead_code, deprecated)]
+
 mod auth;
 mod config;
 mod error;
@@ -31,7 +33,7 @@ use config::Config;
 // use neo4rs::{Graph, ConfigBuilder as Neo4jConfigBuilder};
 use redis::Client as RedisClient;
 use sqlx::postgres::PgPoolOptions;
-use state::{AppState, AppMetrics, CallSessions, ChatRooms};
+use state::{AppState, AppMetrics, CallSessions, ChatRooms, HISTOGRAM_BUCKETS};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::sync::atomic::Ordering;
@@ -130,7 +132,10 @@ async fn metrics_middleware(
     next: Next,
 ) -> Response {
     state.metrics.inc_requests();
+    let start = Instant::now();
     let response = next.run(request).await;
+    let duration_secs = start.elapsed().as_secs_f64();
+    state.metrics.observe_duration(duration_secs);
     state.metrics.dec_active_requests();
 
     if response.status().is_server_error() {
@@ -852,7 +857,7 @@ async fn main() {
                 })
         )
         // Request timeout
-        .layer(TimeoutLayer::new(Duration::from_secs(request_timeout)))
+        .layer(TimeoutLayer::new(Duration::from_secs(request_timeout))) // TODO: migrate to with_status_code when tower-http is upgraded
         // Compression for responses
         .layer(CompressionLayer::new())
         // Request ID propagation
@@ -957,7 +962,7 @@ async fn prometheus_metrics(
         (rooms.room_count(), rooms.total_subscribers())
     };
 
-    format!(
+    let mut output = format!(
         r#"# HELP app_requests_total Total number of requests
 # TYPE app_requests_total counter
 app_requests_total {}
@@ -1124,7 +1129,37 @@ dlq_entries_abandoned_total{{queue="webhooks"}} {}
         dlq_stats.webhooks_resolved,
         dlq_stats.payments_abandoned,
         dlq_stats.webhooks_abandoned,
-    )
+    );
+
+    // Append HTTP request duration histogram
+    output.push_str("\n# HELP http_request_duration_seconds HTTP request latency in seconds\n");
+    output.push_str("# TYPE http_request_duration_seconds histogram\n");
+
+    // Cumulative bucket counters: each bucket value = sum of all bucket counters
+    // where the boundary <= this bucket's boundary.
+    // Our observe_duration already increments each qualifying bucket independently,
+    // so we need cumulative sums.
+    let mut cumulative: u64 = 0;
+    for (i, &bound) in HISTOGRAM_BUCKETS.iter().enumerate() {
+        cumulative += metrics.duration_buckets[i].load(Ordering::Relaxed);
+        output.push_str(&format!(
+            "http_request_duration_seconds_bucket{{le=\"{}\"}} {}\n",
+            bound, cumulative,
+        ));
+    }
+    // +Inf bucket
+    let inf_count = metrics.duration_buckets[HISTOGRAM_BUCKETS.len()].load(Ordering::Relaxed);
+    output.push_str(&format!(
+        "http_request_duration_seconds_bucket{{le=\"+Inf\"}} {}\n",
+        inf_count,
+    ));
+
+    let sum = f64::from_bits(metrics.duration_sum_bits.load(Ordering::Relaxed));
+    let count = metrics.duration_count.load(Ordering::Relaxed);
+    output.push_str(&format!("http_request_duration_seconds_sum {}\n", sum));
+    output.push_str(&format!("http_request_duration_seconds_count {}\n", count));
+
+    output
 }
 
 // DLQ metrics structure

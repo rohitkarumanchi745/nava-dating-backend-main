@@ -16,7 +16,6 @@ use tracing::{info, warn, error, instrument};
 
 use crate::state::AppState;
 use crate::services::graph_service::GraphService;
-use crate::middleware::dual_write::DualWriteManager;
 
 // -----------------------------------------------------------------------------
 // Sync Job Configuration
@@ -426,7 +425,7 @@ async fn process_neo4j_operation(
     state: &AppState,
     op: &crate::middleware::dual_write::SyncOperation,
 ) -> Result<(), String> {
-    let graph_service = state.graph()
+    let _graph_service = state.graph()
         .ok_or_else(|| "Graph service unavailable".to_string())?;
 
     match op.operation_type.as_str() {
@@ -449,7 +448,7 @@ async fn process_neo4j_operation(
 }
 
 async fn process_postgres_operation(
-    state: &AppState,
+    _state: &AppState,
     op: &crate::middleware::dual_write::SyncOperation,
 ) -> Result<(), String> {
     match op.operation_type.as_str() {

@@ -11,7 +11,6 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
     Json,
     routing::{get, post},
     Router,
@@ -19,7 +18,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use std::sync::Arc;
-use tracing::{info, warn, instrument};
+use tracing::{info, instrument};
 
 use crate::state::AppState;
 use crate::error::AppError;

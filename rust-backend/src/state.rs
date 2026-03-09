@@ -98,6 +98,11 @@ impl AppState {
     }
 }
 
+/// Standard Prometheus HTTP request duration histogram bucket boundaries (in seconds).
+pub const HISTOGRAM_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
 /// Application metrics for monitoring
 pub struct AppMetrics {
     pub requests_total: AtomicU64,
@@ -131,6 +136,16 @@ pub struct AppMetrics {
     pub trust_safety_flags_total: AtomicU64,
     /// Upload deferrals due to client conditions
     pub upload_deferrals_total: AtomicU64,
+
+    // --- HTTP request duration histogram ---
+    /// Bucket counters for http_request_duration_seconds histogram.
+    /// Index i counts observations <= HISTOGRAM_BUCKETS[i].
+    /// The last element (index 11) is the +Inf bucket.
+    pub duration_buckets: [AtomicU64; 12],
+    /// Cumulative sum of observed durations in seconds (stored as f64 bits).
+    pub duration_sum_bits: AtomicU64,
+    /// Total number of observations.
+    pub duration_count: AtomicU64,
 }
 
 impl AppMetrics {
@@ -155,6 +170,13 @@ impl AppMetrics {
             moderation_actions_total: AtomicU64::new(0),
             trust_safety_flags_total: AtomicU64::new(0),
             upload_deferrals_total: AtomicU64::new(0),
+            duration_buckets: [
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+            ],
+            duration_sum_bits: AtomicU64::new(0_f64.to_bits()),
+            duration_count: AtomicU64::new(0),
         }
     }
 
@@ -221,6 +243,35 @@ impl AppMetrics {
 
     pub fn inc_upload_deferrals(&self) {
         self.upload_deferrals_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an observed request duration into the histogram.
+    pub fn observe_duration(&self, secs: f64) {
+        // Increment every bucket whose boundary >= observed value, plus the +Inf bucket.
+        for (i, &bound) in HISTOGRAM_BUCKETS.iter().enumerate() {
+            if secs <= bound {
+                self.duration_buckets[i].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // +Inf bucket (index 11) always incremented
+        self.duration_buckets[HISTOGRAM_BUCKETS.len()].fetch_add(1, Ordering::Relaxed);
+
+        // Atomically add to sum using CAS loop on the f64 bits
+        loop {
+            let old_bits = self.duration_sum_bits.load(Ordering::Relaxed);
+            let old_val = f64::from_bits(old_bits);
+            let new_val = old_val + secs;
+            let new_bits = new_val.to_bits();
+            if self
+                .duration_sum_bits
+                .compare_exchange_weak(old_bits, new_bits, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+
+        self.duration_count.fetch_add(1, Ordering::Relaxed);
     }
 }
 

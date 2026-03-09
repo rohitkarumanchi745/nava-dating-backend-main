@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::Sha256;
 
 use super::*;

@@ -101,7 +101,7 @@ pub fn face_ratio_score(
     }
 
     match face_bbox {
-        Some((x, y, w, h)) => {
+        Some((_x, _y, w, h)) => {
             let face_area = w as f64 * h as f64;
             let ratio = face_area / image_area;
             // Optimal: face is 10-40% of frame. Too small = far away, too big = too close.

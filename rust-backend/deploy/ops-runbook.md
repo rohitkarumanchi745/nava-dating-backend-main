@@ -9,6 +9,7 @@
 6. [PgBouncer Operations](#pgbouncer-operations)
 7. [Read Replica Operations](#read-replica-operations)
 8. [Write Scaling Roadmap](#write-scaling-roadmap)
+9. [External Exporters](#external-exporters)
 
 ---
 
@@ -308,3 +309,202 @@ If functional sharding isn't enough:
 - Don't shard prematurely — the current single-primary handles 50K+ DAU
 - Don't use multi-master replication (conflict resolution is a nightmare for dating app data)
 - Don't move to a different database — PostgreSQL with proper tuning scales further than most teams need
+
+---
+
+## External Exporters
+
+The SLO alerts in `deploy/slo-alerts.yml` depend on metrics from three external Prometheus exporters. These must be deployed alongside the application for the corresponding alerts to fire.
+
+### pgbouncer_exporter
+
+**Repository:** https://github.com/prometheus-community/pgbouncer_exporter
+
+**Metrics used by alerts:**
+- `pgbouncer_pools_server_active` — active server connections per pool
+- `pgbouncer_pools_server_maxconn` — max server connections per pool
+- `pgbouncer_pools_client_waiting` — clients queued waiting for a connection
+
+**Alerts that depend on it:** `PgBouncerPoolExhausted`, `PgBouncerClientWaiting` (group `pgbouncer_alerts`)
+
+**Deployment:**
+```bash
+# Deploy as a sidecar or standalone pod pointing at PgBouncer's admin interface
+kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgbouncer-exporter
+  namespace: nava-prod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pgbouncer-exporter
+  template:
+    metadata:
+      labels:
+        app: pgbouncer-exporter
+    spec:
+      containers:
+        - name: pgbouncer-exporter
+          image: prometheuscommunity/pgbouncer-exporter:latest
+          args:
+            - --pgBouncer.connectionString=postgres://stats:@pgbouncer:6432/pgbouncer?sslmode=disable
+          ports:
+            - containerPort: 9127
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgbouncer-exporter
+  namespace: nava-prod
+spec:
+  selector:
+    app: pgbouncer-exporter
+  ports:
+    - port: 9127
+      targetPort: 9127
+EOF
+```
+
+**Verification:** `curl pgbouncer-exporter:9127/metrics | grep pgbouncer_pools_server_active`
+
+### postgres_exporter
+
+**Repository:** https://github.com/prometheus-community/postgres_exporter
+
+**Metrics used by alerts:**
+- `pg_stat_activity_max_tx_duration` — longest running transaction duration (by database)
+- `pg_stat_user_tables_n_dead_tup` — dead tuple count per table (autovacuum health)
+
+**Alerts that depend on it:** `StatementTimeoutsRising`, `AutovacuumBehind` (group `query_alerts`)
+
+**Deployment:**
+```bash
+kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-exporter
+  namespace: nava-prod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-exporter
+  template:
+    metadata:
+      labels:
+        app: postgres-exporter
+    spec:
+      containers:
+        - name: postgres-exporter
+          image: prometheuscommunity/postgres-exporter:latest
+          env:
+            - name: DATA_SOURCE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: nava-secrets
+                  key: postgres-exporter-dsn
+          ports:
+            - containerPort: 9187
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-exporter
+  namespace: nava-prod
+spec:
+  selector:
+    app: postgres-exporter
+  ports:
+    - port: 9187
+      targetPort: 9187
+EOF
+```
+
+The DSN secret should use a read-only PostgreSQL role, e.g.: `postgresql://exporter:password@postgres:5432/nava?sslmode=require`
+
+**Verification:** `curl postgres-exporter:9187/metrics | grep pg_stat_user_tables_n_dead_tup`
+
+### blackbox_exporter
+
+**Repository:** https://github.com/prometheus/blackbox_exporter
+
+**Metrics used by alerts:**
+- `probe_http_status_code` — HTTP status code returned by the probed target
+
+**Alerts that depend on it:** `ServiceUnhealthy` (group `slo_availability`)
+
+The `nava-health` scrape job in `prometheus.yml` probes the `/health` endpoint. If you switch to using the blackbox exporter for synthetic checks, configure it as follows:
+
+**Deployment:**
+```bash
+kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blackbox-exporter
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: blackbox-exporter
+  template:
+    metadata:
+      labels:
+        app: blackbox-exporter
+    spec:
+      containers:
+        - name: blackbox-exporter
+          image: prom/blackbox-exporter:latest
+          args:
+            - --config.file=/etc/blackbox/blackbox.yml
+          ports:
+            - containerPort: 9115
+          volumeMounts:
+            - name: config
+              mountPath: /etc/blackbox
+      volumes:
+        - name: config
+          configMap:
+            name: blackbox-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blackbox-exporter
+  namespace: monitoring
+spec:
+  selector:
+    app: blackbox-exporter
+  ports:
+    - port: 9115
+      targetPort: 9115
+EOF
+```
+
+Blackbox config (`blackbox.yml`):
+```yaml
+modules:
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      valid_status_codes: [200]
+      method: GET
+```
+
+**Verification:** `curl "blackbox-exporter:9115/probe?target=http://nava-backend:3000/health&module=http_2xx" | grep probe_http_status_code`
+
+### Quick health check — all exporters
+
+```bash
+# Verify all exporter targets are up in Prometheus
+curl -s prometheus:9090/api/v1/targets | jq '.data.activeTargets[] | select(.labels.job | test("pgbouncer|postgres|blackbox")) | {job: .labels.job, health: .health}'
+```
+
+If any target shows `health: "down"`, the corresponding alert group will not evaluate and SLO violations will go undetected.

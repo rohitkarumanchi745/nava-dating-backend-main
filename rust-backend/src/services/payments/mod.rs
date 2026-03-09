@@ -15,7 +15,7 @@ pub mod razorpay;
 pub mod retry;
 pub mod stripe;
 
-pub use retry::{DeadLetterQueue, RetryConfig, with_retry};
+pub use retry::DeadLetterQueue;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

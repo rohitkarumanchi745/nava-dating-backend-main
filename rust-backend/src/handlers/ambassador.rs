@@ -363,8 +363,8 @@ pub async fn get_leaderboard(
     let entries = service.get_leaderboard(period, limit).await?;
 
     // Find current user's rank
-    let my_rank = entries.iter()
-        .find(|e| {
+    let _my_rank = entries.iter()
+        .find(|_e| {
             // We need to check if this ambassador belongs to the current user
             // This is a simplified check - in production you'd query the ambassador ID
             false // Will be set properly below

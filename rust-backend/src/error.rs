@@ -127,6 +127,7 @@ impl From<GraphError> for AppError {
 }
 
 // Error type wrappers used by graph_service
+#[allow(non_snake_case)]
 impl AppError {
     /// Create a database error
     pub fn Database(msg: String) -> Self {
