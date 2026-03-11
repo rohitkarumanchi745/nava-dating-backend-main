@@ -9093,3 +9093,176 @@ pub async fn ai_insights(
         }
     })))
 }
+
+// ============================================================================
+// Message Requests — pending like-messages waiting for acceptance
+// ============================================================================
+
+/// GET /messages/requests — Returns all pending like-messages sent to the
+/// authenticated user from people they haven't liked back yet.
+pub async fn get_message_requests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let db = state.read_pool();
+
+    #[derive(sqlx::FromRow)]
+    struct RequestRow {
+        sender_id: i32,
+        message_content: String,
+        sent_at: chrono::NaiveDateTime,
+        name: Option<String>,
+        profile_photo_url: Option<String>,
+        dob: Option<chrono::NaiveDate>,
+        is_verified: Option<bool>,
+        city: Option<String>,
+    }
+
+    let requests = sqlx::query_as::<_, RequestRow>(r#"
+        SELECT
+            m.sender_id,
+            m.content AS message_content,
+            m.created_at AS sent_at,
+            u.name,
+            u.profile_photo_url,
+            u.dob,
+            u.is_verified,
+            l.city
+        FROM messages m
+        JOIN users u ON u.id = m.sender_id
+        LEFT JOIN user_locations l ON l.user_id = m.sender_id
+        WHERE m.receiver_id = $1
+          AND m.message_type = 'like_message'
+          AND NOT EXISTS (
+              SELECT 1 FROM matches mx
+              WHERE (
+                  (mx.user1_id = $1 AND mx.user2_id = m.sender_id AND mx.user1_liked = TRUE)
+                  OR
+                  (mx.user1_id = m.sender_id AND mx.user2_id = $1 AND mx.user2_liked = TRUE)
+              )
+          )
+        ORDER BY m.created_at DESC
+        LIMIT 100
+    "#)
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+
+    let items: Vec<Value> = requests.into_iter().map(|r| {
+        let age = r.dob.map(calculate_age);
+        json!({
+            "from_user_id": r.sender_id,
+            "name": r.name,
+            "age": age,
+            "photo": r.profile_photo_url,
+            "is_verified": r.is_verified.unwrap_or(false),
+            "city": r.city,
+            "message": r.message_content,
+            "sent_at": r.sent_at,
+        })
+    }).collect();
+
+    Ok(Json(json!({
+        "requests": items,
+        "count": items.len(),
+    })))
+}
+
+/// POST /messages/requests/{from_user_id}/accept — Like them back, creating a match.
+/// The like_message becomes the first message in the match conversation.
+pub async fn accept_message_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(from_user_id): AxumPath<i32>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Like them back — reuse the same match logic
+    let (user1_id, user2_id, is_user1) = if user_id < from_user_id {
+        (user_id, from_user_id, true)
+    } else {
+        (from_user_id, user_id, false)
+    };
+
+    let existing = sqlx::query_as::<_, MatchCheckRow>(
+        "SELECT id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match FROM matches WHERE user1_id = $1 AND user2_id = $2",
+    )
+    .bind(user1_id)
+    .bind(user2_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let match_id = match existing {
+        Some(m) => {
+            let query = if is_user1 {
+                "UPDATE matches SET user1_liked = TRUE, is_mutual_match = TRUE, updated_at = NOW() WHERE id = $1"
+            } else {
+                "UPDATE matches SET user2_liked = TRUE, is_mutual_match = TRUE, updated_at = NOW() WHERE id = $1"
+            };
+            sqlx::query(query).bind(&m.id).execute(&state.db).await?;
+            m.id
+        }
+        None => {
+            let new_id = Uuid::new_v4().to_string();
+            let (u1_liked, u2_liked) = if is_user1 { (true, true) } else { (true, true) };
+            sqlx::query(
+                "INSERT INTO matches (id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match, status, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, TRUE, 'active', NOW(), NOW())",
+            )
+            .bind(&new_id).bind(user1_id).bind(user2_id)
+            .bind(u1_liked).bind(u2_liked)
+            .execute(&state.db).await?;
+            new_id
+        }
+    };
+
+    let _ = log_interaction_event(&state.db, user_id, from_user_id, "like", None, None, Some("message_request")).await;
+
+    let ml = state.ml.clone();
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        let mut ml = ml.write().await;
+        ml.record_swipe(&db, user_id, from_user_id, true).await;
+        ml.record_swipe(&db, from_user_id, user_id, true).await;
+    });
+
+    Ok(Json(json!({
+        "matched": true,
+        "match_id": match_id,
+        "message": "It's a match! The conversation is ready.",
+    })))
+}
+
+/// POST /messages/requests/{from_user_id}/decline — Decline the request (soft pass).
+pub async fn decline_message_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(from_user_id): AxumPath<i32>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Mark the like_message as declined so it doesn't reappear
+    sqlx::query(
+        "UPDATE messages SET message_type = 'like_message_declined', updated_at = NOW()
+         WHERE sender_id = $1 AND receiver_id = $2 AND message_type = 'like_message'",
+    )
+    .bind(from_user_id)
+    .bind(user_id)
+    .execute(&state.db)
+    .await?;
+
+    // Record as pass for ML
+    let ml = state.ml.clone();
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        let mut ml = ml.write().await;
+        ml.record_swipe(&db, user_id, from_user_id, false).await;
+    });
+
+    Ok(Json(json!({ "declined": true })))
+}
