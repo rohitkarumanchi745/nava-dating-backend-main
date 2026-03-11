@@ -79,6 +79,8 @@ use handlers::{
     get_my_location, get_nearby, purchase_pass, search_locations, update_location,
     // Student
     student_status, verify_student, verify_student_otp,
+    verify_student_domain_otp, verify_student_document,
+    admin_verification_queue, admin_verification_decision,
     // University Discovery
     search_universities, get_university_countries, discover_university_profiles, get_university_profiles,
     get_university_reels, purchase_university_pass, get_my_university_passes,
@@ -795,7 +797,12 @@ async fn main() {
         // Student
         .route("/student/verify", post(verify_student))
         .route("/student/verify-otp", post(verify_student_otp))
+        .route("/student/verify/domain-otp", post(verify_student_domain_otp))
+        .route("/student/verify/document", post(verify_student_document))
         .route("/student/status", get(student_status))
+        // Admin verification review
+        .route("/admin/verification/queue", get(admin_verification_queue))
+        .route("/admin/verification/{doc_id}/decision", post(admin_verification_decision))
         // University Discovery
         .route("/universities/search", get(search_universities))
         .route("/universities/countries", get(get_university_countries))

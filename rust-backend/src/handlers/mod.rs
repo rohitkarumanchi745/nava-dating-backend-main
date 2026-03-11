@@ -2654,6 +2654,339 @@ pub async fn student_status(
 }
 
 // ============================================================================
+// Extended Student Verification — Document upload, domain OTP, admin review
+// ============================================================================
+
+/// POST /student/verify/domain-otp
+/// OTP to any institutional domain in our university whitelist (e.g. .ac.in, .edu.in)
+/// Falls back to DB lookup when the domain isn't in the hardcoded tier list.
+#[derive(Debug, Deserialize)]
+pub struct DomainOtpRequest {
+    pub email: String,
+}
+
+pub async fn verify_student_domain_otp(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<DomainOtpRequest>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let email = payload.email.trim().to_lowercase();
+    if !email.contains('@') {
+        return Err(AppError::bad_request("Invalid email"));
+    }
+    let domain = email.split('@').last().unwrap_or("");
+
+    // Look up university by domain in DB
+    let uni = sqlx::query_as::<_, (i64, String, String, String)>(
+        "SELECT id, name, tier, country_code FROM universities WHERE LOWER(domain) = $1 AND is_active = TRUE LIMIT 1"
+    )
+    .bind(domain)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (uni_id, uni_name, tier_str, _country) = uni
+        .ok_or_else(|| AppError::bad_request("Email domain not associated with any verified institution in our system"))?;
+
+    let otp_code = format!("{:06}", rand::thread_rng().gen_range(100000..999999));
+    let expires_at = Utc::now().naive_utc() + chrono::Duration::days(365);
+
+    sqlx::query("DELETE FROM student_verifications WHERE user_id = $1")
+        .bind(user_id).execute(&state.db).await?;
+
+    sqlx::query(r#"
+        INSERT INTO student_verifications
+            (user_id, university_name, university_id, email, status, verification_method,
+             discount_tier, submitted_at, expires_at, verification_code, assurance_level, method_detail)
+        VALUES ($1, $2, $3, $4, 'pending', 'domain_otp', $5, NOW(), $6, $7, 'high', $8)
+    "#)
+    .bind(user_id)
+    .bind(&uni_name)
+    .bind(uni_id)
+    .bind(&email)
+    .bind(&tier_str)
+    .bind(expires_at)
+    .bind(&otp_code)
+    .bind(format!("domain:{}", domain))
+    .execute(&state.db)
+    .await?;
+
+    let email_sent = send_otp_email(&email, &otp_code, &uni_name, &state.config).await;
+    if let Err(e) = email_sent {
+        tracing::warn!("Failed to send domain OTP email: {:?}", e);
+    }
+
+    Ok(Json(json!({
+        "message": "OTP sent to your institutional email",
+        "email": email,
+        "university_name": uni_name,
+        "assurance_level": "high",
+        "otp_expires_in_seconds": 600,
+        "dev_otp": if state.config.is_dev_mode() { Some(&otp_code) } else { None },
+    })))
+}
+
+/// POST /student/verify/document  (multipart)
+/// Fields: doc_type (string), file (binary), selfie (binary, optional)
+pub async fn verify_student_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let mut doc_type: Option<String> = None;
+    let mut doc_bytes: Option<Vec<u8>> = None;
+    let mut selfie_bytes: Option<Vec<u8>> = None;
+    let mut university_name: Option<String> = None;
+
+    while let Some(mut field) = multipart.next_field().await
+        .map_err(|_| AppError::bad_request("Invalid multipart data"))? {
+        match field.name().unwrap_or("") {
+            "doc_type"        => { doc_type = Some(field.text().await.unwrap_or_default()); }
+            "university_name" => { university_name = Some(field.text().await.unwrap_or_default()); }
+            "file"            => { doc_bytes = Some(field.bytes().await.unwrap_or_default().to_vec()); }
+            "selfie"          => { selfie_bytes = Some(field.bytes().await.unwrap_or_default().to_vec()); }
+            _ => {}
+        }
+    }
+
+    let doc_type = doc_type.ok_or_else(|| AppError::bad_request("doc_type is required"))?;
+    let doc_bytes = doc_bytes.ok_or_else(|| AppError::bad_request("file is required"))?;
+
+    // Validate doc_type
+    let valid_types = ["student_id_photo", "enrollment_letter", "fee_receipt", "bonafide_certificate"];
+    if !valid_types.contains(&doc_type.as_str()) {
+        return Err(AppError::bad_request("Invalid doc_type"));
+    }
+
+    // Max 10MB per document
+    if doc_bytes.len() > 10 * 1024 * 1024 {
+        return Err(AppError::bad_request("Document exceeds 10MB limit"));
+    }
+
+    // Store document — save to local uploads dir (production: use S3/GCS)
+    let uploads_dir = std::path::Path::new("uploads/verification");
+    tokio::fs::create_dir_all(uploads_dir).await
+        .map_err(|e| AppError::Internal(format!("Failed to create upload dir: {}", e)))?;
+
+    let file_ext = "jpg"; // Default; could detect from magic bytes
+    let file_name = format!("vdoc_{}_{}.{}", user_id, uuid::Uuid::new_v4(), file_ext);
+    let file_path = uploads_dir.join(&file_name);
+    tokio::fs::write(&file_path, &doc_bytes).await
+        .map_err(|e| AppError::Internal(format!("Failed to store document: {}", e)))?;
+
+    let storage_path = file_path.to_string_lossy().to_string();
+    let retention_days = 90i64;
+    let expires_at = Utc::now().naive_utc() + chrono::Duration::days(retention_days);
+
+    // Create or update pending verification record
+    let sv = sqlx::query_as::<_, (i32,)>(
+        "SELECT id FROM student_verifications WHERE user_id = $1 AND status IN ('pending', 'approved') LIMIT 1"
+    )
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let verification_id = if let Some((id,)) = sv {
+        id
+    } else {
+        let uni_name = university_name.as_deref().unwrap_or("Unknown University");
+        sqlx::query_scalar::<_, i32>(r#"
+            INSERT INTO student_verifications
+                (user_id, university_name, email, status, verification_method, submitted_at, assurance_level, method_detail)
+            VALUES ($1, $2, '', 'pending', 'document', NOW(), 'medium', $3)
+            RETURNING id
+        "#)
+        .bind(user_id)
+        .bind(uni_name)
+        .bind(format!("doc:{}", doc_type))
+        .fetch_one(&state.db)
+        .await?
+    };
+
+    // Insert document record
+    let doc_id = sqlx::query_scalar::<_, i64>(r#"
+        INSERT INTO verification_documents
+            (user_id, verification_id, doc_type, storage_path, review_status, expires_at)
+        VALUES ($1, $2, $3::verification_doc_type, $4, 'pending', $5)
+        RETURNING id
+    "#)
+    .bind(user_id)
+    .bind(verification_id)
+    .bind(&doc_type)
+    .bind(&storage_path)
+    .bind(expires_at)
+    .fetch_one(&state.db)
+    .await?;
+
+    // If selfie also uploaded, store it too
+    if let Some(selfie) = selfie_bytes {
+        if !selfie.is_empty() {
+            let selfie_name = format!("vdoc_selfie_{}_{}.jpg", user_id, uuid::Uuid::new_v4());
+            let selfie_path = uploads_dir.join(&selfie_name);
+            let _ = tokio::fs::write(&selfie_path, &selfie).await;
+            let _ = sqlx::query(r#"
+                INSERT INTO verification_documents
+                    (user_id, verification_id, doc_type, storage_path, review_status, expires_at)
+                VALUES ($1, $2, 'id_selfie'::verification_doc_type, $3, 'pending', $4)
+            "#)
+            .bind(user_id)
+            .bind(verification_id)
+            .bind(selfie_path.to_string_lossy().as_ref())
+            .bind(expires_at)
+            .execute(&state.db)
+            .await;
+        }
+    }
+
+    Ok(Json(json!({
+        "submitted": true,
+        "document_id": doc_id,
+        "verification_id": verification_id,
+        "doc_type": doc_type,
+        "assurance_level": "medium",
+        "review_status": "pending",
+        "message": "Document submitted for review. We'll verify within 24-48 hours.",
+        "retention_days": retention_days,
+    })))
+}
+
+/// GET /admin/verification/queue — List pending document verifications (admin only)
+pub async fn admin_verification_queue(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let _admin_id = decode_access_token(&token, &state.config.secret_key)?;
+    // TODO: enforce admin role check when role system is added
+
+    #[derive(Debug, sqlx::FromRow, Serialize)]
+    struct QueueItem {
+        doc_id: i64,
+        user_id: i32,
+        user_name: Option<String>,
+        doc_type: String,
+        confidence_score: Option<f32>,
+        extracted_institute: Option<String>,
+        extracted_name: Option<String>,
+        extracted_expiry: Option<NaiveDate>,
+        review_status: String,
+        submitted_at: Option<chrono::NaiveDateTime>,
+        verification_id: Option<i32>,
+        university_name: Option<String>,
+    }
+
+    let items = sqlx::query_as::<_, QueueItem>(r#"
+        SELECT vd.id AS doc_id, vd.user_id, u.name AS user_name,
+               vd.doc_type::text, vd.confidence_score, vd.extracted_institute,
+               vd.extracted_name, vd.extracted_expiry,
+               vd.review_status::text, vd.created_at AS submitted_at,
+               sv.id AS verification_id, sv.university_name
+        FROM verification_documents vd
+        JOIN users u ON u.id = vd.user_id
+        LEFT JOIN student_verifications sv ON sv.id = vd.verification_id
+        WHERE vd.review_status = 'pending'
+        ORDER BY vd.confidence_score ASC NULLS FIRST, vd.created_at ASC
+        LIMIT 50
+    "#)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(json!({ "queue": items, "total": items.len() })))
+}
+
+/// POST /admin/verification/{doc_id}/decision — Approve or reject a document
+#[derive(Debug, Deserialize)]
+pub struct VerificationDecision {
+    pub action: String, // "approve" | "reject" | "needs_more_info"
+    pub notes: Option<String>,
+    pub assurance_level: Option<String>, // override: "high" | "medium"
+}
+
+pub async fn admin_verification_decision(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(doc_id): AxumPath<i64>,
+    Json(payload): Json<VerificationDecision>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let admin_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    if !["approve", "reject", "needs_more_info"].contains(&payload.action.as_str()) {
+        return Err(AppError::bad_request("action must be approve, reject, or needs_more_info"));
+    }
+
+    // Fetch the document and linked verification
+    let doc = sqlx::query_as::<_, (i32, Option<i32>, String)>(
+        "SELECT user_id, verification_id, doc_type::text FROM verification_documents WHERE id = $1"
+    )
+    .bind(doc_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::not_found("Document not found"))?;
+
+    let (doc_user_id, verification_id, _doc_type) = doc;
+
+    // Update document review status
+    sqlx::query(r#"
+        UPDATE verification_documents
+        SET review_status = $1::doc_review_status, review_notes = $2,
+            reviewed_by = $3, reviewed_at = NOW()
+        WHERE id = $4
+    "#)
+    .bind(&payload.action)
+    .bind(&payload.notes)
+    .bind(admin_id)
+    .bind(doc_id)
+    .execute(&state.db)
+    .await?;
+
+    // If approved, update the student_verification record
+    if payload.action == "approve" {
+        let assurance = payload.assurance_level.as_deref().unwrap_or("medium");
+        let expires_at = Utc::now().naive_utc() + chrono::Duration::days(365);
+
+        if let Some(sv_id) = verification_id {
+            sqlx::query(r#"
+                UPDATE student_verifications
+                SET status = 'approved', verified_at = NOW(),
+                    expires_at = $1, assurance_level = $2
+                WHERE id = $3
+            "#)
+            .bind(expires_at)
+            .bind(assurance)
+            .bind(sv_id)
+            .execute(&state.db)
+            .await?;
+        }
+
+        // Mark user as student verified
+        sqlx::query("UPDATE users SET is_student_verified = TRUE, updated_at = NOW() WHERE id = $1")
+            .bind(doc_user_id)
+            .execute(&state.db)
+            .await?;
+    } else if payload.action == "reject" {
+        if let Some(sv_id) = verification_id {
+            sqlx::query("UPDATE student_verifications SET status = 'rejected' WHERE id = $1")
+                .bind(sv_id)
+                .execute(&state.db)
+                .await?;
+        }
+    }
+
+    Ok(Json(json!({
+        "decided": true,
+        "doc_id": doc_id,
+        "action": payload.action,
+        "user_id": doc_user_id,
+    })))
+}
+
+// ============================================================================
 // Calls
 // ============================================================================
 
