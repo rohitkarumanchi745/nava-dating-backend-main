@@ -394,6 +394,93 @@ VALUES
 ('Tecnológico de Monterrey', 'Tec de Monterrey', 'tec.mx', 'Mexico', 'MEX', 'Nuevo León', 'Monterrey', 'top_private', 'private', TRUE),
 ('University of Buenos Aires', 'UBA', 'uba.ar', 'Argentina', 'ARG', 'Buenos Aires', 'Buenos Aires', 'top_public', 'public', TRUE),
 ('Universidad de los Andes', 'Uniandes', 'uniandes.edu.co', 'Colombia', 'COL', 'Bogotá', 'Bogotá', 'top_private', 'private', TRUE),
-('Pontificia Universidad Católica del Perú', 'PUCP', 'pucp.edu.pe', 'Peru', 'PER', 'Lima', 'Lima', 'top_private', 'private', TRUE)
+('Pontificia Universidad Católica del Perú', 'PUCP', 'pucp.edu.pe', 'Peru', 'PER', 'Lima', 'Lima', 'top_private', 'private', TRUE),
+
+-- ============================================================
+-- INDIA — Additional Engineering Colleges (State + Deemed + Private)
+-- ============================================================
+-- Delhi/NCR
+('Delhi Technological University', 'DTU', 'dtu.ac.in', 'India', 'IND', 'Delhi', 'Delhi', 'top_public', 'public', TRUE),
+('Netaji Subhas University of Technology', 'NSUT', 'nsut.ac.in', 'India', 'IND', 'Delhi', 'Delhi', 'top_public', 'public', TRUE),
+('Indraprastha Institute of Information Technology Delhi', 'IIIT Delhi', 'iiitd.ac.in', 'India', 'IND', 'Delhi', 'Delhi', 'top_public', 'public', TRUE),
+('Jamia Millia Islamia', 'JMI', 'jmi.ac.in', 'India', 'IND', 'Delhi', 'Delhi', 'top_public', 'public', TRUE),
+('Guru Gobind Singh Indraprastha University', 'GGSIPU', 'ipu.ac.in', 'India', 'IND', 'Delhi', 'Delhi', 'top_public', 'public', TRUE),
+-- Maharashtra
+('College of Engineering Pune', 'COEP', 'coep.org.in', 'India', 'IND', 'Maharashtra', 'Pune', 'top_public', 'public', TRUE),
+('Veermata Jijabai Technological Institute', 'VJTI', 'vjti.ac.in', 'India', 'IND', 'Maharashtra', 'Mumbai', 'top_public', 'public', TRUE),
+('Pune Institute of Computer Technology', 'PICT', 'pict.edu', 'India', 'IND', 'Maharashtra', 'Pune', 'top_private', 'private', TRUE),
+('Symbiosis Institute of Technology', 'SIT Pune', 'sitpune.edu.in', 'India', 'IND', 'Maharashtra', 'Pune', 'top_private', 'private', TRUE),
+('Vishwakarma Institute of Technology', 'VIT Pune', 'vit.edu', 'India', 'IND', 'Maharashtra', 'Pune', 'top_private', 'private', TRUE),
+('MIT College of Engineering', 'MITCOE', 'mitcoe.edu.in', 'India', 'IND', 'Maharashtra', 'Pune', 'regular', 'private', TRUE),
+('Sardar Patel College of Engineering', 'SPCE', 'spce.ac.in', 'India', 'IND', 'Maharashtra', 'Mumbai', 'top_public', 'public', TRUE),
+-- Tamil Nadu
+('PSG College of Technology', 'PSG Tech', 'psgtech.ac.in', 'India', 'IND', 'Tamil Nadu', 'Coimbatore', 'top_private', 'private', TRUE),
+('College of Engineering Guindy', 'CEG', 'annauniv.edu', 'India', 'IND', 'Tamil Nadu', 'Chennai', 'top_public', 'public', TRUE),
+('Coimbatore Institute of Technology', 'CIT', 'citcbe.ac.in', 'India', 'IND', 'Tamil Nadu', 'Coimbatore', 'top_private', 'private', TRUE),
+('SSN College of Engineering', 'SSN', 'ssn.edu.in', 'India', 'IND', 'Tamil Nadu', 'Chennai', 'top_private', 'private', TRUE),
+('Sri Sivasubramaniya Nadar College', 'SSN', 'ssn.edu.in', 'India', 'IND', 'Tamil Nadu', 'Chennai', 'top_private', 'private', TRUE),
+('Kumaraguru College of Technology', 'KCT', 'kct.ac.in', 'India', 'IND', 'Tamil Nadu', 'Coimbatore', 'top_private', 'private', TRUE),
+('Amrita Vishwa Vidyapeetham', 'Amrita', 'amrita.edu', 'India', 'IND', 'Tamil Nadu', 'Coimbatore', 'top_private', 'private', TRUE),
+-- Karnataka
+('PES University', 'PES', 'pes.edu', 'India', 'IND', 'Karnataka', 'Bengaluru', 'top_private', 'private', TRUE),
+('MS Ramaiah Institute of Technology', 'MSRIT', 'msrit.edu', 'India', 'IND', 'Karnataka', 'Bengaluru', 'top_private', 'private', TRUE),
+('BMS College of Engineering', 'BMSCE', 'bmsce.ac.in', 'India', 'IND', 'Karnataka', 'Bengaluru', 'top_private', 'private', TRUE),
+('Dayananda Sagar College of Engineering', 'DSCE', 'dsce.edu.in', 'India', 'IND', 'Karnataka', 'Bengaluru', 'regular', 'private', TRUE),
+('New Horizon College of Engineering', 'NHCE', 'newhorizonindia.edu', 'India', 'IND', 'Karnataka', 'Bengaluru', 'regular', 'private', TRUE),
+('REVA University', 'REVA', 'reva.edu.in', 'India', 'IND', 'Karnataka', 'Bengaluru', 'regular', 'private', TRUE),
+-- Gujarat
+('DA-IICT', 'DAIICT', 'daiict.ac.in', 'India', 'IND', 'Gujarat', 'Gandhinagar', 'top_private', 'private', TRUE),
+('Nirma University', 'Nirma', 'nirmauni.ac.in', 'India', 'IND', 'Gujarat', 'Ahmedabad', 'top_private', 'private', TRUE),
+('LD College of Engineering', 'LDCE', 'ldce.ac.in', 'India', 'IND', 'Gujarat', 'Ahmedabad', 'top_public', 'public', TRUE),
+('Institute of Technology Nirma University', 'Nirma IT', 'nirmauni.ac.in', 'India', 'IND', 'Gujarat', 'Ahmedabad', 'top_private', 'private', TRUE),
+-- Rajasthan
+('LNMIIT Jaipur', 'LNMIIT', 'lnmiit.ac.in', 'India', 'IND', 'Rajasthan', 'Jaipur', 'top_private', 'private', TRUE),
+('Poornima College of Engineering', 'PCE', 'poornima.org', 'India', 'IND', 'Rajasthan', 'Jaipur', 'regular', 'private', TRUE),
+-- Punjab / Haryana
+('Chandigarh University', 'CU', 'cuchd.in', 'India', 'IND', 'Punjab', 'Mohali', 'top_private', 'private', TRUE),
+('Lovely Professional University', 'LPU', 'lpu.in', 'India', 'IND', 'Punjab', 'Jalandhar', 'top_private', 'private', TRUE),
+('Chitkara University', 'Chitkara', 'chitkara.edu.in', 'India', 'IND', 'Punjab', 'Rajpura', 'top_private', 'private', TRUE),
+('Punjab Engineering College', 'PEC', 'pec.ac.in', 'India', 'IND', 'Chandigarh', 'Chandigarh', 'top_public', 'public', TRUE),
+-- West Bengal
+('Jadavpur University', 'JU', 'jaduniv.edu.in', 'India', 'IND', 'West Bengal', 'Kolkata', 'top_public', 'public', TRUE),
+('Heritage Institute of Technology', 'HITK', 'heritageit.edu', 'India', 'IND', 'West Bengal', 'Kolkata', 'regular', 'private', TRUE),
+-- Odisha
+('KIIT University', 'KIIT', 'kiit.ac.in', 'India', 'IND', 'Odisha', 'Bhubaneswar', 'top_private', 'private', TRUE),
+-- Telangana / AP
+('BITS Pilani Hyderabad Campus', 'BITS Hyderabad', 'bits-hyderabad.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_private', 'private', TRUE),
+('Osmania University', 'OU', 'osmania.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_public', 'public', TRUE),
+('CVR College of Engineering', 'CVR', 'cvr.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('Vasavi College of Engineering', 'VCE', 'vasaviengg.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_private', 'private', TRUE),
+-- Kerala
+('College of Engineering Trivandrum', 'CET', 'cet.ac.in', 'India', 'IND', 'Kerala', 'Thiruvananthapuram', 'top_public', 'public', TRUE),
+('Government Engineering College Thrissur', 'GEC Thrissur', 'gectcr.ac.in', 'India', 'IND', 'Kerala', 'Thrissur', 'top_public', 'public', TRUE),
+('Cochin University of Science and Technology', 'CUSAT', 'cusat.ac.in', 'India', 'IND', 'Kerala', 'Kochi', 'top_public', 'public', TRUE),
+('Model Engineering College', 'MEC', 'mec.ac.in', 'India', 'IND', 'Kerala', 'Kochi', 'top_public', 'public', TRUE),
+-- UP / Bihar
+('Harcourt Butler Technical University', 'HBTU', 'hbtu.ac.in', 'India', 'IND', 'Uttar Pradesh', 'Kanpur', 'top_public', 'public', TRUE),
+('Madan Mohan Malaviya University of Technology', 'MMMUT', 'mmmut.ac.in', 'India', 'IND', 'Uttar Pradesh', 'Gorakhpur', 'top_public', 'public', TRUE),
+('GL Bajaj Institute of Technology and Management', 'GLBITM', 'glbitm.ac.in', 'India', 'IND', 'Uttar Pradesh', 'Greater Noida', 'regular', 'private', TRUE),
+('Shiv Nadar University', 'SNU', 'snu.edu.in', 'India', 'IND', 'Uttar Pradesh', 'Greater Noida', 'top_private', 'private', TRUE),
+('Bennett University', 'Bennett', 'bennett.edu.in', 'India', 'IND', 'Uttar Pradesh', 'Greater Noida', 'top_private', 'private', TRUE),
+-- New IIITs (25 IIITs under PPP/state)
+('IIIT Kota', 'IIIT Kota', 'iiitkota.ac.in', 'India', 'IND', 'Rajasthan', 'Kota', 'top_public', 'public', TRUE),
+('IIIT Vadodara', 'IIIT Vadodara', 'iiitvadodara.ac.in', 'India', 'IND', 'Gujarat', 'Vadodara', 'top_public', 'public', TRUE),
+('IIIT Lucknow', 'IIIT Lucknow', 'iiitl.ac.in', 'India', 'IND', 'Uttar Pradesh', 'Lucknow', 'top_public', 'public', TRUE),
+('IIIT Kalyani', 'IIIT Kalyani', 'iiitkalyani.ac.in', 'India', 'IND', 'West Bengal', 'Kalyani', 'top_public', 'public', TRUE),
+('IIIT Sri City', 'IIIT Sri City', 'iiits.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Chittoor', 'top_public', 'public', TRUE),
+('IIIT Ranchi', 'IIIT Ranchi', 'iiitranchi.ac.in', 'India', 'IND', 'Jharkhand', 'Ranchi', 'top_public', 'public', TRUE),
+('IIIT Nagpur', 'IIIT Nagpur', 'iiitn.ac.in', 'India', 'IND', 'Maharashtra', 'Nagpur', 'top_public', 'public', TRUE),
+('IIIT Dharwad', 'IIIT Dharwad', 'iiitdwd.ac.in', 'India', 'IND', 'Karnataka', 'Dharwad', 'top_public', 'public', TRUE),
+('IIIT Kurnool', 'IIIT Kurnool', 'iiitk.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Kurnool', 'top_public', 'public', TRUE),
+('IIIT Sonepat', 'IIIT Sonepat', 'iiitsonepat.ac.in', 'India', 'IND', 'Haryana', 'Sonepat', 'top_public', 'public', TRUE),
+('IIIT Tiruchirappalli', 'IIIT Trichy', 'iiitтриchy.ac.in', 'India', 'IND', 'Tamil Nadu', 'Tiruchirappalli', 'top_public', 'public', TRUE),
+('IIIT Una', 'IIIT Una', 'iiitu.ac.in', 'India', 'IND', 'Himachal Pradesh', 'Una', 'top_public', 'public', TRUE),
+('IIIT Surat', 'IIIT Surat', 'iiitvadodara.ac.in', 'India', 'IND', 'Gujarat', 'Surat', 'top_public', 'public', TRUE),
+('IIIT Bhopal', 'IIIT Bhopal', 'iiitbhopal.ac.in', 'India', 'IND', 'Madhya Pradesh', 'Bhopal', 'top_public', 'public', TRUE),
+('IIIT Bhagalpur', 'IIIT Bhagalpur', 'iiitbh.ac.in', 'India', 'IND', 'Bihar', 'Bhagalpur', 'top_public', 'public', TRUE),
+('IIIT Agartala', 'IIIT Agartala', 'iiita.ac.in', 'India', 'IND', 'Tripura', 'Agartala', 'top_public', 'public', TRUE),
+('IIIT Manipur', 'IIIT Manipur', 'iiitmanipur.ac.in', 'India', 'IND', 'Manipur', 'Imphal', 'top_public', 'public', TRUE),
+('IIIT Raichur', 'IIIT Raichur', 'iiitr.ac.in', 'India', 'IND', 'Karnataka', 'Raichur', 'top_public', 'public', TRUE),
+('IIIT Pune', 'IIIT Pune', 'iiitp.ac.in', 'India', 'IND', 'Maharashtra', 'Pune', 'top_public', 'public', TRUE)
 
 ON CONFLICT (domain) DO NOTHING;
