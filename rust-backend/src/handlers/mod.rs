@@ -8861,3 +8861,213 @@ pub async fn like_reel_creator(
         "reel_id": reel_id
     })))
 }
+
+// ============================================================================
+// AI Insights — compatibility breakdown between two users
+// ============================================================================
+
+/// GET /ai/insights/{user_id} — Returns ML-powered compatibility insights
+/// between the authenticated user and the target user.
+/// Used by AIInsightsView in the iOS app.
+pub async fn ai_insights(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(target_user_id): AxumPath<i32>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    if user_id == target_user_id {
+        return Err(AppError::bad_request("Cannot get insights for yourself"));
+    }
+
+    let db = state.read_pool();
+
+    // --- Fetch both users' tags ---
+    let (my_interests, my_langs, my_intent) =
+        crate::ml::affinity::fetch_user_tags(db, user_id).await;
+    let (their_interests, their_langs, their_intent) =
+        crate::ml::affinity::fetch_user_tags(db, target_user_id).await;
+
+    // --- Affinity scores ---
+    let scorer = crate::ml::affinity::AffinityScorer::default();
+    let cf_score = {
+        let ml = state.ml.read().await;
+        ml.co_likes.cf_score(user_id, target_user_id)
+    };
+    let affinity = scorer.score(
+        &my_interests,
+        &their_interests,
+        &my_langs,
+        &their_langs,
+        my_intent.as_deref(),
+        their_intent.as_deref(),
+        cf_score,
+    );
+
+    // --- Geo score ---
+    let my_loc = fetch_user_location(db, user_id).await?;
+    let their_loc = fetch_user_location(db, target_user_id).await?;
+    let distance_km = match (&my_loc, &their_loc) {
+        (Some(a), Some(b)) => {
+            match (a.latitude.zip(a.longitude), b.latitude.zip(b.longitude)) {
+                (Some((alat, alng)), Some((blat, blng))) => {
+                    Some(haversine_km(alat, alng, blat, blng))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let geo_score = distance_km.map(|d| {
+        let max_km = 100.0_f64;
+        (1.0 - (d / max_km).min(1.0)).max(0.0)
+    }).unwrap_or(0.5);
+
+    // --- Shared interests list ---
+    let my_set: std::collections::HashSet<&str> =
+        my_interests.iter().map(|s| s.as_str()).collect();
+    let shared_interests: Vec<&str> = their_interests
+        .iter()
+        .filter(|i| my_set.contains(i.as_str()))
+        .map(|s| s.as_str())
+        .collect();
+
+    // --- Shared languages list ---
+    let my_lang_set: std::collections::HashSet<&str> =
+        my_langs.iter().map(|s| s.as_str()).collect();
+    let shared_languages: Vec<&str> = their_langs
+        .iter()
+        .filter(|l| my_lang_set.contains(l.as_str()))
+        .map(|s| s.as_str())
+        .collect();
+
+    // --- RL score (read-only, no training) ---
+    let rl_score = {
+        let mut ml = state.ml.write().await;
+        let user_f = crate::ml::features::UserFeatures::from_db(db, user_id)
+            .await
+            .unwrap_or_else(|_| ml.feature_defaults.for_user(user_id));
+        let cand_f = crate::ml::features::UserFeatures::from_db(db, target_user_id)
+            .await
+            .unwrap_or_else(|_| ml.feature_defaults.for_user(target_user_id));
+        let state_vec = crate::ml::features::combine_features(&user_f, &cand_f);
+        ml.rl_agent.score_candidate(user_id, &state_vec)
+    };
+
+    // --- Super like check ---
+    let super_liked_me: bool = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM swipes WHERE from_user_id = $1 AND to_user_id = $2 AND action = 'superlike')"
+    )
+    .bind(target_user_id as i64)
+    .bind(user_id as i64)
+    .fetch_one(db)
+    .await
+    .unwrap_or(false);
+
+    let super_like_boost = if super_liked_me { 0.15 } else { 0.0 };
+
+    // --- Final blended compatibility score ---
+    let compatibility = (0.55 * rl_score.clamp(0.0, 1.0)
+        + 0.20 * geo_score
+        + 0.20 * affinity.total
+        + super_like_boost)
+        .clamp(0.0, 1.0);
+
+    // --- Human-readable insight labels ---
+    let interest_label = if affinity.interest_overlap >= 0.6 {
+        "Very high shared interests"
+    } else if affinity.interest_overlap >= 0.3 {
+        "Good interest overlap"
+    } else if affinity.interest_overlap > 0.0 {
+        "Some shared interests"
+    } else {
+        "Different interests"
+    };
+
+    let intent_label = match affinity.intent_alignment {
+        x if x >= 0.9 => "Same relationship goals",
+        x if x >= 0.4 => "Similar relationship goals",
+        _ => "Different relationship goals",
+    };
+
+    let distance_label = distance_km.map(|d| {
+        if d < 5.0 { "Very close — under 5 km".to_string() }
+        else if d < 20.0 { format!("{:.0} km away", d) }
+        else if d < 100.0 { format!("{:.0} km away", d) }
+        else { format!("{:.0} km away — long distance", d) }
+    });
+
+    let compatibility_label = if compatibility >= 0.80 {
+        "Exceptional match"
+    } else if compatibility >= 0.65 {
+        "Strong compatibility"
+    } else if compatibility >= 0.50 {
+        "Good potential"
+    } else if compatibility >= 0.35 {
+        "Some compatibility"
+    } else {
+        "Low compatibility"
+    };
+
+    // --- University match ---
+    let uni_map = batch_lookup_university_full(db, &[user_id, target_user_id]).await?;
+    let my_uni = uni_map.get(&user_id).map(|(name, _, _)| name.clone());
+    let their_uni = uni_map.get(&target_user_id).map(|(name, _, _)| name.clone());
+    let same_university = my_uni.is_some()
+        && their_uni.is_some()
+        && my_uni == their_uni;
+
+    Ok(Json(json!({
+        "compatibility_score": (compatibility * 100.0).round() as i32,
+        "compatibility_label": compatibility_label,
+        "breakdown": {
+            "personality_match": {
+                "score": (rl_score.clamp(0.0, 1.0) * 100.0).round() as i32,
+                "label": if rl_score >= 0.7 { "Your profiles are highly aligned" }
+                         else if rl_score >= 0.4 { "Moderate profile alignment" }
+                         else { "Still learning your preferences" },
+                "weight_pct": 55
+            },
+            "shared_interests": {
+                "score": (affinity.interest_overlap * 100.0).round() as i32,
+                "label": interest_label,
+                "shared": shared_interests,
+                "weight_pct": 10
+            },
+            "shared_languages": {
+                "score": (affinity.language_overlap * 100.0).round() as i32,
+                "label": if !shared_languages.is_empty() {
+                    "You speak the same language"
+                } else {
+                    "Different languages"
+                },
+                "shared": shared_languages,
+                "weight_pct": 5
+            },
+            "relationship_goals": {
+                "score": (affinity.intent_alignment * 100.0).round() as i32,
+                "label": intent_label,
+                "weight_pct": 5
+            },
+            "proximity": {
+                "score": (geo_score * 100.0).round() as i32,
+                "label": distance_label.as_deref().unwrap_or("Location unknown"),
+                "distance_km": distance_km,
+                "weight_pct": 20
+            },
+            "super_like_boost": {
+                "active": super_liked_me,
+                "label": if super_liked_me { "They super liked you!" } else { "No super like" }
+            }
+        },
+        "highlights": {
+            "same_university": same_university,
+            "university": their_uni,
+            "cf_signal": cf_score > 0.1,
+            "cf_label": if cf_score > 0.5 { "Many mutual connections liked them" }
+                        else if cf_score > 0.1 { "Some mutual connections liked them" }
+                        else { "" }
+        }
+    })))
+}

@@ -27,7 +27,7 @@ pub struct MlService {
     pub federated: FederatedCoordinator,
     train_counter: u64,
     /// Cached population-level feature defaults for fallback
-    feature_defaults: FeatureDefaults,
+    pub feature_defaults: FeatureDefaults,
     // --- New scoring layers ---
     /// Gravity model distance scoring + density smoothing
     pub geo: GeoScorer,

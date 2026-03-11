@@ -812,6 +812,8 @@ async fn main() {
         .route("/search/students/{user_id}/message", post(direct_message_from_search))
         // Unified Profile (works from discover, reels, search)
         .route("/profile/{user_id}", get(get_user_profile))
+        // AI Insights — compatibility breakdown
+        .route("/ai/insights/{user_id}", get(handlers::ai_insights))
         // Calls
         .route("/calls", post(create_call))
         // Spots
