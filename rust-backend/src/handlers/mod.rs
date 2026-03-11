@@ -7356,6 +7356,9 @@ pub struct StudentSearchQuery {
     pub min_age: Option<i32>,
     pub max_age: Option<i32>,
     pub tier: Option<String>,            // University tier: top_private, top_public, regular
+    pub class_year: Option<i32>,         // Graduation/class year filter (e.g. 2025)
+    pub is_alumni: Option<bool>,         // Alumni-only filter
+    pub new_in_city: Option<bool>,       // "New in town" filter (arrived within 60 days)
     pub limit: Option<i32>,
     pub offset: Option<i32>,
 }
@@ -7377,6 +7380,9 @@ pub struct StudentSearchResult {
     pub is_verified: bool,
     pub can_message: bool,
     pub interaction_status: String,  // "none", "liked", "matched"
+    pub class_year: Option<i32>,
+    pub is_alumni: bool,
+    pub is_new_in_city: bool,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -7403,6 +7409,53 @@ struct StudentSearchRow {
     university_short_name: Option<String>,
     university_tier: Option<String>,
     university_country: Option<String>,
+    graduation_year: Option<i32>,
+    is_alumni: Option<bool>,
+    is_new_in_city: Option<bool>,
+}
+
+// =============================================================================
+// PUT /profile/city-arrival
+// Sets city_arrival_date and current_city; auto-sets is_new_in_city if within 60 days
+// =============================================================================
+#[derive(Debug, Deserialize)]
+pub struct CityArrivalPayload {
+    pub city: String,
+    pub arrival_date: String, // ISO date: "2026-01-15"
+}
+
+pub async fn set_city_arrival(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CityArrivalPayload>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let arrival = chrono::NaiveDate::parse_from_str(&payload.arrival_date, "%Y-%m-%d")
+        .map_err(|_| AppError::bad_request("Invalid date format, use YYYY-MM-DD"))?;
+
+    let today = chrono::Utc::now().date_naive();
+    let days_since = (today - arrival).num_days();
+    let is_new = days_since >= 0 && days_since <= 60;
+
+    sqlx::query(
+        "UPDATE users SET current_city = $1, city_arrival_date = $2, is_new_in_city = $3, updated_at = NOW() WHERE id = $4"
+    )
+    .bind(&payload.city)
+    .bind(arrival)
+    .bind(is_new)
+    .bind(user_id)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "updated": true,
+        "city": payload.city,
+        "arrival_date": payload.arrival_date,
+        "is_new_in_city": is_new,
+        "days_since_arrival": days_since
+    })))
 }
 
 pub async fn search_students(
@@ -7523,6 +7576,25 @@ pub async fn search_students(
         }
     }
 
+    // Class year filter (graduation year)
+    if let Some(cy) = params.class_year {
+        conditions.push(format!("sv.graduation_year = {}", cy));
+    }
+
+    // Alumni-only filter
+    if let Some(alumni) = params.is_alumni {
+        conditions.push(format!("sv.is_alumni = {}", alumni));
+    }
+
+    // New-in-city filter: arrived within last 60 days
+    if params.new_in_city == Some(true) {
+        conditions.push("u.is_new_in_city = TRUE".to_string());
+        conditions.push(format!(
+            "u.city_arrival_date >= '{}'",
+            (chrono::Utc::now().date_naive() - chrono::Duration::days(60))
+        ));
+    }
+
     let where_clause = conditions.join(" AND ");
 
     let query_str = format!(
@@ -7536,7 +7608,10 @@ pub async fn search_students(
                univ.name AS university_name,
                univ.short_name AS university_short_name,
                univ.tier AS university_tier,
-               univ.country AS university_country
+               univ.country AS university_country,
+               sv.graduation_year,
+               COALESCE(sv.is_alumni, FALSE) AS is_alumni,
+               COALESCE(u.is_new_in_city, FALSE) AS is_new_in_city
         FROM users u
         INNER JOIN student_verifications sv ON sv.user_id = u.id
         INNER JOIN universities univ ON univ.id = sv.university_id
@@ -7650,6 +7725,9 @@ pub async fn search_students(
             is_verified: row.is_verified.unwrap_or(false),
             can_message: is_premium || is_matched,
             interaction_status,
+            class_year: row.graduation_year,
+            is_alumni: row.is_alumni.unwrap_or(false),
+            is_new_in_city: row.is_new_in_city.unwrap_or(false),
         }
     }).collect();
 

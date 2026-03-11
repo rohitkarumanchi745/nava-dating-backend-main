@@ -25,7 +25,7 @@ use axum::{
     http::HeaderMap,
     middleware as axum_middleware,
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use axum_middleware::Next;
@@ -70,7 +70,7 @@ use handlers::{
     // Auth
     send_otp, verify_otp,
     // Profile
-    profile_me, profile_status, update_bio, update_profile, update_preferences,
+    profile_me, profile_status, update_bio, update_profile, update_preferences, set_city_arrival,
     // Voice Intro
     upload_voice_intro, upload_voice_intro_json, track_voice_play,
     // Discovery & Matching
@@ -737,6 +737,7 @@ async fn main() {
         .route("/update-bio", post(update_bio))
         .route("/profile/status", get(profile_status))
         .route("/profile/me", get(profile_me))
+        .route("/profile/city-arrival", put(set_city_arrival))
         .route("/preferences", post(update_preferences))
         // Voice Intro
         .route("/voice-intro", post(upload_voice_intro))
