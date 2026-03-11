@@ -612,6 +612,99 @@ VALUES
 ('Sarvajanik College of Engineering and Technology', 'SCET', 'scet.ac.in', 'India', 'IND', 'Gujarat', 'Surat', 'top_private', 'private', TRUE),
 ('Silver Oak University', 'Silver Oak', 'silveroakuni.ac.in', 'India', 'IND', 'Gujarat', 'Ahmedabad', 'regular', 'private', TRUE),
 ('Indus University', 'Indus', 'indusuni.ac.in', 'India', 'IND', 'Gujarat', 'Ahmedabad', 'regular', 'private', TRUE),
-('Ganpat University', 'Ganpat', 'ganpatuniversity.ac.in', 'India', 'IND', 'Gujarat', 'Mehsana', 'regular', 'private', TRUE)
+('Ganpat University', 'Ganpat', 'ganpatuniversity.ac.in', 'India', 'IND', 'Gujarat', 'Mehsana', 'regular', 'private', TRUE),
+
+-- ============================================================
+-- TELANGANA — JNTUH Affiliated + Autonomous Colleges
+-- ============================================================
+-- JNTU Hyderabad (parent university)
+('Jawaharlal Nehru Technological University Hyderabad', 'JNTUH', 'jntuh.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_public', 'public', TRUE),
+-- Autonomous colleges under JNTUH — Hyderabad
+('Keshav Memorial Institute of Technology', 'KMIT', 'kmit.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_private', 'private', TRUE),
+('Sreyas Institute of Engineering and Technology', 'SIET', 'sreyas.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('TKR College of Engineering and Technology', 'TKRCET', 'tkrcet.com', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('G. Narayanamma Institute of Technology and Science', 'GNITS', 'gnits.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_private', 'private', TRUE),
+('Hyderabad Institute of Technology and Management', 'HITAM', 'hitam.org', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('Matrusri Engineering College', 'MEC Hyd', 'matrusri.edu.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('Guru Nanak Engineering College Hyderabad', 'GNEC', 'gnec.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('Lords Institute of Engineering and Technology', 'LIET', 'lords.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('Malla Reddy Engineering College', 'MREC', 'mallareddyengineeringcollege.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('Malla Reddy College of Engineering and Technology', 'MRCET', 'mrcet.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_private', 'private', TRUE),
+('Vignana Bharathi Institute of Technology', 'VBIT', 'vbit.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_private', 'private', TRUE),
+('Aurora Engineering College', 'AEC Hyd', 'aec.edu.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('Ace Engineering College', 'ACE', 'aceec.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('Stanley College of Engineering and Technology for Women', 'Stanley', 'stanleycollegehyd.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('Nawab Shah Alam Khan College of Engineering', 'NSAKCE', 'nskce.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('Padmasri Dr. B.V. Raju Institute of Technology', 'BVRIT', 'bvrit.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_private', 'private', TRUE),
+('CMR Engineering College', 'CMREC', 'cmrec.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('Institute of Aeronautical Engineering', 'IARE', 'iare.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_private', 'private', TRUE),
+('Marri Laxman Reddy Institute of Technology', 'MLRIT', 'mlrithyderabad.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('Vidya Jyothi Institute of Technology', 'VJIT', 'vjit.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('Bharat Institute of Engineering and Technology', 'BIET', 'biet.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('Holy Mary Institute of Technology and Science', 'HMITS', 'holymaryinstitutions.org', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('Balaji Institute of Technology and Science', 'BITS Warangal', 'bits-warangal.ac.in', 'India', 'IND', 'Telangana', 'Warangal', 'regular', 'private', TRUE),
+('Kakatiya Institute of Technology and Science', 'KITS Warangal', 'kitsw.ac.in', 'India', 'IND', 'Telangana', 'Warangal', 'top_private', 'private', TRUE),
+('Kakatiya University', 'KU', 'kakatiya.ac.in', 'India', 'IND', 'Telangana', 'Warangal', 'top_public', 'public', TRUE),
+('SR Engineering College', 'SREC', 'srec.ac.in', 'India', 'IND', 'Telangana', 'Warangal', 'top_private', 'private', TRUE),
+('Vaagdevi College of Engineering', 'VCE Warangal', 'vaagdevi.edu.in', 'India', 'IND', 'Telangana', 'Warangal', 'regular', 'private', TRUE),
+('Samskruti College of Engineering', 'Samskruti', 'samskruticollege.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+('Nalla Malla Reddy Engineering College', 'NMREC', 'nmrec.edu.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
+
+-- ============================================================
+-- ANDHRA PRADESH — JNTUK, JNTUA Affiliated + Autonomous Colleges
+-- ============================================================
+-- Parent Universities
+('Jawaharlal Nehru Technological University Kakinada', 'JNTUK', 'jntuk.edu.in', 'India', 'IND', 'Andhra Pradesh', 'Kakinada', 'top_public', 'public', TRUE),
+('Jawaharlal Nehru Technological University Anantapur', 'JNTUA', 'jntua.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Anantapur', 'top_public', 'public', TRUE),
+('Andhra University', 'AU', 'andhrauniversity.edu.in', 'India', 'IND', 'Andhra Pradesh', 'Visakhapatnam', 'top_public', 'public', TRUE),
+('Sri Venkateswara University', 'SVU', 'svuniversity.edu.in', 'India', 'IND', 'Andhra Pradesh', 'Tirupati', 'top_public', 'public', TRUE),
+('Acharya Nagarjuna University', 'ANU', 'nagarjunauniversity.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Guntur', 'top_public', 'public', TRUE),
+('Krishna University', 'KRU', 'krishnauniversity.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Machilipatnam', 'top_public', 'public', TRUE),
+('GITAM University', 'GITAM', 'gitam.edu', 'India', 'IND', 'Andhra Pradesh', 'Visakhapatnam', 'top_private', 'private', TRUE),
+-- Autonomous colleges — Visakhapatnam
+('Andhra University College of Engineering', 'AUCE', 'aucoe.info', 'India', 'IND', 'Andhra Pradesh', 'Visakhapatnam', 'top_public', 'public', TRUE),
+('MVGR College of Engineering', 'MVGR', 'mvgrce.edu.in', 'India', 'IND', 'Andhra Pradesh', 'Visakhapatnam', 'top_private', 'private', TRUE),
+('Gayatri Vidya Parishad College of Engineering', 'GVPCE', 'gvpce.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Visakhapatnam', 'top_private', 'private', TRUE),
+('SRKR Engineering College', 'SRKR', 'srkrec.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Bhimavaram', 'top_private', 'private', TRUE),
+('Vishnu Institute of Technology', 'VIIT', 'vishnu.edu.in', 'India', 'IND', 'Andhra Pradesh', 'Bhimavaram', 'top_private', 'private', TRUE),
+('Raghu Engineering College', 'Raghu', 'raghuenggcollege.in', 'India', 'IND', 'Andhra Pradesh', 'Visakhapatnam', 'regular', 'private', TRUE),
+('GITAM Institute of Technology', 'GIT', 'gitam.edu', 'India', 'IND', 'Andhra Pradesh', 'Visakhapatnam', 'top_private', 'private', TRUE),
+('Anil Neerukonda Institute of Technology', 'ANITS', 'anits.edu.in', 'India', 'IND', 'Andhra Pradesh', 'Visakhapatnam', 'top_private', 'private', TRUE),
+('Dadi Institute of Engineering and Technology', 'DIET', 'diet.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Visakhapatnam', 'regular', 'private', TRUE),
+-- Guntur / Krishna / West Godavari
+('Vignan University Guntur', 'Vignan', 'vignan.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Guntur', 'top_private', 'private', TRUE),
+('KL University', 'KLU', 'kluniversity.in', 'India', 'IND', 'Andhra Pradesh', 'Guntur', 'top_private', 'private', TRUE),
+('Bapatla Engineering College', 'BEC', 'bec-bapatla.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Bapatla', 'top_private', 'private', TRUE),
+('RVR & JC College of Engineering', 'RVRJC', 'rvrjcce.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Guntur', 'top_private', 'private', TRUE),
+('Nagarjuna Institute of Engineering Technology and Management', 'NIEM', 'nietrec.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Guntur', 'regular', 'private', TRUE),
+('Velagapudi Ramakrishna Siddhartha Engineering College', 'VRSEC', 'vrsiddhartha.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Vijayawada', 'top_private', 'private', TRUE),
+('PVP Siddhartha Institute of Technology', 'PVPSIT', 'pvpsiddhartha.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Vijayawada', 'top_private', 'private', TRUE),
+('Sri Vasavi Engineering College', 'SVEC', 'srivasaviengg.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Tadepalligudem', 'regular', 'private', TRUE),
+('Shri Vishnu Engineering College for Women', 'SVECW', 'svecw.edu.in', 'India', 'IND', 'Andhra Pradesh', 'Bhimavaram', 'top_private', 'private', TRUE),
+-- East Godavari / Kakinada
+('Kakinada Institute of Engineering and Technology', 'KIET Kakinada', 'kiet.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Kakinada', 'regular', 'private', TRUE),
+('P.R. Engineering College', 'PREC', 'precollege.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Kakinada', 'regular', 'private', TRUE),
+('Sri Vasavi Institute of Engineering and Technology', 'SVIET', 'sviet.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Nandamuru', 'regular', 'private', TRUE),
+-- Nellore / SPSR
+('Sri Venkateswara College of Engineering', 'SVCE AP', 'svcolleges.edu.in', 'India', 'IND', 'Andhra Pradesh', 'Nellore', 'regular', 'private', TRUE),
+('Narayana Engineering College', 'NEC Nellore', 'narayanaengineeringcollege.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Nellore', 'regular', 'private', TRUE),
+('Krishnamurthy Institute of Technology and Engineering', 'KITE', 'kitengineering.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Nellore', 'regular', 'private', TRUE),
+-- Kurnool / Anantapur / Rayalaseema
+('G. Pullaiah College of Engineering and Technology', 'GPCET', 'gpcet.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Kurnool', 'top_private', 'private', TRUE),
+('Santhiram Engineering College', 'SEC Nandyal', 'santhiram.edu.in', 'India', 'IND', 'Andhra Pradesh', 'Nandyal', 'regular', 'private', TRUE),
+('Rajeev Gandhi Memorial College of Engineering', 'RGMCET', 'rgmcet.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Nandyal', 'top_private', 'private', TRUE),
+('Sri Krishnadevaraya University', 'SKU', 'skuniversity.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Anantapur', 'top_public', 'public', TRUE),
+('JNT University Anantapur College of Engineering', 'JNTUA CE', 'jntuace.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Anantapur', 'top_public', 'public', TRUE),
+('Sri Sai Institute of Technology and Science', 'SSITS', 'ssitsrnr.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Anantapur', 'regular', 'private', TRUE),
+-- Tirupati / Chittoor
+('Sri Venkateswara Engineering College', 'SVEC Tirupati', 'svec.edu.in', 'India', 'IND', 'Andhra Pradesh', 'Tirupati', 'top_private', 'private', TRUE),
+('Sri Padmavati Mahila Visvavidyalayam', 'SPMVV', 'spmvv.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Tirupati', 'top_public', 'public', TRUE),
+('Madanapalle Institute of Technology and Science', 'MITS', 'mits.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Madanapalle', 'top_private', 'private', TRUE),
+('Sri Balaji Engineering College', 'SBEC', 'sbec.in', 'India', 'IND', 'Andhra Pradesh', 'Tirupati', 'regular', 'private', TRUE),
+-- SRM / Amrita AP campuses
+('SRM University AP', 'SRM AP', 'srmap.edu.in', 'India', 'IND', 'Andhra Pradesh', 'Amaravati', 'top_private', 'private', TRUE),
+('Amrita School of Engineering Amaravati', 'Amrita AP', 'amrita.edu', 'India', 'IND', 'Andhra Pradesh', 'Amaravati', 'top_private', 'private', TRUE),
+('VIT-AP University', 'VIT AP', 'vitap.ac.in', 'India', 'IND', 'Andhra Pradesh', 'Amaravati', 'top_private', 'private', TRUE),
+('Koneru Lakshmaiah Education Foundation', 'KL Deemed', 'kluniversity.in', 'India', 'IND', 'Andhra Pradesh', 'Vijayawada', 'top_private', 'private', TRUE)
 
 ON CONFLICT (domain) DO NOTHING;
