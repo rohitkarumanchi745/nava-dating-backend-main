@@ -546,6 +546,8 @@ pub struct PurchasePassRequest {
 #[derive(Debug, Deserialize)]
 pub struct LikeRequest {
     pub target_user_id: i32,
+    /// Optional message sent with the like (message request feature)
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

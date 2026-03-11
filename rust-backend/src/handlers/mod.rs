@@ -1256,8 +1256,29 @@ pub async fn like_user(
         }
     };
 
+    // Store message request if provided
+    let message_text = payload.message.as_deref()
+        .map(|m| m.trim())
+        .filter(|m| !m.is_empty())
+        .map(|m| &m[..m.len().min(300)]);
+
+    if let Some(msg) = message_text {
+        let _ = sqlx::query(
+            r#"INSERT INTO messages (match_id, sender_id, receiver_id, content, message_type, created_at)
+               VALUES ($1, $2, $3, $4, 'like_message', NOW())
+               ON CONFLICT DO NOTHING"#,
+        )
+        .bind(&match_id)
+        .bind(user_id)
+        .bind(target_id)
+        .bind(msg)
+        .execute(&state.db)
+        .await;
+    }
+
     // Log like event
-    let _ = log_interaction_event(&state.db, user_id, target_id, "like", None, None, Some("discover")).await;
+    let event_type = if message_text.is_some() { "like_with_message" } else { "like" };
+    let _ = log_interaction_event(&state.db, user_id, target_id, event_type, None, None, Some("discover")).await;
 
     // Feed RL agent with like signal (non-blocking, never fails the request)
     let ml = state.ml.clone();
@@ -1274,6 +1295,7 @@ pub async fn like_user(
         "message": if is_mutual { "It's a match!" } else { "Like sent" },
         "match_id": match_id,
         "is_mutual": is_mutual,
+        "has_message": message_text.is_some(),
     })))
 }
 
