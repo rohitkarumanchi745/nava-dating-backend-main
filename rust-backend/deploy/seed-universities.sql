@@ -565,7 +565,6 @@ VALUES
 ('National Institute of Technology Warangal', 'NIT Warangal', 'nitw.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_public', 'public', TRUE),
 ('Chaitanya Bharathi Institute of Technology', 'CBIT', 'cbit.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_private', 'private', TRUE),
 ('Gokaraju Rangaraju Institute of Engineering', 'GRIET', 'griet.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_private', 'private', TRUE),
-('Mahatma Gandhi Institute of Technology', 'MGIT', 'mgit.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_private', 'private', TRUE),
 ('Muffakham Jah College of Engineering', 'MJCET', 'mjcet.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_private', 'private', TRUE),
 ('MLR Institute of Technology', 'MLRIT', 'mlrinstitutions.ac.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'regular', 'private', TRUE),
 ('Sreenidhi Institute of Science and Technology', 'SNIST', 'sreenidhi.edu.in', 'India', 'IND', 'Telangana', 'Hyderabad', 'top_private', 'private', TRUE),
