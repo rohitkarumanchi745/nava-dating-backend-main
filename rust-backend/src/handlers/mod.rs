@@ -2482,6 +2482,7 @@ pub async fn verify_student_otp(
         SELECT id, verification_code, discount_tier, university_name
         FROM student_verifications
         WHERE user_id = $1 AND email = $2 AND status = 'pending'
+          AND expires_at > NOW()
         "#,
     )
     .bind(user_id)
@@ -2490,7 +2491,7 @@ pub async fn verify_student_otp(
     .await?;
 
     let (verification_id, stored_otp, discount_tier, university_name) = verification
-        .ok_or_else(|| AppError::bad_request("No pending verification found for this email"))?;
+        .ok_or_else(|| AppError::bad_request("OTP expired or not found — please request a new one"))?;
 
     // Verify OTP
     if payload.otp != stored_otp {
