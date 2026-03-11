@@ -816,8 +816,11 @@ async fn main() {
         .route("/ai/insights/{user_id}", get(handlers::ai_insights))
         // Message Requests — like-with-message inbox
         .route("/messages/requests", get(handlers::get_message_requests))
+        .route("/messages/requests/sent", get(handlers::get_sent_message_requests))
         .route("/messages/requests/{from_user_id}/accept", post(handlers::accept_message_request))
         .route("/messages/requests/{from_user_id}/decline", post(handlers::decline_message_request))
+        .route("/messages/requests/{from_user_id}/reply", post(handlers::reply_message_request))
+        .route("/messages/requests/{from_user_id}/like-back", post(handlers::like_back_after_reply))
         // Calls
         .route("/calls", post(create_call))
         // Spots

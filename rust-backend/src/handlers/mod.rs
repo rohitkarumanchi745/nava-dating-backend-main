@@ -9266,3 +9266,237 @@ pub async fn decline_message_request(
 
     Ok(Json(json!({ "declined": true })))
 }
+
+// ============================================================================
+// Message Request — Reply without matching (soft conversation)
+// ============================================================================
+
+/// POST /messages/requests/{from_user_id}/reply
+/// User B replies to User A's message request WITHOUT creating a match.
+/// User A sees the reply but cannot see User B's full profile yet.
+/// Once User A likes back, a real match is created automatically.
+pub async fn reply_message_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(from_user_id): AxumPath<i32>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let reply_text = payload.get("message")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::bad_request("message is required"))?;
+
+    if reply_text.len() > 300 {
+        return Err(AppError::bad_request("message must be under 300 characters"));
+    }
+
+    // Verify the original request exists
+    let request_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM messages WHERE sender_id = $1 AND receiver_id = $2 AND message_type = 'like_message')"
+    )
+    .bind(from_user_id)
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    if !request_exists {
+        return Err(AppError::not_found("Message request not found"));
+    }
+
+    // Use a deterministic thread_id for the pre-match conversation
+    // Format: req_{smaller_id}_{larger_id}
+    let (a, b) = if from_user_id < user_id { (from_user_id, user_id) } else { (user_id, from_user_id) };
+    let thread_id = format!("req_{}_{}", a, b);
+
+    // Store the reply as like_message_reply — no match record created
+    sqlx::query(
+        r#"INSERT INTO messages (match_id, sender_id, receiver_id, content, message_type, is_read, created_at)
+           VALUES ($1, $2, $3, $4, 'like_message_reply', FALSE, NOW())"#,
+    )
+    .bind(&thread_id)
+    .bind(user_id)
+    .bind(from_user_id)
+    .bind(reply_text)
+    .execute(&state.db)
+    .await?;
+
+    // Mark original like_message as replied so it shows differently in inbox
+    sqlx::query(
+        "UPDATE messages SET message_type = 'like_message_replied' WHERE sender_id = $1 AND receiver_id = $2 AND message_type = 'like_message'"
+    )
+    .bind(from_user_id)
+    .bind(user_id)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "replied": true,
+        "thread_id": thread_id,
+        "info": "Reply sent. Their profile will be fully visible once you match.",
+    })))
+}
+
+/// GET /messages/requests/sent — User A sees replies from people they sent requests to.
+/// Shows the pre-match conversation thread with limited profile info.
+pub async fn get_sent_message_requests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let db = state.read_pool();
+
+    #[derive(sqlx::FromRow)]
+    struct SentRow {
+        receiver_id: i32,
+        original_message: String,
+        sent_at: chrono::NaiveDateTime,
+        reply_content: Option<String>,
+        replied_at: Option<chrono::NaiveDateTime>,
+        name: Option<String>,
+        // profile photo hidden until match — only show first name and blurred indicator
+        is_verified: Option<bool>,
+    }
+
+    let sent = sqlx::query_as::<_, SentRow>(r#"
+        SELECT
+            m.receiver_id,
+            m.content AS original_message,
+            m.created_at AS sent_at,
+            r.content AS reply_content,
+            r.created_at AS replied_at,
+            u.name,
+            u.is_verified
+        FROM messages m
+        JOIN users u ON u.id = m.receiver_id
+        LEFT JOIN messages r ON r.sender_id = m.receiver_id
+            AND r.receiver_id = m.sender_id
+            AND r.message_type = 'like_message_reply'
+        WHERE m.sender_id = $1
+          AND m.message_type IN ('like_message', 'like_message_replied')
+        ORDER BY COALESCE(r.created_at, m.created_at) DESC
+        LIMIT 100
+    "#)
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+
+    let items: Vec<Value> = sent.into_iter().map(|r| {
+        let has_reply = r.reply_content.is_some();
+        // Only show first name to preserve privacy until match
+        let display_name = r.name.as_deref()
+            .and_then(|n| n.split_whitespace().next())
+            .map(|n| n.to_string());
+
+        json!({
+            "to_user_id": r.receiver_id,
+            "display_name": display_name,   // first name only
+            "photo_hidden": true,           // full profile hidden until match
+            "is_verified": r.is_verified.unwrap_or(false),
+            "your_message": r.original_message,
+            "sent_at": r.sent_at,
+            "has_reply": has_reply,
+            "reply": r.reply_content,
+            "replied_at": r.replied_at,
+            "status": if has_reply { "replied" } else { "pending" },
+        })
+    }).collect();
+
+    Ok(Json(json!({
+        "sent_requests": items,
+        "count": items.len(),
+    })))
+}
+
+/// POST /messages/requests/{from_user_id}/like-back
+/// User A likes back after seeing a reply — creates the full match.
+/// The pre-match thread messages are migrated to the real match conversation.
+pub async fn like_back_after_reply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(from_user_id): AxumPath<i32>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Create the match (same logic as accept_message_request)
+    let (user1_id, user2_id, is_user1) = if user_id < from_user_id {
+        (user_id, from_user_id, true)
+    } else {
+        (from_user_id, user_id, false)
+    };
+
+    let existing = sqlx::query_as::<_, MatchCheckRow>(
+        "SELECT id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match FROM matches WHERE user1_id = $1 AND user2_id = $2",
+    )
+    .bind(user1_id)
+    .bind(user2_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let match_id = match existing {
+        Some(m) => {
+            let query = if is_user1 {
+                "UPDATE matches SET user1_liked = TRUE, is_mutual_match = TRUE, updated_at = NOW() WHERE id = $1"
+            } else {
+                "UPDATE matches SET user2_liked = TRUE, is_mutual_match = TRUE, updated_at = NOW() WHERE id = $1"
+            };
+            sqlx::query(query).bind(&m.id).execute(&state.db).await?;
+            m.id
+        }
+        None => {
+            let new_id = Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO matches (id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match, status, created_at, updated_at)
+                 VALUES ($1, $2, $3, TRUE, TRUE, TRUE, 'active', NOW(), NOW())",
+            )
+            .bind(&new_id).bind(user1_id).bind(user2_id)
+            .execute(&state.db).await?;
+            new_id
+        }
+    };
+
+    // Migrate pre-match thread to real match_id so the conversation history is preserved
+    let (a, b) = if user_id < from_user_id { (user_id, from_user_id) } else { (from_user_id, user_id) };
+    let thread_id = format!("req_{}_{}", a, b);
+
+    let _ = sqlx::query(
+        "UPDATE messages SET match_id = $1, message_type = 'text' WHERE match_id = $2"
+    )
+    .bind(&match_id)
+    .bind(&thread_id)
+    .execute(&state.db)
+    .await;
+
+    // Also migrate the original like_message
+    let _ = sqlx::query(
+        "UPDATE messages SET match_id = $1, message_type = 'text' WHERE sender_id = $2 AND receiver_id = $3 AND message_type IN ('like_message', 'like_message_replied')"
+    )
+    .bind(&match_id)
+    .bind(from_user_id)
+    .bind(user_id)
+    .execute(&state.db)
+    .await;
+
+    let _ = log_interaction_event(&state.db, user_id, from_user_id, "like", None, None, Some("message_request_reply")).await;
+
+    let ml = state.ml.clone();
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        let mut ml = ml.write().await;
+        ml.record_swipe(&db, user_id, from_user_id, true).await;
+        ml.record_swipe(&db, from_user_id, user_id, true).await;
+    });
+
+    Ok(Json(json!({
+        "matched": true,
+        "match_id": match_id,
+        "message": "It's a match! Full conversation history preserved.",
+        "conversation_migrated": true,
+    })))
+}
