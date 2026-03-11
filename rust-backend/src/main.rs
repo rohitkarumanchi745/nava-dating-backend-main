@@ -74,14 +74,21 @@ use handlers::{
     // Voice Intro
     upload_voice_intro, upload_voice_intro_json, track_voice_play,
     // Discovery & Matching
-    discover, get_match, get_matches, like_user, pass_user,
+    discover, get_match, get_matches, like_user, super_like_user, pass_user,
     // Location
     get_my_location, get_nearby, purchase_pass, search_locations, update_location,
     // Student
     student_status, verify_student, verify_student_otp,
     // University Discovery
-    search_universities, get_university_countries, discover_university_profiles,
+    search_universities, get_university_countries, discover_university_profiles, get_university_profiles,
     get_university_reels, purchase_university_pass, get_my_university_passes,
+    // Student Global Search
+    search_students, student_search_suggestions, unified_search, view_student_profile,
+    like_student_from_search, direct_message_from_search,
+    // Unified Profile & Cross-surface actions
+    get_user_profile, like_reel_creator,
+    // Reel match flow
+    request_reel_match, accept_reel_match,
     // Calls
     create_call,
     // Spots
@@ -429,6 +436,7 @@ async fn main() {
     let neo4j_user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".to_string());
     let neo4j_password = std::env::var("NEO4J_PASSWORD").ok();
 
+
     let (neo4j, graph_service) = if let (Some(uri), Some(password)) = (neo4j_uri, neo4j_password) {
         // Parse host from URI
         let uri_clean = uri.replace("bolt://", "").replace("neo4j://", "");
@@ -544,6 +552,9 @@ async fn main() {
         None
     };
 
+    // Create event bus early so it can be shared with AppState
+    let event_bus = Arc::new(modules::events::EventBus::new(4096));
+
     let state = AppState {
         db,
         db_read: db_read_replica,
@@ -562,6 +573,7 @@ async fn main() {
         ml: Arc::new(RwLock::new(ml_service)),
         trust_safety,
         moderation,
+        event_bus: event_bus.clone(),
     };
 
     // Run startup sync if Neo4j is connected
@@ -594,7 +606,7 @@ async fn main() {
     }
 
     // ── Modular Monolith: Event Bus + Domain Modules ──────────────────
-    let event_bus = Arc::new(modules::events::EventBus::new(4096));
+    // (event_bus created above and shared via AppState)
 
     // Notification module (replaces notification-service microservice)
     let notif_module = Arc::new(
@@ -734,10 +746,12 @@ async fn main() {
         .route("/discover", get(discover))
         .route("/profiles/discover", get(discover))
         .route("/match/like", post(like_user))
+        .route("/match/super-like", post(super_like_user))
         .route("/match/pass", post(pass_user))
-        .route("/profiles/like", post(like_user))
-        .route("/profiles/pass", post(pass_user))
         .route("/match/{match_id}", get(get_match))
+        .route("/profiles/like", post(like_user))
+        .route("/profiles/super-like", post(super_like_user))
+        .route("/profiles/pass", post(pass_user))
         .route("/matches", get(get_matches))
         // Location
         .route("/location/update", post(update_location))
@@ -785,9 +799,19 @@ async fn main() {
         .route("/universities/search", get(search_universities))
         .route("/universities/countries", get(get_university_countries))
         .route("/universities/discover", get(discover_university_profiles))
+        .route("/universities/{id}/profiles", get(get_university_profiles))
         .route("/universities/reels", get(get_university_reels))
         .route("/universities/passes", get(get_my_university_passes))
         .route("/universities/passes", post(purchase_university_pass))
+        // Student Global Search (LinkedIn-style)
+        .route("/search/students", get(search_students))
+        .route("/search/unified", get(unified_search))
+        .route("/search/students/suggestions", get(student_search_suggestions))
+        .route("/search/students/profile/{user_id}", get(view_student_profile))
+        .route("/search/students/{user_id}/like", post(like_student_from_search))
+        .route("/search/students/{user_id}/message", post(direct_message_from_search))
+        // Unified Profile (works from discover, reels, search)
+        .route("/profile/{user_id}", get(get_user_profile))
         // Calls
         .route("/calls", post(create_call))
         // Spots
@@ -825,6 +849,9 @@ async fn main() {
         .route("/reels/message/read", post(mark_reel_message_read))
         .route("/reels/conversation", get(get_reel_conversation))
         .route("/reels/patterns", get(get_my_learned_patterns))
+        .route("/reels/{reel_id}/like-creator", post(like_reel_creator))
+        .route("/reels/match-request", post(request_reel_match))
+        .route("/reels/match-accept", post(accept_reel_match))
         // LLM Labeling System
         .route("/llm/queue", post(queue_reel_labeling))
         .route("/llm/batch", get(get_labeling_batch))

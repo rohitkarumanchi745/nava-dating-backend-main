@@ -910,11 +910,9 @@ pub async fn profile_me(
         "subscriptions": subscriptions.into_iter().map(|sub| json!({
             "id": sub.id,
             "subscription_type": sub.subscription_type,
-            "pass_type": sub.pass_type,
             "start_date": sub.start_date.map(format_datetime),
             "end_date": sub.end_date.map(format_datetime),
             "status": sub.status,
-            "is_active": sub.is_active,
         })).collect::<Vec<Value>>(),
         "spots": spots.into_iter().map(|spot| json!({
             "id": spot.id,
@@ -1077,6 +1075,21 @@ pub async fn discover(
         }
     };
 
+    // Fetch who has super-liked this user (among candidates)
+    let super_likers: std::collections::HashSet<i32> = sqlx::query_scalar::<_, i64>(
+        "SELECT from_user_id FROM swipes WHERE to_user_id = $1 AND action = 'superlike'"
+    )
+    .bind(user_id as i64)
+    .fetch_all(read_db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|id| id as i32)
+    .collect();
+
+    // Batch-lookup university info for all candidates
+    let uni_map = batch_lookup_university(read_db, &candidates.iter().map(|c| c.id).collect::<Vec<_>>()).await?;
+
     let mut profiles: Vec<DiscoverProfile> = candidates
         .into_iter()
         .map(|c| {
@@ -1090,6 +1103,7 @@ pub async fn discover(
 
             let photos = get_photos_from_row(&c);
             let ml_score = score_map.get(&c.id).copied();
+            let uni_info = uni_map.get(&c.id);
             DiscoverProfile {
                 id: c.id,
                 name: c.name,
@@ -1105,6 +1119,10 @@ pub async fn discover(
                 distance_text: distance_km.map(format_distance),
                 city: c.city,
                 compatibility_score: ml_score.or(c.attractiveness_score),
+                university: uni_info.map(|(name, _)| name.clone()),
+                university_tier: uni_info.map(|(_, tier)| format_tier(tier)),
+                interaction_status: None,
+                super_liked_you: None, // populated below
             }
         })
         .filter(|p| {
@@ -1117,7 +1135,14 @@ pub async fn discover(
         })
         .collect();
 
-    // Sort by ML score (descending)
+    // Tag profiles that have super-liked this user
+    for profile in &mut profiles {
+        if super_likers.contains(&profile.id) {
+            profile.super_liked_you = Some(true);
+        }
+    }
+
+    // Sort by ML score (descending) — super-likers already boosted by ML
     profiles.sort_by(|a, b| {
         b.compatibility_score
             .unwrap_or(0.0)
@@ -1252,6 +1277,195 @@ pub async fn like_user(
     })))
 }
 
+/// Super Like — premium action that notifies the target and stands out.
+/// Deducts from user's super_like consumable balance (or checks subscription tier).
+pub async fn super_like_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<LikeRequest>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let target_id = payload.target_user_id;
+    state.metrics.inc_swipe_writes();
+
+    if user_id == target_id {
+        return Err(AppError::bad_request("Cannot super like yourself"));
+    }
+
+    // Check if target exists
+    let target_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND is_active = TRUE)",
+    )
+    .bind(target_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    if !target_exists {
+        return Err(AppError::not_found("User not found"));
+    }
+
+    // --- Check & deduct super like balance ---
+    // 1. Check if user has unlimited super likes (Platinum subscription)
+    let has_unlimited = sqlx::query_scalar::<_, bool>(r#"
+        SELECT EXISTS(
+            SELECT 1 FROM user_subscriptions us
+            JOIN products p ON us.product_id = p.id
+            WHERE us.user_id = $1 AND us.status = 'active'
+            AND p.features::text LIKE '%unlimited_super_likes%'
+        )
+    "#)
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(false);
+
+    if !has_unlimited {
+        // 2. Check consumable balance
+        let balance = sqlx::query_scalar::<_, i32>(
+            "SELECT COALESCE(balance, 0) FROM user_consumables WHERE user_id = $1 AND consumable_type = 'super_like'"
+        )
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await?
+        .unwrap_or(0);
+
+        // 3. Check daily allocation from Gold subscription (5 daily)
+        let has_daily = sqlx::query_scalar::<_, bool>(r#"
+            SELECT EXISTS(
+                SELECT 1 FROM user_subscriptions us
+                JOIN products p ON us.product_id = p.id
+                WHERE us.user_id = $1 AND us.status = 'active'
+                AND p.features::text LIKE '%5_super_likes_daily%'
+            )
+        "#)
+        .bind(user_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(false);
+
+        if has_daily {
+            // Count super likes used today
+            let used_today = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM swipes WHERE from_user_id = $1 AND action = 'superlike' AND created_at >= CURRENT_DATE"
+            )
+            .bind(user_id as i64)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(0);
+
+            if used_today >= 5 && balance <= 0 {
+                return Err(AppError::bad_request("Daily super like limit reached (5/day). Purchase more or upgrade to Platinum."));
+            }
+            // If daily allocation available, no deduction needed from consumables
+            if used_today < 5 {
+                // Using daily allocation — no balance deduction
+            } else {
+                // Daily used up, deduct from purchased balance
+                sqlx::query("UPDATE user_consumables SET balance = balance - 1, total_used = total_used + 1, updated_at = NOW() WHERE user_id = $1 AND consumable_type = 'super_like'")
+                    .bind(user_id)
+                    .execute(&state.db)
+                    .await?;
+            }
+        } else if balance > 0 {
+            // Free/no subscription — deduct from purchased balance
+            sqlx::query("UPDATE user_consumables SET balance = balance - 1, total_used = total_used + 1, updated_at = NOW() WHERE user_id = $1 AND consumable_type = 'super_like'")
+                .bind(user_id)
+                .execute(&state.db)
+                .await?;
+        } else {
+            return Err(AppError::bad_request("No super likes remaining. Purchase a super like pack or subscribe to Gold/Platinum."));
+        }
+    }
+
+    // --- Record the super like swipe ---
+    sqlx::query(
+        "INSERT INTO swipes (from_user_id, to_user_id, action, source) VALUES ($1, $2, 'superlike', 'discover') ON CONFLICT (from_user_id, to_user_id) DO UPDATE SET action = 'superlike', created_at = NOW()"
+    )
+    .bind(user_id as i64)
+    .bind(target_id as i64)
+    .execute(&state.db)
+    .await?;
+
+    // --- Create/update match record (same as like_user) ---
+    let (user1_id, user2_id, is_user1) = if user_id < target_id {
+        (user_id, target_id, true)
+    } else {
+        (target_id, user_id, false)
+    };
+
+    let existing = sqlx::query_as::<_, MatchCheckRow>(
+        "SELECT id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match FROM matches WHERE user1_id = $1 AND user2_id = $2",
+    )
+    .bind(user1_id)
+    .bind(user2_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (match_id, is_mutual) = match existing {
+        Some(m) => {
+            let other_liked = if is_user1 { m.user2_liked } else { m.user1_liked };
+            let is_mutual = other_liked.unwrap_or(false);
+
+            let query = if is_user1 {
+                "UPDATE matches SET user1_liked = TRUE, is_mutual_match = $1, updated_at = NOW() WHERE id = $2"
+            } else {
+                "UPDATE matches SET user2_liked = TRUE, is_mutual_match = $1, updated_at = NOW() WHERE id = $2"
+            };
+
+            sqlx::query(query)
+                .bind(is_mutual)
+                .bind(&m.id)
+                .execute(&state.db)
+                .await?;
+
+            (m.id, is_mutual)
+        }
+        None => {
+            let new_id = Uuid::new_v4().to_string();
+            let (u1_liked, u2_liked) = if is_user1 { (true, false) } else { (false, true) };
+
+            sqlx::query(
+                r#"INSERT INTO matches (id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match, status, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, FALSE, 'active', NOW(), NOW())"#,
+            )
+            .bind(&new_id)
+            .bind(user1_id)
+            .bind(user2_id)
+            .bind(u1_liked)
+            .bind(u2_liked)
+            .execute(&state.db)
+            .await?;
+
+            (new_id, false)
+        }
+    };
+
+    // Log interaction
+    let _ = log_interaction_event(&state.db, user_id, target_id, "superlike", None, None, Some("discover")).await;
+
+    // Publish event (fires notification to target)
+    state.event_bus.publish("swipe_handler", crate::modules::events::DomainEvent::SwipeSuperLike {
+        user_id,
+        target_user_id: target_id,
+    });
+
+    // Feed RL agent with 3× weighted super-like signal
+    let ml = state.ml.clone();
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        let mut ml = ml.write().await;
+        ml.record_swipe_weighted(&db, user_id, target_id, true, true).await;
+    });
+
+    Ok(Json(json!({
+        "message": if is_mutual { "It's a match! (Super Like)" } else { "Super Like sent!" },
+        "match_id": match_id,
+        "is_mutual": is_mutual,
+        "is_super_like": true,
+    })))
+}
+
 pub async fn pass_user(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1372,6 +1586,10 @@ pub async fn get_match(
     // Get photos before moving other fields
     let photos = get_user_photos(&other_user);
 
+    // Lookup university info for matched user
+    let uni_map = batch_lookup_university(&state.db, &[other_id]).await?;
+    let uni_info = uni_map.get(&other_id);
+
     let profile = DiscoverProfile {
         id: other_user.id,
         name: other_user.name,
@@ -1387,6 +1605,10 @@ pub async fn get_match(
         distance_text: distance_km.map(format_distance),
         city: other_location.and_then(|l| l.city),
         compatibility_score: m.ai_compatibility_score,
+        university: uni_info.map(|(name, _)| name.clone()),
+        university_tier: uni_info.map(|(_, tier)| format_tier(tier)),
+        interaction_status: Some("matched".to_string()),
+        super_liked_you: None,
     };
 
     let detail = MatchDetail {
@@ -1625,7 +1847,7 @@ pub async fn get_nearby(
     let active_pass = get_active_pass(&state.db, user_id).await?;
     let pass_type = active_pass
         .as_ref()
-        .and_then(|p| p.pass_type.as_ref())
+        .and_then(|p| p.subscription_type.as_ref())
         .map(|s| PassType::from_str(s))
         .unwrap_or(PassType::Free);
 
@@ -2233,7 +2455,7 @@ pub async fn verify_student_otp(
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
 
     // Find pending verification for this user and email
-    let verification = sqlx::query_as::<_, (i64, String, String, String)>(
+    let verification = sqlx::query_as::<_, (i32, String, String, String)>(
         r#"
         SELECT id, verification_code, discount_tier, university_name
         FROM student_verifications
@@ -2275,7 +2497,7 @@ pub async fn verify_student_otp(
         UPDATE student_verifications
         SET status = 'approved', verified_at = NOW(),
             university_id = NULLIF($2, 0),
-            country_code = NULLIF($3, '')
+            university_country_code = NULLIF($3, '')
         WHERE id = $1
         "#,
     )
@@ -3086,10 +3308,9 @@ async fn get_active_pass(
 ) -> Result<Option<UserSubscriptionRow>, sqlx::Error> {
     sqlx::query_as::<_, UserSubscriptionRow>(
         r#"
-        SELECT id, subscription_type, pass_type, start_date, end_date, status, is_active
+        SELECT id, subscription_type, start_date, end_date, status
         FROM user_subscriptions
         WHERE user_id = $1
-          AND is_active = TRUE
           AND status = 'active'
           AND (end_date IS NULL OR end_date > NOW())
         ORDER BY end_date DESC NULLS FIRST
@@ -3366,8 +3587,9 @@ fn format_fuzzy_distance(km: f64) -> String {
 }
 
 fn determine_university_tier(domain: &str, name: Option<&str>) -> (String, StudentTier) {
-    // Top private universities (Ivy League, etc.)
+    // ── Top Private (Ivy League + Global Elite Private) ─────────────────
     let top_private = [
+        // US — Ivy League & Elite Private
         ("harvard.edu", "Harvard University"),
         ("stanford.edu", "Stanford University"),
         ("mit.edu", "MIT"),
@@ -3378,10 +3600,179 @@ fn determine_university_tier(domain: &str, name: Option<&str>) -> (String, Stude
         ("brown.edu", "Brown University"),
         ("dartmouth.edu", "Dartmouth College"),
         ("cornell.edu", "Cornell University"),
+        ("caltech.edu", "Caltech"),
+        ("uchicago.edu", "University of Chicago"),
+        ("duke.edu", "Duke University"),
+        ("northwestern.edu", "Northwestern University"),
+        ("jhu.edu", "Johns Hopkins University"),
+        ("rice.edu", "Rice University"),
+        ("vanderbilt.edu", "Vanderbilt University"),
+        ("wustl.edu", "Washington University in St. Louis"),
+        ("nd.edu", "University of Notre Dame"),
+        ("cmu.edu", "Carnegie Mellon University"),
+        ("emory.edu", "Emory University"),
+        ("georgetown.edu", "Georgetown University"),
+        ("nyu.edu", "New York University"),
+        ("usc.edu", "University of Southern California"),
+        // India — IITs (Indian Institutes of Technology)
+        ("iitb.ac.in", "IIT Bombay"),
+        ("iitd.ac.in", "IIT Delhi"),
+        ("iitm.ac.in", "IIT Madras"),
+        ("iitkgp.ac.in", "IIT Kharagpur"),
+        ("iitk.ac.in", "IIT Kanpur"),
+        ("iitr.ac.in", "IIT Roorkee"),
+        ("iitg.ac.in", "IIT Guwahati"),
+        ("iith.ac.in", "IIT Hyderabad"),
+        ("iitbbs.ac.in", "IIT Bhubaneswar"),
+        ("iitgn.ac.in", "IIT Gandhinagar"),
+        ("iiti.ac.in", "IIT Indore"),
+        ("iitj.ac.in", "IIT Jodhpur"),
+        ("iitp.ac.in", "IIT Patna"),
+        ("iitrpr.ac.in", "IIT Ropar"),
+        ("iitmandi.ac.in", "IIT Mandi"),
+        ("iitbhilai.ac.in", "IIT Bhilai"),
+        ("iitgoa.ac.in", "IIT Goa"),
+        ("iitjammu.ac.in", "IIT Jammu"),
+        ("iitdh.ac.in", "IIT Dharwad"),
+        ("iitpkd.ac.in", "IIT Palakkad"),
+        ("iittirupati.ac.in", "IIT Tirupati"),
+        ("iitism.ac.in", "IIT (ISM) Dhanbad"),
+        // India — IIMs (Indian Institutes of Management)
+        ("iima.ac.in", "IIM Ahmedabad"),
+        ("iimb.ac.in", "IIM Bangalore"),
+        ("iimc.ac.in", "IIM Calcutta"),
+        ("iiml.ac.in", "IIM Lucknow"),
+        ("iimk.ac.in", "IIM Kozhikode"),
+        ("iimi.ac.in", "IIM Indore"),
+        ("iimshillong.ac.in", "IIM Shillong"),
+        ("iimranchi.ac.in", "IIM Ranchi"),
+        ("iimrohtak.ac.in", "IIM Rohtak"),
+        ("iimkashipur.ac.in", "IIM Kashipur"),
+        ("iimtrichy.ac.in", "IIM Tiruchirappalli"),
+        ("iimu.ac.in", "IIM Udaipur"),
+        ("iimnagpur.ac.in", "IIM Nagpur"),
+        ("iimbg.ac.in", "IIM Bodh Gaya"),
+        ("iimamritsar.ac.in", "IIM Amritsar"),
+        ("iimj.ac.in", "IIM Jammu"),
+        // India — BITS, ISB, IISC
+        ("bits-pilani.ac.in", "BITS Pilani"),
+        ("pilani.bits-pilani.ac.in", "BITS Pilani"),
+        ("goa.bits-pilani.ac.in", "BITS Pilani Goa"),
+        ("hyderabad.bits-pilani.ac.in", "BITS Pilani Hyderabad"),
+        ("isb.edu", "Indian School of Business"),
+        ("iisc.ac.in", "Indian Institute of Science"),
+        // India — NITs (top ones)
+        ("nitk.ac.in", "NIT Karnataka (Surathkal)"),
+        ("nitw.ac.in", "NIT Warangal"),
+        ("nitt.edu", "NIT Tiruchirappalli"),
+        ("nitc.ac.in", "NIT Calicut"),
+        ("svnit.ac.in", "NIT Surat"),
+        ("mnnit.ac.in", "MNNIT Allahabad"),
+        ("vnit.ac.in", "VNIT Nagpur"),
+        ("manit.ac.in", "MANIT Bhopal"),
+        ("nitdgp.ac.in", "NIT Durgapur"),
+        ("nitr.ac.in", "NIT Rourkela"),
+        // India — Top Private
+        ("vit.ac.in", "VIT Vellore"),
+        ("srmist.edu.in", "SRM University"),
+        ("manipal.edu", "Manipal University"),
+        ("amity.edu", "Amity University"),
+        ("lpu.in", "Lovely Professional University"),
+        ("christuniversity.in", "Christ University"),
+        ("flame.edu.in", "FLAME University"),
+        ("ashoka.edu.in", "Ashoka University"),
+        ("jgu.edu.in", "Jindal Global University"),
+        ("shiv-nadar.org", "Shiv Nadar University"),
+        ("plaksha.edu.in", "Plaksha University"),
+        // India — Central & State Universities
+        ("du.ac.in", "Delhi University"),
+        ("jnu.ac.in", "Jawaharlal Nehru University"),
+        ("bhu.ac.in", "Banaras Hindu University"),
+        ("amu.ac.in", "Aligarh Muslim University"),
+        ("uohyd.ac.in", "University of Hyderabad"),
+        ("jadavpur.edu", "Jadavpur University"),
+        ("annauniv.edu", "Anna University"),
+        ("ipu.ac.in", "IP University Delhi"),
+        ("mu.ac.in", "Mumbai University"),
+        ("unipune.ac.in", "Savitribai Phule Pune University"),
+        ("bangaloreuniversity.ac.in", "Bangalore University"),
+        ("osmania.ac.in", "Osmania University"),
+        // India — Medical
+        ("aiims.edu", "AIIMS New Delhi"),
+        ("aiimsrishikesh.edu.in", "AIIMS Rishikesh"),
+        ("jipmer.edu.in", "JIPMER Puducherry"),
+        ("cmc-vellore.edu", "CMC Vellore"),
+        // India — Law
+        ("nls.ac.in", "National Law School Bangalore"),
+        ("nalsar.ac.in", "NALSAR Hyderabad"),
+        ("nujs.edu", "NUJS Kolkata"),
+        ("nludelhi.ac.in", "NLU Delhi"),
+        ("gnlu.ac.in", "GNLU Gujarat"),
+        // India — Design & Architecture
+        ("nid.edu", "National Institute of Design"),
+        ("nift.ac.in", "NIFT"),
+        ("spa.ac.in", "School of Planning & Architecture"),
+        // UK — Russell Group & Elite
+        ("ox.ac.uk", "University of Oxford"),
+        ("cam.ac.uk", "University of Cambridge"),
+        ("imperial.ac.uk", "Imperial College London"),
+        ("lse.ac.uk", "London School of Economics"),
+        ("ucl.ac.uk", "University College London"),
+        ("kcl.ac.uk", "King's College London"),
+        ("ed.ac.uk", "University of Edinburgh"),
+        ("manchester.ac.uk", "University of Manchester"),
+        ("warwick.ac.uk", "University of Warwick"),
+        ("bristol.ac.uk", "University of Bristol"),
+        ("st-andrews.ac.uk", "University of St Andrews"),
+        ("dur.ac.uk", "Durham University"),
+        ("bath.ac.uk", "University of Bath"),
+        ("lboro.ac.uk", "Loughborough University"),
+        // Canada
+        ("utoronto.ca", "University of Toronto"),
+        ("ubc.ca", "University of British Columbia"),
+        ("mcgill.ca", "McGill University"),
+        ("uwaterloo.ca", "University of Waterloo"),
+        ("ualberta.ca", "University of Alberta"),
+        ("queensu.ca", "Queen's University"),
+        ("wlu.ca", "Wilfrid Laurier University"),
+        // Australia — Group of Eight
+        ("unimelb.edu.au", "University of Melbourne"),
+        ("sydney.edu.au", "University of Sydney"),
+        ("unsw.edu.au", "UNSW Sydney"),
+        ("anu.edu.au", "Australian National University"),
+        ("uq.edu.au", "University of Queensland"),
+        ("monash.edu", "Monash University"),
+        // Singapore
+        ("nus.edu.sg", "National University of Singapore"),
+        ("ntu.edu.sg", "Nanyang Technological University"),
+        ("smu.edu.sg", "Singapore Management University"),
+        // Europe
+        ("ethz.ch", "ETH Zurich"),
+        ("epfl.ch", "EPFL"),
+        ("tum.de", "Technical University of Munich"),
+        ("lmu.de", "LMU Munich"),
+        ("sorbonne-universite.fr", "Sorbonne University"),
+        ("polytechnique.fr", "École Polytechnique"),
+        ("uva.nl", "University of Amsterdam"),
+        ("tudelft.nl", "TU Delft"),
+        // Middle East & Africa
+        ("kaust.edu.sa", "KAUST"),
+        ("aud.edu", "American University Dubai"),
+        ("uct.ac.za", "University of Cape Town"),
+        // East Asia
+        ("u-tokyo.ac.jp", "University of Tokyo"),
+        ("kyoto-u.ac.jp", "Kyoto University"),
+        ("snu.ac.kr", "Seoul National University"),
+        ("kaist.ac.kr", "KAIST"),
+        ("tsinghua.edu.cn", "Tsinghua University"),
+        ("pku.edu.cn", "Peking University"),
+        ("hku.hk", "University of Hong Kong"),
+        ("cuhk.edu.hk", "Chinese University of Hong Kong"),
     ];
 
-    // Top public universities
+    // ── Top Public Universities ────────────────────────────────────────
     let top_public = [
+        // US
         ("berkeley.edu", "UC Berkeley"),
         ("ucla.edu", "UCLA"),
         ("umich.edu", "University of Michigan"),
@@ -3402,6 +3793,19 @@ fn determine_university_tier(domain: &str, name: Option<&str>) -> (String, Stude
         ("umn.edu", "University of Minnesota"),
         ("ufl.edu", "University of Florida"),
         ("tamu.edu", "Texas A&M University"),
+        ("ucdavis.edu", "UC Davis"),
+        ("ucsd.edu", "UC San Diego"),
+        ("ucsb.edu", "UC Santa Barbara"),
+        ("uci.edu", "UC Irvine"),
+        ("asu.edu", "Arizona State University"),
+        ("rutgers.edu", "Rutgers University"),
+        ("indiana.edu", "Indiana University"),
+        ("uga.edu", "University of Georgia"),
+        ("ncsu.edu", "NC State University"),
+        ("vt.edu", "Virginia Tech"),
+        ("colorado.edu", "University of Colorado Boulder"),
+        ("iowa.edu", "University of Iowa"),
+        ("msu.edu", "Michigan State University"),
     ];
 
     for (d, n) in &top_private {
@@ -3416,12 +3820,71 @@ fn determine_university_tier(domain: &str, name: Option<&str>) -> (String, Stude
         }
     }
 
-    // Check for .edu domain as regular student
-    if domain.ends_with(".edu") {
-        let uni_name = name
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("University ({})", domain));
-        return (uni_name, StudentTier::Regular);
+    // Also check against the universities table in DB (handled at verification time)
+    // The hardcoded lists above are for instant tier classification without DB hit
+
+    // Recognized educational domains (global)
+    let edu_domains = [
+        ".edu",        // US standard
+        ".ac.in",      // India
+        ".edu.in",     // India
+        ".res.in",     // India research institutes
+        ".ac.uk",      // UK
+        ".edu.au",     // Australia
+        ".ac.nz",      // New Zealand
+        ".edu.sg",     // Singapore
+        ".edu.my",     // Malaysia
+        ".ac.jp",      // Japan
+        ".ac.kr",      // South Korea
+        ".edu.cn",     // China
+        ".edu.hk",     // Hong Kong
+        ".edu.tw",     // Taiwan
+        ".ac.za",      // South Africa
+        ".edu.ng",     // Nigeria
+        ".edu.eg",     // Egypt
+        ".edu.sa",     // Saudi Arabia
+        ".ac.ae",      // UAE
+        ".edu.pk",     // Pakistan
+        ".edu.bd",     // Bangladesh
+        ".edu.lk",     // Sri Lanka
+        ".edu.np",     // Nepal
+        ".ac.th",      // Thailand
+        ".edu.ph",     // Philippines
+        ".edu.vn",     // Vietnam
+        ".ac.id",      // Indonesia
+        ".edu.br",     // Brazil
+        ".edu.mx",     // Mexico
+        ".edu.co",     // Colombia
+        ".edu.ar",     // Argentina
+        ".edu.pe",     // Peru
+        ".edu.cl",     // Chile
+        ".ac.il",      // Israel
+        ".edu.tr",     // Turkey
+        ".edu.ru",     // Russia
+        ".edu.pl",     // Poland
+        ".ac.be",      // Belgium
+        ".edu.es",     // Spain
+        ".edu.it",     // Italy
+    ];
+
+    for edu_domain in &edu_domains {
+        if domain.ends_with(edu_domain) {
+            let uni_name = name
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("University ({})", domain));
+            return (uni_name, StudentTier::Regular);
+        }
+    }
+
+    // European universities often use custom TLDs — check common patterns
+    let eu_patterns = [".uni-", ".tu-", ".rwth-", ".kit.", ".fu-berlin", ".hu-berlin"];
+    for pattern in &eu_patterns {
+        if domain.contains(pattern) && (domain.ends_with(".de") || domain.ends_with(".at") || domain.ends_with(".ch")) {
+            let uni_name = name
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("University ({})", domain));
+            return (uni_name, StudentTier::Regular);
+        }
     }
 
     (String::new(), StudentTier::None)
@@ -3988,11 +4451,43 @@ pub async fn get_reel_feed(
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
 
-    let limit: i32 = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(20);
+    // Feed controls
+    // limit: 5-50, default 10 (initial), 15 (prefetch)
+    // prefetch: true when loading next batch while user is still scrolling
+    // session_id: carry across prefetches to group analytics
+    let is_prefetch = params.get("prefetch").map(|v| v == "true" || v == "1").unwrap_or(false);
+    let default_limit = if is_prefetch { 15 } else { 10 };
+    let limit: i32 = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(default_limit).clamp(5, 50);
     let session_id = params.get("session_id").cloned().unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    #[derive(sqlx::FromRow, Serialize)]
-    struct ReelFeedItem {
+    let read_db = state.read_pool();
+
+    // ── Step 1: Load user preference signals ──
+    let category_prefs: std::collections::HashMap<String, f64> = sqlx::query_as::<_, (Option<Value>,)>(
+        "SELECT preferred_categories FROM user_content_preferences WHERE user_id = $1"
+    )
+    .bind(user_id)
+    .fetch_optional(read_db)
+    .await?
+    .and_then(|(v,)| v)
+    .and_then(|v| v.as_object().map(|obj| {
+        obj.iter().filter_map(|(k, v)| v.as_f64().map(|score| (k.clone(), score))).collect()
+    }))
+    .unwrap_or_default();
+
+    let exploration_rate: f64 = sqlx::query_scalar::<_, f64>(
+        "SELECT COALESCE(reel_exploration_rate, 0.3) FROM user_interaction_model WHERE user_id = $1"
+    )
+    .bind(user_id as i64)
+    .fetch_optional(read_db)
+    .await?
+    .unwrap_or(0.3); // New users get 30% exploration
+
+    // ── Step 2: Candidate generation — 5x limit, exclude seen reels ──
+    let candidate_pool = (limit * 5).min(200);
+
+    #[derive(sqlx::FromRow)]
+    struct ReelCandidate {
         id: i64,
         user_id: i32,
         video_url: String,
@@ -4002,37 +4497,184 @@ pub async fn get_reel_feed(
         tags: Option<Value>,
         category: Option<String>,
         engagement_score: Option<f64>,
+        avg_watch_percent: Option<f64>,
         view_count: Option<i32>,
         like_count: Option<i32>,
         created_at: Option<NaiveDateTime>,
         creator_name: Option<String>,
         creator_photo: Option<String>,
         creator_verified: Option<bool>,
+        creator_attractiveness: Option<f64>,
     }
 
-    let reels = sqlx::query_as::<_, ReelFeedItem>(
+    let candidates = sqlx::query_as::<_, ReelCandidate>(
         r#"
-        SELECT r.id, r.user_id, r.video_url, r.thumbnail_url, r.duration_sec, r.caption,
-               r.tags, r.category, r.engagement_score, r.view_count, r.like_count, r.created_at,
-               u.name as creator_name, u.profile_photo_1 as creator_photo, u.is_verified as creator_verified
+        SELECT r.id, r.user_id::int4 as user_id, r.video_url, r.thumbnail_url, r.duration_sec,
+               r.caption, r.tags, r.category, r.engagement_score, r.avg_watch_percent,
+               r.view_count, r.like_count, r.created_at,
+               u.name as creator_name, u.profile_photo_1 as creator_photo,
+               u.is_verified as creator_verified, u.attractiveness_score as creator_attractiveness
         FROM reels r
         JOIN users u ON u.id = r.user_id
-        WHERE r.is_active = TRUE AND r.user_id != $1
+        WHERE r.is_active = TRUE
+          AND r.user_id != $1
+          AND NOT EXISTS (
+              SELECT 1 FROM reel_views rv
+              WHERE rv.reel_id = r.id AND rv.viewer_id = $1
+          )
           AND NOT EXISTS (
               SELECT 1 FROM matches m
               WHERE ((m.user1_id = $1 AND m.user2_id = r.user_id) OR (m.user2_id = $1 AND m.user1_id = r.user_id))
               AND m.status = 'blocked'
           )
-        ORDER BY r.engagement_score DESC NULLS LAST, r.created_at DESC
+        ORDER BY r.created_at DESC
         LIMIT $2
         "#,
     )
-    .bind(user_id)
-    .bind(limit)
-    .fetch_all(state.read_pool())
+    .bind(user_id as i64)
+    .bind(candidate_pool)
+    .fetch_all(read_db)
     .await?;
 
-    Ok(Json(json!({ "reels": reels, "session_id": session_id, "count": reels.len() })))
+    // ── Step 3: Personalized scoring ──
+    let now = chrono::Utc::now().naive_utc();
+    let mut rng_seed = (user_id as u64).wrapping_mul(now.and_utc().timestamp() as u64);
+
+    let mut scored: Vec<(f64, usize)> = candidates.iter().enumerate().map(|(idx, r)| {
+        // ── Category affinity (35%) ──
+        let cat_score = r.category.as_ref()
+            .and_then(|c| category_prefs.get(c))
+            .copied()
+            .unwrap_or(0.0)
+            .min(1.0);
+
+        // ── Engagement quality (20%) — normalized watch% + like rate ──
+        let watch_quality = r.avg_watch_percent.unwrap_or(0.0) / 100.0;
+        let like_rate = if r.view_count.unwrap_or(0) > 0 {
+            (r.like_count.unwrap_or(0) as f64) / (r.view_count.unwrap_or(1) as f64)
+        } else {
+            0.0
+        };
+        let engagement = (watch_quality * 0.6 + like_rate.min(1.0) * 0.4).min(1.0);
+
+        // ── Freshness (15%) — exponential decay, half-life = 24h ──
+        let age_hours = r.created_at
+            .map(|t| (now - t).num_hours() as f64)
+            .unwrap_or(168.0); // Default 7 days old
+        let freshness = (-0.693 * age_hours / 24.0).exp(); // ln(2)/24h
+
+        // ── Creator compatibility (15%) ──
+        let attractiveness = r.creator_attractiveness.unwrap_or(0.0).min(1.0);
+        let creator_score = attractiveness;
+
+        // ── Exploration (5%) — pseudo-random for diversity ──
+        rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let random_val = (rng_seed >> 33) as f64 / (u32::MAX as f64);
+        let explore = if random_val < exploration_rate { 0.5 + random_val } else { 0.0 };
+
+        // ── Weighted combination ──
+        let score = cat_score * 0.35
+            + engagement * 0.20
+            + freshness * 0.15
+            + creator_score * 0.15
+            + explore * 0.05
+            + random_val * 0.10; // 10% noise for diversity
+
+        (score, idx)
+    }).collect();
+
+    // Sort by personalized score descending
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // ── Step 4: Diversity filter — max 2 reels per creator in final feed ──
+    let mut creator_counts: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    let mut category_streak = 0u32;
+    let mut last_category: Option<String> = None;
+    let mut final_indices: Vec<usize> = Vec::with_capacity(limit as usize);
+
+    for (_, idx) in &scored {
+        if final_indices.len() >= limit as usize { break; }
+        let r = &candidates[*idx];
+
+        // Max 2 reels per creator
+        let count = creator_counts.entry(r.user_id).or_insert(0);
+        if *count >= 2 { continue; }
+
+        // Max 3 consecutive same-category reels
+        if let Some(ref cat) = r.category {
+            if last_category.as_ref() == Some(cat) {
+                category_streak += 1;
+                if category_streak >= 3 { continue; }
+            } else {
+                category_streak = 0;
+                last_category = Some(cat.clone());
+            }
+        }
+
+        *count += 1;
+        final_indices.push(*idx);
+    }
+
+    // ── Step 5: Build response with university + interaction data ──
+    let final_candidates: Vec<&ReelCandidate> = final_indices.iter().map(|i| &candidates[*i]).collect();
+    let creator_ids: Vec<i32> = final_candidates.iter().map(|r| r.user_id).collect();
+    let uni_map = batch_lookup_university(read_db, &creator_ids).await?;
+    let interaction_map = batch_lookup_interactions(read_db, user_id, &creator_ids).await?;
+
+    let reels: Vec<Value> = final_indices.iter().zip(scored.iter()).map(|(idx, (score, _))| {
+        let r = &candidates[*idx];
+        let uni_info = uni_map.get(&r.user_id);
+        let interaction = interaction_map.get(&r.user_id).cloned().unwrap_or_else(|| "none".to_string());
+        json!({
+            "id": r.id,
+            "user_id": r.user_id,
+            "video_url": r.video_url,
+            "thumbnail_url": r.thumbnail_url,
+            "duration_sec": r.duration_sec,
+            "caption": r.caption,
+            "tags": r.tags,
+            "category": r.category,
+            "engagement_score": r.engagement_score,
+            "view_count": r.view_count,
+            "like_count": r.like_count,
+            "created_at": r.created_at,
+            "creator_name": r.creator_name,
+            "creator_photo": r.creator_photo,
+            "creator_verified": r.creator_verified,
+            "creator_university": uni_info.map(|(name, _)| name.clone()),
+            "creator_university_tier": uni_info.map(|(_, tier)| format_tier(tier)),
+            "interaction_status": interaction,
+            "can_like": interaction == "none",
+            "personalization_score": (score * 100.0).round() / 100.0
+        })
+    }).collect();
+
+    // ── Step 6: Decay exploration rate as user watches more ──
+    // (async fire-and-forget — don't block the response)
+    let db_clone = state.db.clone();
+    let uid = user_id;
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            r#"UPDATE user_interaction_model
+               SET reel_exploration_rate = GREATEST(0.05, reel_exploration_rate * 0.995),
+                   total_reel_interactions = total_reel_interactions + 1,
+                   updated_at = NOW()
+               WHERE user_id = $1"#
+        ).bind(uid as i64).execute(&db_clone).await;
+    });
+
+    // has_more = we had more candidates than we returned
+    let has_more = candidates.len() > final_indices.len();
+
+    Ok(Json(json!({
+        "reels": reels,
+        "session_id": session_id,
+        "count": reels.len(),
+        "has_more": has_more,
+        "prefetch_at": (reels.len() as f64 * 0.7).ceil() as usize,
+        "algorithm": "personalized_v1",
+        "exploration_rate": (exploration_rate * 100.0).round() / 100.0
+    })))
 }
 
 /// Track reel view - ML learns interest patterns
@@ -4058,11 +4700,12 @@ pub async fn track_reel_view(
 
     let session_id = payload.session_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    let reel_owner = sqlx::query_scalar::<_, i32>("SELECT user_id FROM reels WHERE id = $1")
+    let reel_owner_i64 = sqlx::query_scalar::<_, i64>("SELECT user_id FROM reels WHERE id = $1")
         .bind(payload.reel_id)
         .fetch_optional(&state.db)
         .await?
         .ok_or_else(|| AppError::not_found("Reel not found"))?;
+    let reel_owner = reel_owner_i64 as i32;
 
     // Interest score: watch%, duration, rewatch, scroll speed
     let interest_score = calc_interest_score(payload.watch_percent, payload.watch_duration_sec, payload.rewatched.unwrap_or(false), payload.scroll_velocity);
@@ -4112,8 +4755,8 @@ pub async fn like_reel(
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
 
-    let reel_owner = sqlx::query_scalar::<_, i32>("SELECT user_id FROM reels WHERE id = $1")
-        .bind(payload.reel_id).fetch_optional(&state.db).await?.ok_or_else(|| AppError::not_found("Reel not found"))?;
+    let reel_owner = sqlx::query_scalar::<_, i64>("SELECT user_id FROM reels WHERE id = $1")
+        .bind(payload.reel_id).fetch_optional(&state.db).await?.ok_or_else(|| AppError::not_found("Reel not found"))? as i32;
 
     if reel_owner == user_id { return Err(AppError::bad_request("Cannot like your own reel")); }
 
@@ -4163,8 +4806,9 @@ pub async fn send_reel_message(
     let token = extract_bearer_token(&headers)?;
     let sender_id = decode_access_token(&token, &state.config.secret_key)?;
 
-    let receiver_id = sqlx::query_scalar::<_, i32>("SELECT user_id FROM reels WHERE id = $1")
+    let receiver_id_i64 = sqlx::query_scalar::<_, i64>("SELECT user_id FROM reels WHERE id = $1")
         .bind(payload.reel_id).fetch_optional(&state.db).await?.ok_or_else(|| AppError::not_found("Reel not found"))?;
+    let receiver_id = receiver_id_i64 as i32;
 
     if receiver_id == sender_id { return Err(AppError::bad_request("Cannot message yourself")); }
 
@@ -4172,7 +4816,7 @@ pub async fn send_reel_message(
     let effort_score = calc_message_effort(&payload.content, payload.reaction_emoji.is_some());
     let msg_type = payload.message_type.as_deref().unwrap_or("text");
 
-    let message_id = sqlx::query_scalar::<_, i32>(
+    let message_id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO reel_messages (reel_id, sender_id, receiver_id, content, message_type, reaction_emoji, created_at) VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING id",
     )
     .bind(payload.reel_id).bind(sender_id).bind(receiver_id).bind(&payload.content).bind(msg_type).bind(&payload.reaction_emoji)
@@ -4204,6 +4848,12 @@ pub async fn send_reel_message(
     let msg_features = serde_json::json!({ "length": payload.content.len(), "has_question": payload.content.contains('?'), "effort": effort_score });
     sqlx::query("INSERT INTO response_training_data (sender_id, receiver_id, interaction_source, reel_id, message_features, got_response, created_at) VALUES ($1, $2, 'reel_message', $3, $4, FALSE, NOW())")
         .bind(sender_id).bind(receiver_id).bind(payload.reel_id).bind(&msg_features).execute(&state.db).await?;
+
+    // Publish notification event
+    let preview = if payload.content.len() > 60 { format!("{}...", &payload.content[..57]) } else { payload.content.clone() };
+    state.event_bus.publish("reel_handler", crate::modules::events::DomainEvent::ReelMessage {
+        reel_id: payload.reel_id, sender_id, receiver_id, content_preview: preview,
+    });
 
     Ok(Json(json!({ "message_id": message_id, "effort_score": effort_score, "sent": true })))
 }
@@ -4262,46 +4912,64 @@ pub async fn reply_reel_message(
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
 
     #[derive(sqlx::FromRow)]
-    struct OrigMsg { reel_id: i32, sender_id: i32, receiver_id: i32, created_at: Option<NaiveDateTime> }
+    struct OrigMsg { reel_id: i64, sender_id: i64, receiver_id: i64, created_at: Option<NaiveDateTime> }
 
     let orig = sqlx::query_as::<_, OrigMsg>("SELECT reel_id, sender_id, receiver_id, created_at FROM reel_messages WHERE id = $1")
         .bind(payload.original_message_id).fetch_optional(&state.db).await?.ok_or_else(|| AppError::not_found("Message not found"))?;
 
-    if orig.receiver_id != user_id { return Err(AppError::forbidden("Not authorized")); }
+    if orig.receiver_id as i32 != user_id { return Err(AppError::forbidden("Not authorized")); }
 
     let response_time_sec = orig.created_at.map(|t| (Utc::now().naive_utc() - t).num_seconds() as i32);
 
-    let reply_id = sqlx::query_scalar::<_, i32>("INSERT INTO reel_messages (reel_id, sender_id, receiver_id, content, message_type, created_at) VALUES ($1, $2, $3, $4, 'text', NOW()) RETURNING id")
-        .bind(orig.reel_id).bind(user_id).bind(orig.sender_id).bind(&payload.content).fetch_one(&state.db).await?;
+    let orig_reel_id = orig.reel_id as i32;
+    let orig_sender_id = orig.sender_id as i32;
+
+    let reply_id = sqlx::query_scalar::<_, i64>("INSERT INTO reel_messages (reel_id, sender_id, receiver_id, content, message_type, created_at) VALUES ($1, $2, $3, $4, 'text', NOW()) RETURNING id")
+        .bind(orig_reel_id).bind(user_id).bind(orig_sender_id).bind(&payload.content).fetch_one(&state.db).await?;
 
     // Mark original as replied
     sqlx::query("UPDATE reel_messages SET replied = TRUE, reply_delay_sec = $2 WHERE id = $1").bind(payload.original_message_id).bind(response_time_sec).execute(&state.db).await?;
 
     // Update conversation
-    let (user_a, user_b) = if user_id < orig.sender_id { (user_id, orig.sender_id) } else { (orig.sender_id, user_id) };
+    let (user_a, user_b) = if user_id < orig_sender_id { (user_id, orig_sender_id) } else { (orig_sender_id, user_id) };
     let is_replier_a = user_id == user_a;
 
     let conv = sqlx::query_as::<_, (i32, i32)>("SELECT a_message_count, b_message_count FROM reel_conversations WHERE reel_id = $1 AND user_a = $2 AND user_b = $3")
-        .bind(orig.reel_id).bind(user_a).bind(user_b).fetch_optional(&state.db).await?;
+        .bind(orig_reel_id).bind(user_a).bind(user_b).fetch_optional(&state.db).await?;
     let conversation_continued = conv.map(|(a, b)| a + b >= 2).unwrap_or(false);
 
     sqlx::query(r#"UPDATE reel_conversations SET a_message_count = a_message_count + $4, b_message_count = b_message_count + $5, total_messages = total_messages + 1, last_message_by = $6, last_message_at = NOW(), updated_at = NOW() WHERE reel_id = $1 AND user_a = $2 AND user_b = $3"#)
-        .bind(orig.reel_id).bind(user_a).bind(user_b).bind(if is_replier_a { 1 } else { 0 }).bind(if is_replier_a { 0 } else { 1 }).bind(user_id).execute(&state.db).await?;
+        .bind(orig_reel_id).bind(user_a).bind(user_b).bind(if is_replier_a { 1 } else { 0 }).bind(if is_replier_a { 0 } else { 1 }).bind(user_id).execute(&state.db).await?;
 
     // KEY ML LEARNING: Original sender got a response - their approach worked!
     let reward = 3.0 + if conversation_continued { 2.0 } else { 0.0 };
     sqlx::query(r#"UPDATE response_training_data SET got_response = TRUE, response_time_sec = $4, conversation_continued = $5, reward = $6 WHERE sender_id = $1 AND receiver_id = $2 AND reel_id = $3 AND got_response = FALSE"#)
-        .bind(orig.sender_id).bind(user_id).bind(orig.reel_id).bind(response_time_sec).bind(conversation_continued).bind(reward).execute(&state.db).await?;
+        .bind(orig_sender_id).bind(user_id).bind(orig_reel_id).bind(response_time_sec).bind(conversation_continued).bind(reward).execute(&state.db).await?;
 
     // Update sender's response patterns
     sqlx::query(r#"INSERT INTO user_response_patterns (user_id, total_responses_received, conversations_continued, updated_at) VALUES ($1, 1, $2, NOW())
         ON CONFLICT (user_id) DO UPDATE SET total_responses_received = user_response_patterns.total_responses_received + 1, conversations_continued = user_response_patterns.conversations_continued + $2, response_rate = (user_response_patterns.total_responses_received + 1)::float / GREATEST(user_response_patterns.total_messages_sent, 1), updated_at = NOW()"#)
-        .bind(orig.sender_id).bind(if conversation_continued { 1 } else { 0 }).execute(&state.db).await?;
+        .bind(orig_sender_id).bind(if conversation_continued { 1 } else { 0 }).execute(&state.db).await?;
 
-    log_reel_event(&state.db, user_id, orig.reel_id, orig.sender_id, "reply", 100.0, 0, None, None, None, 4.0).await?;
+    log_reel_event(&state.db, user_id, orig_reel_id, orig_sender_id, "reply", 100.0, 0, None, None, None, 4.0).await?;
 
     // Check match eligibility
-    check_reel_match_eligibility(&state.db, orig.reel_id, user_a, user_b).await?;
+    check_reel_match_eligibility(&state.db, orig_reel_id, user_a, user_b).await?;
+
+    // Publish notification events
+    let preview = if payload.content.len() > 60 { format!("{}...", &payload.content[..57]) } else { payload.content.clone() };
+    state.event_bus.publish("reel_handler", crate::modules::events::DomainEvent::ReelReply {
+        reel_id: orig_reel_id, replier_id: user_id, original_sender_id: orig_sender_id, content_preview: preview,
+    });
+
+    // Check if this reply triggered match eligibility — notify both users
+    let eligible: Option<bool> = sqlx::query_scalar("SELECT eligible_for_match FROM reel_conversations WHERE reel_id = $1 AND user_a = $2 AND user_b = $3")
+        .bind(orig_reel_id).bind(user_a).bind(user_b).fetch_optional(&state.db).await?.flatten();
+    if eligible == Some(true) {
+        state.event_bus.publish("reel_handler", crate::modules::events::DomainEvent::ReelMatchEligible {
+            reel_id: orig_reel_id, user_a, user_b,
+        });
+    }
 
     Ok(Json(json!({ "reply_id": reply_id, "conversation_continued": conversation_continued, "response_time_sec": response_time_sec })))
 }
@@ -4343,13 +5011,317 @@ pub async fn get_reel_conversation(
 
     let (user_a, user_b) = if user_id < other_user { (user_id, other_user) } else { (other_user, user_id) };
 
-    #[derive(sqlx::FromRow, Serialize)]
-    struct ConvStats { total_messages: Option<i32>, eligible_for_match: Option<bool>, match_suggested: Option<bool>, match_id: Option<String> }
+    #[derive(sqlx::FromRow)]
+    struct ConvStats {
+        total_messages: Option<i32>,
+        eligible_for_match: Option<bool>,
+        match_suggested: Option<bool>,
+        match_accepted_a: Option<bool>,
+        match_accepted_b: Option<bool>,
+        match_id: Option<String>,
+    }
 
-    let stats = sqlx::query_as::<_, ConvStats>("SELECT total_messages, eligible_for_match, match_suggested, match_id FROM reel_conversations WHERE reel_id = $1 AND user_a = $2 AND user_b = $3")
-        .bind(reel_id).bind(user_a).bind(user_b).fetch_optional(read_db).await?;
+    let stats = sqlx::query_as::<_, ConvStats>(
+        "SELECT total_messages, eligible_for_match, match_suggested, match_accepted_a, match_accepted_b, match_id FROM reel_conversations WHERE reel_id = $1 AND user_a = $2 AND user_b = $3"
+    ).bind(reel_id).bind(user_a).bind(user_b).fetch_optional(read_db).await?;
 
-    Ok(Json(json!({ "messages": messages, "stats": stats })))
+    let is_user_a = user_id == user_a;
+    let (can_request_match, match_status) = if let Some(ref s) = stats {
+        let already_matched = s.match_id.is_some();
+        let i_accepted = if is_user_a { s.match_accepted_a } else { s.match_accepted_b };
+        let they_accepted = if is_user_a { s.match_accepted_b } else { s.match_accepted_a };
+
+        let status = if already_matched {
+            "matched"
+        } else if i_accepted == Some(true) && they_accepted == Some(true) {
+            "matched"
+        } else if i_accepted == Some(true) {
+            "request_sent"
+        } else if they_accepted == Some(true) {
+            "request_received"
+        } else if s.eligible_for_match.unwrap_or(false) {
+            "eligible"
+        } else {
+            "chatting"
+        };
+
+        let can_request = s.eligible_for_match.unwrap_or(false)
+            && !already_matched
+            && i_accepted.is_none();
+
+        (can_request, status)
+    } else {
+        (false, "no_conversation")
+    };
+
+    Ok(Json(json!({
+        "messages": messages,
+        "stats": {
+            "total_messages": stats.as_ref().and_then(|s| s.total_messages),
+            "eligible_for_match": stats.as_ref().and_then(|s| s.eligible_for_match).unwrap_or(false),
+            "match_status": match_status,
+            "can_request_match": can_request_match,
+            "match_id": stats.as_ref().and_then(|s| s.match_id.clone())
+        }
+    })))
+}
+
+// ============================================================================
+// Reel Match Request / Accept — Private conversation → Match
+// ============================================================================
+
+/// POST /reels/match-request — Request to match after a reel conversation
+#[derive(Deserialize)]
+pub struct ReelMatchRequestPayload {
+    pub reel_id: i32,
+    pub other_user_id: i32,
+}
+
+pub async fn request_reel_match(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ReelMatchRequestPayload>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    if user_id == payload.other_user_id {
+        return Err(AppError::bad_request("Cannot match with yourself"));
+    }
+
+    let (user_a, user_b) = if user_id < payload.other_user_id {
+        (user_id, payload.other_user_id)
+    } else {
+        (payload.other_user_id, user_id)
+    };
+    let is_user_a = user_id == user_a;
+
+    // Check conversation exists and is eligible
+    #[derive(sqlx::FromRow)]
+    struct ConvCheck {
+        eligible_for_match: Option<bool>,
+        match_accepted_a: Option<bool>,
+        match_accepted_b: Option<bool>,
+        match_id: Option<String>,
+    }
+
+    let conv = sqlx::query_as::<_, ConvCheck>(
+        "SELECT eligible_for_match, match_accepted_a, match_accepted_b, match_id FROM reel_conversations WHERE reel_id = $1 AND user_a = $2 AND user_b = $3"
+    )
+    .bind(payload.reel_id).bind(user_a).bind(user_b)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::not_found("No conversation found"))?;
+
+    if conv.match_id.is_some() {
+        return Err(AppError::bad_request("Already matched"));
+    }
+
+    if !conv.eligible_for_match.unwrap_or(false) {
+        return Err(AppError::bad_request("Not eligible yet — keep chatting (both need 2+ messages)"));
+    }
+
+    let my_accepted = if is_user_a { conv.match_accepted_a } else { conv.match_accepted_b };
+    if my_accepted == Some(true) {
+        return Err(AppError::bad_request("Match request already sent"));
+    }
+
+    // Set my acceptance
+    let col = if is_user_a { "match_accepted_a" } else { "match_accepted_b" };
+    sqlx::query(&format!(
+        "UPDATE reel_conversations SET {} = TRUE, match_suggested = TRUE, updated_at = NOW() WHERE reel_id = $1 AND user_a = $2 AND user_b = $3",
+        col
+    ))
+    .bind(payload.reel_id).bind(user_a).bind(user_b)
+    .execute(&state.db).await?;
+
+    // Check if both accepted → auto-create match
+    let other_accepted = if is_user_a { conv.match_accepted_b } else { conv.match_accepted_a };
+    let is_match = other_accepted == Some(true);
+
+    let match_id = if is_match {
+        // Both accepted — create the real match!
+        let mid = create_match_from_reel(&state.db, user_a, user_b, payload.reel_id).await?;
+
+        // Update conversation with match_id
+        sqlx::query("UPDATE reel_conversations SET match_id = $4, updated_at = NOW() WHERE reel_id = $1 AND user_a = $2 AND user_b = $3")
+            .bind(payload.reel_id).bind(user_a).bind(user_b).bind(&mid)
+            .execute(&state.db).await?;
+
+        // Update ML stats
+        let _ = sqlx::query(
+            "UPDATE user_interaction_model SET total_matches_from_reels = COALESCE(total_matches_from_reels, 0) + 1, updated_at = NOW() WHERE user_id = $1"
+        ).bind(user_id as i64).execute(&state.db).await;
+        let _ = sqlx::query(
+            "UPDATE user_interaction_model SET total_matches_from_reels = COALESCE(total_matches_from_reels, 0) + 1, updated_at = NOW() WHERE user_id = $1"
+        ).bind(payload.other_user_id as i64).execute(&state.db).await;
+
+        Some(mid)
+    } else {
+        None
+    };
+
+    // Publish notification events
+    if is_match {
+        if let Some(ref mid) = match_id {
+            state.event_bus.publish("reel_handler", crate::modules::events::DomainEvent::ReelMatchAccepted {
+                reel_id: payload.reel_id, match_id: mid.clone(), user1_id: user_a, user2_id: user_b,
+            });
+        }
+    } else {
+        state.event_bus.publish("reel_handler", crate::modules::events::DomainEvent::ReelMatchRequested {
+            reel_id: payload.reel_id, requester_id: user_id, target_id: payload.other_user_id,
+        });
+    }
+
+    Ok(Json(json!({
+        "request_sent": true,
+        "is_match": is_match,
+        "match_id": match_id,
+        "status": if is_match { "matched" } else { "request_sent" }
+    })))
+}
+
+/// POST /reels/match-accept — Accept or decline a match request
+#[derive(Deserialize)]
+pub struct ReelMatchAcceptPayload {
+    pub reel_id: i32,
+    pub other_user_id: i32,
+    pub accept: bool,
+}
+
+pub async fn accept_reel_match(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ReelMatchAcceptPayload>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let (user_a, user_b) = if user_id < payload.other_user_id {
+        (user_id, payload.other_user_id)
+    } else {
+        (payload.other_user_id, user_id)
+    };
+    let is_user_a = user_id == user_a;
+
+    // Verify the other person already sent a request
+    #[derive(sqlx::FromRow)]
+    struct ConvCheck2 {
+        match_accepted_a: Option<bool>,
+        match_accepted_b: Option<bool>,
+        match_id: Option<String>,
+    }
+
+    let conv = sqlx::query_as::<_, ConvCheck2>(
+        "SELECT match_accepted_a, match_accepted_b, match_id FROM reel_conversations WHERE reel_id = $1 AND user_a = $2 AND user_b = $3"
+    )
+    .bind(payload.reel_id).bind(user_a).bind(user_b)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::not_found("No conversation found"))?;
+
+    if conv.match_id.is_some() {
+        return Err(AppError::bad_request("Already matched"));
+    }
+
+    let other_accepted = if is_user_a { conv.match_accepted_b } else { conv.match_accepted_a };
+    if other_accepted != Some(true) {
+        return Err(AppError::bad_request("No pending match request from this user"));
+    }
+
+    if !payload.accept {
+        // Decline — reset their request
+        let other_col = if is_user_a { "match_accepted_b" } else { "match_accepted_a" };
+        sqlx::query(&format!(
+            "UPDATE reel_conversations SET {} = NULL, updated_at = NOW() WHERE reel_id = $1 AND user_a = $2 AND user_b = $3",
+            other_col
+        ))
+        .bind(payload.reel_id).bind(user_a).bind(user_b)
+        .execute(&state.db).await?;
+
+        return Ok(Json(json!({
+            "accepted": false,
+            "status": "declined",
+            "message": "Match request declined. They can request again later."
+        })));
+    }
+
+    // Accept — set my acceptance and create match
+    let col = if is_user_a { "match_accepted_a" } else { "match_accepted_b" };
+    sqlx::query(&format!(
+        "UPDATE reel_conversations SET {} = TRUE, updated_at = NOW() WHERE reel_id = $1 AND user_a = $2 AND user_b = $3",
+        col
+    ))
+    .bind(payload.reel_id).bind(user_a).bind(user_b)
+    .execute(&state.db).await?;
+
+    // Create the match
+    let match_id = create_match_from_reel(&state.db, user_a, user_b, payload.reel_id).await?;
+
+    sqlx::query("UPDATE reel_conversations SET match_id = $4, updated_at = NOW() WHERE reel_id = $1 AND user_a = $2 AND user_b = $3")
+        .bind(payload.reel_id).bind(user_a).bind(user_b).bind(&match_id)
+        .execute(&state.db).await?;
+
+    // Update ML stats for both users
+    for uid in [user_a, user_b] {
+        let _ = sqlx::query(
+            "UPDATE user_interaction_model SET total_matches_from_reels = COALESCE(total_matches_from_reels, 0) + 1, updated_at = NOW() WHERE user_id = $1"
+        ).bind(uid as i64).execute(&state.db).await;
+    }
+
+    // Notify both users about the match
+    state.event_bus.publish("reel_handler", crate::modules::events::DomainEvent::ReelMatchAccepted {
+        reel_id: payload.reel_id, match_id: match_id.clone(), user1_id: user_a, user2_id: user_b,
+    });
+
+    Ok(Json(json!({
+        "accepted": true,
+        "is_match": true,
+        "match_id": match_id,
+        "status": "matched",
+        "message": "It's a match! You can now chat freely."
+    })))
+}
+
+/// Create a real match record from a reel conversation
+async fn create_match_from_reel(db: &PgPool, user1: i32, user2: i32, _reel_id: i32) -> Result<String, AppError> {
+    // Check if match already exists
+    let existing = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM matches WHERE user1_id = $1 AND user2_id = $2"
+    )
+    .bind(user1).bind(user2)
+    .fetch_optional(db).await?;
+
+    if let Some(mid) = existing {
+        // Update existing to mutual match
+        sqlx::query(
+            "UPDATE matches SET is_mutual_match = TRUE, user1_liked = TRUE, user2_liked = TRUE, status = 'accepted' WHERE id = $1"
+        ).bind(&mid).execute(db).await?;
+        return Ok(mid);
+    }
+
+    // Create new mutual match
+    let new_match_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        r#"
+        INSERT INTO matches (id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match, status, match_reason, created_at)
+        VALUES ($1, $2, $3, TRUE, TRUE, TRUE, 'accepted', 'reel_conversation', NOW())
+        "#,
+    )
+    .bind(&new_match_id).bind(user1).bind(user2)
+    .execute(db).await?;
+    let match_id = new_match_id;
+
+    // Record swipes for both (for consistency with discover flow)
+    let _ = sqlx::query(
+        "INSERT INTO swipes (from_user_id, to_user_id, action, source) VALUES ($1, $2, 'like', 'reel') ON CONFLICT DO NOTHING"
+    ).bind(user1 as i64).bind(user2 as i64).execute(db).await;
+    let _ = sqlx::query(
+        "INSERT INTO swipes (from_user_id, to_user_id, action, source) VALUES ($1, $2, 'like', 'reel') ON CONFLICT DO NOTHING"
+    ).bind(user2 as i64).bind(user1 as i64).execute(db).await;
+
+    Ok(match_id)
 }
 
 /// Get user's learned patterns (what ML learned about them)
@@ -5794,7 +6766,7 @@ async fn check_university_access(
     // Get user's own university
     let user_uni = sqlx::query_as::<_, (Option<i64>, Option<String>)>(
         r#"
-        SELECT university_id, country_code
+        SELECT university_id, university_country_code
         FROM student_verifications
         WHERE user_id = $1 AND status = 'approved'
         "#
@@ -5953,6 +6925,10 @@ pub async fn discover_university_profiles(
             distance_text: None,
             city: row.city.clone(),
             compatibility_score: row.attractiveness_score,
+            university: Some(university.name.clone()),
+            university_tier: university.tier.as_ref().map(|t| format_tier(t)),
+            interaction_status: None,
+            super_liked_you: None,
         }
     }).collect();
 
@@ -6216,7 +7192,7 @@ pub async fn get_my_university_passes(
     // Get user's university info
     let user_university = sqlx::query_as::<_, (Option<i64>, Option<String>, Option<String>)>(
         r#"
-        SELECT sv.university_id, u.name as university_name, sv.country_code
+        SELECT sv.university_id, u.name as university_name, sv.university_country_code
         FROM student_verifications sv
         LEFT JOIN universities u ON u.id = sv.university_id
         WHERE sv.user_id = $1 AND sv.status = 'approved'
@@ -6338,5 +7314,1550 @@ pub async fn ml_linucb_score(
     Ok(Json(json!({
         "arm_id": payload.arm_id,
         "ucb_score": score
+    })))
+}
+
+// ============================================================================
+// Student Global Search — LinkedIn-style student discovery
+// ============================================================================
+
+/// GET /search/students?q=...&university=...&city=...&country=...&gender=...&limit=...&offset=...
+#[derive(Debug, Deserialize)]
+pub struct StudentSearchQuery {
+    pub q: Option<String>,              // Free-text search (name)
+    pub university: Option<String>,      // University name or short_name
+    pub university_id: Option<i64>,      // Direct university ID
+    pub city: Option<String>,            // City filter
+    pub country: Option<String>,         // Country code filter
+    pub gender: Option<String>,          // Gender filter
+    pub min_age: Option<i32>,
+    pub max_age: Option<i32>,
+    pub tier: Option<String>,            // University tier: top_private, top_public, regular
+    pub limit: Option<i32>,
+    pub offset: Option<i32>,
+}
+
+/// Search result matching frontend StudentResult spec
+#[derive(Debug, Serialize)]
+pub struct StudentSearchResult {
+    pub id: String,
+    pub name: Option<String>,
+    pub age: Option<i32>,
+    pub photos: Vec<String>,
+    pub university: Option<String>,
+    pub university_tier: Option<String>,
+    pub study: Option<String>,
+    pub city: Option<String>,
+    pub country: Option<String>,
+    pub distance: Option<f64>,
+    pub bio: Option<String>,
+    pub is_verified: bool,
+    pub can_message: bool,
+    pub interaction_status: String,  // "none", "liked", "matched"
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct StudentSearchRow {
+    id: i32,
+    name: Option<String>,
+    dob: Option<NaiveDate>,
+    gender: Option<String>,
+    bio: Option<String>,
+    profile_photo_url: Option<String>,
+    profile_photos: Option<Value>,
+    profile_photo_1: Option<String>,
+    profile_photo_2: Option<String>,
+    profile_photo_3: Option<String>,
+    is_verified: Option<bool>,
+    attractiveness_score: Option<f64>,
+    looking_for: Option<String>,
+    profession_title: Option<String>,
+    height_cm: Option<i32>,
+    city: Option<String>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    university_name: Option<String>,
+    university_short_name: Option<String>,
+    university_tier: Option<String>,
+    university_country: Option<String>,
+}
+
+pub async fn search_students(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<StudentSearchQuery>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Must be a verified student to search
+    let is_student = sqlx::query_scalar::<_, bool>(
+        "SELECT COALESCE(is_student_verified, FALSE) FROM users WHERE id = $1"
+    )
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    if !is_student {
+        return Err(AppError::forbidden("Student verification required to search students"));
+    }
+
+    // Check premium status for messaging capability
+    let active_pass = get_active_pass(&state.db, user_id).await?;
+    let is_premium = active_pass.is_some();
+
+    let limit = params.limit.unwrap_or(20).min(50);
+    let offset = params.offset.unwrap_or(0);
+
+    // Get searcher's location for distance calc
+    let my_location = sqlx::query_as::<_, (Option<f64>, Option<f64>)>(
+        "SELECT latitude, longitude FROM user_locations WHERE user_id = $1"
+    )
+    .bind(user_id)
+    .fetch_optional(state.read_pool())
+    .await?;
+    let (my_lat, my_lon) = my_location.unwrap_or((None, None));
+
+    // Build dynamic query
+    let mut conditions = vec![
+        "sv.status = 'approved'".to_string(),
+        "u.is_active = TRUE".to_string(),
+        "u.is_profile_complete = TRUE".to_string(),
+        format!("u.id != {}", user_id),
+    ];
+    let mut bind_idx = 0u32;
+    let mut bind_values: Vec<String> = Vec::new();
+
+    // Free-text name search
+    if let Some(ref q) = params.q {
+        if !q.trim().is_empty() {
+            bind_idx += 1;
+            conditions.push(format!("LOWER(u.name) LIKE ${}", bind_idx));
+            bind_values.push(format!("%{}%", q.trim().to_lowercase()));
+        }
+    }
+
+    // University name search
+    if let Some(ref uni) = params.university {
+        if !uni.trim().is_empty() {
+            bind_idx += 1;
+            conditions.push(format!(
+                "(LOWER(univ.name) LIKE ${idx} OR LOWER(univ.short_name) LIKE ${idx})",
+                idx = bind_idx
+            ));
+            bind_values.push(format!("%{}%", uni.trim().to_lowercase()));
+        }
+    }
+
+    // Direct university ID
+    if let Some(uni_id) = params.university_id {
+        conditions.push(format!("sv.university_id = {}", uni_id));
+    }
+
+    // City filter
+    if let Some(ref city) = params.city {
+        if !city.trim().is_empty() {
+            bind_idx += 1;
+            conditions.push(format!("LOWER(l.city) LIKE ${}", bind_idx));
+            bind_values.push(format!("%{}%", city.trim().to_lowercase()));
+        }
+    }
+
+    // Country filter
+    if let Some(ref country) = params.country {
+        if !country.trim().is_empty() {
+            bind_idx += 1;
+            conditions.push(format!("univ.country_code = ${}", bind_idx));
+            bind_values.push(country.trim().to_uppercase());
+        }
+    }
+
+    // Gender filter
+    if let Some(ref gender) = params.gender {
+        if !gender.trim().is_empty() {
+            bind_idx += 1;
+            conditions.push(format!("u.gender = ${}", bind_idx));
+            bind_values.push(gender.clone());
+        }
+    }
+
+    // Age filters
+    if let Some(min_age) = params.min_age {
+        let max_dob = chrono::Utc::now().date_naive() - chrono::Duration::days(min_age as i64 * 365);
+        conditions.push(format!("u.dob <= '{}'", max_dob));
+    }
+    if let Some(max_age) = params.max_age {
+        let min_dob = chrono::Utc::now().date_naive() - chrono::Duration::days((max_age as i64 + 1) * 365);
+        conditions.push(format!("u.dob >= '{}'", min_dob));
+    }
+
+    // University tier filter
+    if let Some(ref tier) = params.tier {
+        if !tier.trim().is_empty() {
+            bind_idx += 1;
+            conditions.push(format!("univ.tier = ${}", bind_idx));
+            bind_values.push(tier.clone());
+        }
+    }
+
+    let where_clause = conditions.join(" AND ");
+
+    let query_str = format!(
+        r#"
+        SELECT u.id, u.name, u.dob, u.gender, u.bio,
+               u.profile_photo_url, u.profile_photos,
+               u.profile_photo_1, u.profile_photo_2, u.profile_photo_3,
+               u.is_verified, u.attractiveness_score, u.looking_for,
+               u.profession_title, u.height_cm,
+               l.city, l.latitude, l.longitude,
+               univ.name AS university_name,
+               univ.short_name AS university_short_name,
+               univ.tier AS university_tier,
+               univ.country AS university_country
+        FROM users u
+        INNER JOIN student_verifications sv ON sv.user_id = u.id
+        INNER JOIN universities univ ON univ.id = sv.university_id
+        LEFT JOIN user_locations l ON l.user_id = u.id
+        WHERE {}
+        ORDER BY u.attractiveness_score DESC NULLS LAST, u.created_at DESC
+        LIMIT {} OFFSET {}
+        "#,
+        where_clause, limit, offset
+    );
+
+    // Build and execute the dynamic query
+    let mut query = sqlx::query_as::<_, StudentSearchRow>(&query_str);
+    for val in &bind_values {
+        query = query.bind(val);
+    }
+
+    let rows = query.fetch_all(state.read_pool()).await?;
+
+    // Get total count for pagination
+    let count_query_str = format!(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM users u
+        INNER JOIN student_verifications sv ON sv.user_id = u.id
+        INNER JOIN universities univ ON univ.id = sv.university_id
+        LEFT JOIN user_locations l ON l.user_id = u.id
+        WHERE {}
+        "#,
+        where_clause
+    );
+    let mut count_query = sqlx::query_scalar::<_, i64>(&count_query_str);
+    for val in &bind_values {
+        count_query = count_query.bind(val);
+    }
+    let total_count = count_query.fetch_one(state.read_pool()).await.unwrap_or(0);
+
+    // Batch lookup interaction status for all result user IDs
+    let result_ids: Vec<i64> = rows.iter().map(|r| r.id as i64).collect();
+
+    // Get liked status
+    let liked_ids: Vec<i64> = if !result_ids.is_empty() {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT to_user_id FROM swipes WHERE from_user_id = $1 AND to_user_id = ANY($2) AND action = 'like'"
+        )
+        .bind(user_id as i64)
+        .bind(&result_ids)
+        .fetch_all(state.read_pool())
+        .await
+        .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    // Get matched status
+    let matched_ids: Vec<i32> = if !result_ids.is_empty() {
+        let matched_rows = sqlx::query_as::<_, (i32, i32)>(
+            r#"
+            SELECT user1_id, user2_id FROM matches
+            WHERE (user1_id = $1 OR user2_id = $1)
+              AND status IN ('accepted', 'pending_direct')
+            "#
+        )
+        .bind(user_id)
+        .fetch_all(state.read_pool())
+        .await
+        .unwrap_or_default();
+
+        matched_rows.iter().map(|(u1, u2)| {
+            if *u1 == user_id { *u2 } else { *u1 }
+        }).collect()
+    } else {
+        vec![]
+    };
+
+    let results: Vec<StudentSearchResult> = rows.iter().map(|row| {
+        let photos = get_student_search_photos(row);
+        let age = row.dob.map(|dob| {
+            let today = chrono::Utc::now().date_naive();
+            today.years_since(dob).unwrap_or(0) as i32
+        });
+        let distance = match (my_lat, my_lon, row.latitude, row.longitude) {
+            (Some(lat1), Some(lon1), Some(lat2), Some(lon2)) => {
+                Some(haversine_km(lat1, lon1, lat2, lon2))
+            }
+            _ => None,
+        };
+
+        let interaction_status = if matched_ids.contains(&row.id) {
+            "matched".to_string()
+        } else if liked_ids.contains(&(row.id as i64)) {
+            "liked".to_string()
+        } else {
+            "none".to_string()
+        };
+
+        let is_matched = interaction_status == "matched";
+
+        StudentSearchResult {
+            id: row.id.to_string(),
+            name: row.name.clone(),
+            age,
+            photos,
+            university: row.university_name.clone().or_else(|| row.university_short_name.clone()),
+            university_tier: row.university_tier.as_ref().map(|t| format_tier(t)),
+            study: row.profession_title.clone(),
+            city: row.city.clone(),
+            country: row.university_country.clone(),
+            distance,
+            bio: row.bio.clone(),
+            is_verified: row.is_verified.unwrap_or(false),
+            can_message: is_premium || is_matched,
+            interaction_status,
+        }
+    }).collect();
+
+    Ok(Json(json!({
+        "students": results,
+        "total": total_count,
+        "is_premium": is_premium
+    })))
+}
+
+/// GET /search/unified?q=vignan&limit=5
+/// Unified search: returns matching universities with students grouped under each.
+/// Searches university names, user names, and short names.
+/// Returns: { universities: [{ id, name, tier, city, country, student_count, students: [...] }], people: [...] }
+pub async fn unified_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<UnifiedSearchQuery>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let q = params.q.as_deref().unwrap_or("").trim();
+    if q.is_empty() {
+        return Ok(Json(json!({ "universities": [], "people": [], "query": "" })));
+    }
+
+    let search_term = format!("%{}%", q.to_lowercase());
+    let uni_limit = params.uni_limit.unwrap_or(10).min(20) as i64;
+    let students_per_uni = params.students_per_uni.unwrap_or(5).min(20) as i64;
+
+    // Get searcher's location for distance calc
+    let my_location = sqlx::query_as::<_, (Option<f64>, Option<f64>)>(
+        "SELECT latitude, longitude FROM user_locations WHERE user_id = $1"
+    )
+    .bind(user_id)
+    .fetch_optional(state.read_pool())
+    .await?;
+    let (my_lat, my_lon) = my_location.unwrap_or((None, None));
+
+    // 1. Find matching universities
+    let universities = sqlx::query_as::<_, UnifiedUniRow>(
+        r#"
+        SELECT u.id, u.name, u.short_name, u.tier, u.city, u.country, u.country_code,
+               COUNT(sv.id) FILTER (WHERE sv.status = 'approved') AS student_count
+        FROM universities u
+        LEFT JOIN student_verifications sv ON sv.university_id = u.id
+        WHERE u.is_active = TRUE
+          AND (LOWER(u.name) LIKE $1 OR LOWER(u.short_name) LIKE $1)
+        GROUP BY u.id, u.name, u.short_name, u.tier, u.city, u.country, u.country_code
+        ORDER BY student_count DESC, u.name ASC
+        LIMIT $2
+        "#
+    )
+    .bind(&search_term)
+    .bind(uni_limit)
+    .fetch_all(state.read_pool())
+    .await?;
+
+    // 2. For each university, fetch students with distance + optional gender filter
+    let mut uni_results: Vec<Value> = Vec::new();
+    let gender_filter = params.gender.as_deref().filter(|g| !g.trim().is_empty());
+
+    for uni in &universities {
+        // If searching by university_id (user tapped a specific uni), show more profiles
+        let per_uni_limit = if params.university_id == Some(uni.id) { 50i64 } else { students_per_uni };
+
+        let students = if let Some(gender) = gender_filter {
+            sqlx::query_as::<_, UnifiedStudentRow>(
+                r#"
+                SELECT u.id, u.name, u.dob, u.gender, u.bio,
+                       u.profile_photo_url, u.profile_photo_1, u.profile_photo_2, u.profile_photo_3,
+                       u.is_verified, u.profession_title,
+                       l.city AS user_city, l.latitude, l.longitude
+                FROM users u
+                INNER JOIN student_verifications sv ON sv.user_id = u.id AND sv.status = 'approved'
+                LEFT JOIN user_locations l ON l.user_id = u.id
+                WHERE sv.university_id = $1
+                  AND u.is_active = TRUE
+                  AND u.is_profile_complete = TRUE
+                  AND u.id != $2
+                  AND LOWER(u.gender) = LOWER($3)
+                ORDER BY u.attractiveness_score DESC NULLS LAST
+                LIMIT $4
+                "#
+            )
+            .bind(uni.id)
+            .bind(user_id)
+            .bind(gender)
+            .bind(per_uni_limit)
+            .fetch_all(state.read_pool())
+            .await?
+        } else {
+            sqlx::query_as::<_, UnifiedStudentRow>(
+                r#"
+                SELECT u.id, u.name, u.dob, u.gender, u.bio,
+                       u.profile_photo_url, u.profile_photo_1, u.profile_photo_2, u.profile_photo_3,
+                       u.is_verified, u.profession_title,
+                       l.city AS user_city, l.latitude, l.longitude
+                FROM users u
+                INNER JOIN student_verifications sv ON sv.user_id = u.id AND sv.status = 'approved'
+                LEFT JOIN user_locations l ON l.user_id = u.id
+                WHERE sv.university_id = $1
+                  AND u.is_active = TRUE
+                  AND u.is_profile_complete = TRUE
+                  AND u.id != $2
+                ORDER BY u.attractiveness_score DESC NULLS LAST
+                LIMIT $3
+                "#
+            )
+            .bind(uni.id)
+            .bind(user_id)
+            .bind(per_uni_limit)
+            .fetch_all(state.read_pool())
+            .await?
+        };
+
+        let student_list: Vec<Value> = students.iter().map(|s| {
+            let age = s.dob.map(|dob| {
+                chrono::Utc::now().date_naive().years_since(dob).unwrap_or(0) as i32
+            });
+            let distance = match (my_lat, my_lon, s.latitude, s.longitude) {
+                (Some(lat1), Some(lon1), Some(lat2), Some(lon2)) => {
+                    Some((haversine_km(lat1, lon1, lat2, lon2) * 10.0).round() / 10.0)
+                }
+                _ => None,
+            };
+            let photo = s.profile_photo_url.as_ref()
+                .or(s.profile_photo_1.as_ref())
+                .or(s.profile_photo_2.as_ref())
+                .or(s.profile_photo_3.as_ref())
+                .cloned();
+
+            json!({
+                "id": s.id,
+                "name": s.name,
+                "age": age,
+                "photo": photo,
+                "gender": s.gender,
+                "study": s.profession_title,
+                "city": s.user_city,
+                "distance_km": distance,
+                "is_verified": s.is_verified.unwrap_or(false)
+            })
+        }).collect();
+
+        uni_results.push(json!({
+            "id": uni.id,
+            "name": uni.name,
+            "short_name": uni.short_name,
+            "tier": uni.tier.as_ref().map(|t| format_tier(t)),
+            "city": uni.city,
+            "country": uni.country,
+            "country_code": uni.country_code,
+            "student_count": uni.student_count.unwrap_or(0),
+            "students": student_list
+        }));
+    }
+
+    // 3. Also search people by name (across all universities) with filters
+    let mut people_conditions = vec![
+        "u.is_active = TRUE".to_string(),
+        "u.is_profile_complete = TRUE".to_string(),
+        format!("u.id != {}", user_id),
+        "LOWER(u.name) LIKE $1".to_string(),
+    ];
+    let mut people_binds: Vec<String> = vec![search_term.clone()];
+    let mut pidx = 1u32;
+
+    if let Some(ref gender) = params.gender {
+        if !gender.trim().is_empty() {
+            pidx += 1;
+            people_conditions.push(format!("u.gender = ${}", pidx));
+            people_binds.push(gender.clone());
+        }
+    }
+    if let Some(ref city) = params.city {
+        if !city.trim().is_empty() {
+            pidx += 1;
+            people_conditions.push(format!("LOWER(l.city) LIKE ${}", pidx));
+            people_binds.push(format!("%{}%", city.trim().to_lowercase()));
+        }
+    }
+    if let Some(min_age) = params.min_age {
+        let max_dob = chrono::Utc::now().date_naive() - chrono::Duration::days(min_age as i64 * 365);
+        people_conditions.push(format!("u.dob <= '{}'", max_dob));
+    }
+    if let Some(max_age) = params.max_age {
+        let min_dob = chrono::Utc::now().date_naive() - chrono::Duration::days((max_age as i64 + 1) * 365);
+        people_conditions.push(format!("u.dob >= '{}'", min_dob));
+    }
+    if let Some(uni_id) = params.university_id {
+        people_conditions.push(format!(
+            "EXISTS (SELECT 1 FROM student_verifications sv2 WHERE sv2.user_id = u.id AND sv2.university_id = {} AND sv2.status = 'approved')", uni_id
+        ));
+    }
+    if let Some(ref tier) = params.tier {
+        if !tier.trim().is_empty() {
+            people_conditions.push(format!(
+                "EXISTS (SELECT 1 FROM student_verifications sv3 JOIN universities univ3 ON univ3.id = sv3.university_id WHERE sv3.user_id = u.id AND univ3.tier = '{}')", tier.replace('\'', "")
+            ));
+        }
+    }
+
+    let people_where = people_conditions.join(" AND ");
+    let people_sql = format!(
+        r#"
+        SELECT u.id, u.name, u.dob, u.gender, u.bio,
+               u.profile_photo_url, u.profile_photo_1, u.profile_photo_2, u.profile_photo_3,
+               u.is_verified, u.profession_title,
+               l.city AS user_city, l.latitude, l.longitude
+        FROM users u
+        LEFT JOIN user_locations l ON l.user_id = u.id
+        WHERE {}
+        ORDER BY u.attractiveness_score DESC NULLS LAST
+        LIMIT 20
+        "#,
+        people_where
+    );
+
+    let mut people_query = sqlx::query_as::<_, UnifiedStudentRow>(&people_sql);
+    for val in &people_binds {
+        people_query = people_query.bind(val);
+    }
+    let people = people_query.fetch_all(state.read_pool()).await?;
+
+    // Get university info for people results
+    let people_ids: Vec<i32> = people.iter().map(|p| p.id).collect();
+    let uni_map = batch_lookup_university(&state.db, &people_ids).await?;
+
+    let people_results: Vec<Value> = people.iter().map(|s| {
+        let age = s.dob.map(|dob| {
+            chrono::Utc::now().date_naive().years_since(dob).unwrap_or(0) as i32
+        });
+        let distance = match (my_lat, my_lon, s.latitude, s.longitude) {
+            (Some(lat1), Some(lon1), Some(lat2), Some(lon2)) => {
+                Some((haversine_km(lat1, lon1, lat2, lon2) * 10.0).round() / 10.0)
+            }
+            _ => None,
+        };
+        let photo = s.profile_photo_url.as_ref()
+            .or(s.profile_photo_1.as_ref())
+            .or(s.profile_photo_2.as_ref())
+            .or(s.profile_photo_3.as_ref())
+            .cloned();
+        let (uni_name, uni_tier) = uni_map.get(&s.id).map(|(n, t)| (Some(n.as_str()), Some(format_tier(t)))).unwrap_or((None, None));
+
+        json!({
+            "id": s.id,
+            "name": s.name,
+            "age": age,
+            "photo": photo,
+            "gender": s.gender,
+            "university": uni_name,
+            "university_tier": uni_tier,
+            "study": s.profession_title,
+            "city": s.user_city,
+            "distance_km": distance,
+            "is_verified": s.is_verified.unwrap_or(false)
+        })
+    }).collect();
+
+    let has_filters = params.gender.is_some() || params.min_age.is_some() || params.max_age.is_some()
+        || params.city.is_some() || params.university_id.is_some() || params.tier.is_some();
+
+    Ok(Json(json!({
+        "query": q,
+        "universities": uni_results,
+        "people": people_results,
+        "filters_applied": has_filters,
+        "total_people": people_results.len(),
+        "total_universities": uni_results.len()
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UnifiedSearchQuery {
+    pub q: Option<String>,
+    pub uni_limit: Option<i32>,
+    pub students_per_uni: Option<i32>,
+    // Filters for narrowing people results
+    pub gender: Option<String>,
+    pub min_age: Option<i32>,
+    pub max_age: Option<i32>,
+    pub city: Option<String>,
+    pub country: Option<String>,
+    pub university_id: Option<i64>,
+    pub tier: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct UnifiedUniRow {
+    id: i64,
+    name: String,
+    short_name: Option<String>,
+    tier: Option<String>,
+    city: Option<String>,
+    country: String,
+    country_code: String,
+    student_count: Option<i64>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct UnifiedStudentRow {
+    id: i32,
+    name: Option<String>,
+    dob: Option<NaiveDate>,
+    gender: Option<String>,
+    bio: Option<String>,
+    profile_photo_url: Option<String>,
+    profile_photo_1: Option<String>,
+    profile_photo_2: Option<String>,
+    profile_photo_3: Option<String>,
+    is_verified: Option<bool>,
+    profession_title: Option<String>,
+    user_city: Option<String>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+}
+
+/// Get all profiles from a specific university with gender filter.
+/// GET /universities/{id}/profiles?gender=male&limit=50
+pub async fn get_university_profiles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(university_id): AxumPath<i64>,
+    Query(params): Query<UniversityProfilesQuery>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let limit = params.limit.unwrap_or(50).min(100) as i64;
+
+    // Get university info
+    let uni = sqlx::query_as::<_, UnifiedUniRow>(
+        r#"
+        SELECT u.id, u.name, u.short_name, u.tier, u.city, u.country, u.country_code,
+               COUNT(sv.id) FILTER (WHERE sv.status = 'approved') AS student_count
+        FROM universities u
+        LEFT JOIN student_verifications sv ON sv.university_id = u.id
+        WHERE u.id = $1 AND u.is_active = TRUE
+        GROUP BY u.id, u.name, u.short_name, u.tier, u.city, u.country, u.country_code
+        "#
+    )
+    .bind(university_id)
+    .fetch_optional(state.read_pool())
+    .await?
+    .ok_or_else(|| AppError::not_found("University not found"))?;
+
+    // Get searcher's location for distance
+    let my_loc = sqlx::query_as::<_, (Option<f64>, Option<f64>)>(
+        "SELECT latitude, longitude FROM user_locations WHERE user_id = $1"
+    )
+    .bind(user_id)
+    .fetch_optional(state.read_pool())
+    .await?;
+    let (my_lat, my_lon) = my_loc.unwrap_or((None, None));
+
+    // Fetch profiles with optional gender filter
+    let gender_filter = params.gender.as_deref().filter(|g| !g.trim().is_empty());
+    let students = if let Some(gender) = gender_filter {
+        sqlx::query_as::<_, UnifiedStudentRow>(
+            r#"
+            SELECT u.id, u.name, u.dob, u.gender, u.bio,
+                   u.profile_photo_url, u.profile_photo_1, u.profile_photo_2, u.profile_photo_3,
+                   u.is_verified, u.profession_title,
+                   l.city AS user_city, l.latitude, l.longitude
+            FROM users u
+            INNER JOIN student_verifications sv ON sv.user_id = u.id AND sv.status = 'approved'
+            LEFT JOIN user_locations l ON l.user_id = u.id
+            WHERE sv.university_id = $1
+              AND u.is_active = TRUE
+              AND u.is_profile_complete = TRUE
+              AND u.id != $2
+              AND LOWER(u.gender) = LOWER($3)
+            ORDER BY u.attractiveness_score DESC NULLS LAST
+            LIMIT $4
+            "#
+        )
+        .bind(university_id)
+        .bind(user_id)
+        .bind(gender)
+        .bind(limit)
+        .fetch_all(state.read_pool())
+        .await?
+    } else {
+        sqlx::query_as::<_, UnifiedStudentRow>(
+            r#"
+            SELECT u.id, u.name, u.dob, u.gender, u.bio,
+                   u.profile_photo_url, u.profile_photo_1, u.profile_photo_2, u.profile_photo_3,
+                   u.is_verified, u.profession_title,
+                   l.city AS user_city, l.latitude, l.longitude
+            FROM users u
+            INNER JOIN student_verifications sv ON sv.user_id = u.id AND sv.status = 'approved'
+            LEFT JOIN user_locations l ON l.user_id = u.id
+            WHERE sv.university_id = $1
+              AND u.is_active = TRUE
+              AND u.is_profile_complete = TRUE
+              AND u.id != $2
+            ORDER BY u.attractiveness_score DESC NULLS LAST
+            LIMIT $3
+            "#
+        )
+        .bind(university_id)
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(state.read_pool())
+        .await?
+    };
+
+    let profiles: Vec<Value> = students.iter().map(|s| {
+        let age = s.dob.map(|dob| {
+            chrono::Utc::now().date_naive().years_since(dob).unwrap_or(0) as i32
+        });
+        let distance = match (my_lat, my_lon, s.latitude, s.longitude) {
+            (Some(lat1), Some(lon1), Some(lat2), Some(lon2)) => {
+                Some((haversine_km(lat1, lon1, lat2, lon2) * 10.0).round() / 10.0)
+            }
+            _ => None,
+        };
+        let photo = s.profile_photo_url.as_ref()
+            .or(s.profile_photo_1.as_ref())
+            .or(s.profile_photo_2.as_ref())
+            .or(s.profile_photo_3.as_ref())
+            .cloned();
+
+        json!({
+            "id": s.id,
+            "name": s.name,
+            "age": age,
+            "photo": photo,
+            "gender": s.gender,
+            "bio": s.bio,
+            "study": s.profession_title,
+            "city": s.user_city,
+            "distance_km": distance,
+            "distance_text": distance.map(format_distance),
+            "is_verified": s.is_verified.unwrap_or(false)
+        })
+    }).collect();
+
+    Ok(Json(json!({
+        "university": {
+            "id": uni.id,
+            "name": uni.name,
+            "short_name": uni.short_name,
+            "tier": uni.tier.as_ref().map(|t| format_tier(t)),
+            "city": uni.city,
+            "country": uni.country,
+            "student_count": uni.student_count.unwrap_or(0)
+        },
+        "profiles": profiles,
+        "total": profiles.len(),
+        "gender_filter": gender_filter
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UniversityProfilesQuery {
+    pub gender: Option<String>,
+    pub limit: Option<i32>,
+}
+
+/// Format tier from DB value to display string
+fn format_tier(tier: &str) -> String {
+    match tier {
+        "top_private" => "Top Private".to_string(),
+        "top_public" => "Top Public".to_string(),
+        "regular" => "Regular".to_string(),
+        "graduate" => "Graduate".to_string(),
+        "alumni" => "Alumni".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Batch lookup university name + tier for a list of user IDs.
+/// Returns HashMap<user_id, (university_name, tier)>.
+async fn batch_lookup_university(
+    db: &sqlx::PgPool,
+    user_ids: &[i32],
+) -> Result<std::collections::HashMap<i32, (String, String)>, AppError> {
+    if user_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let placeholders: Vec<String> = user_ids.iter().enumerate().map(|(i, _)| format!("${}", i + 1)).collect();
+    let query_str = format!(
+        r#"
+        SELECT sv.user_id, univ.name, univ.tier
+        FROM student_verifications sv
+        INNER JOIN universities univ ON univ.id = sv.university_id
+        WHERE sv.status = 'approved' AND sv.user_id IN ({})
+        "#,
+        placeholders.join(", ")
+    );
+
+    let mut query = sqlx::query_as::<_, (i32, String, String)>(&query_str);
+    for id in user_ids {
+        query = query.bind(id);
+    }
+
+    let rows = query.fetch_all(db).await?;
+    let mut map = std::collections::HashMap::new();
+    for (uid, name, tier) in rows {
+        map.insert(uid, (name, tier));
+    }
+    Ok(map)
+}
+
+/// Batch lookup university name + tier + country for a list of user IDs.
+/// Returns HashMap<user_id, (university_name, tier, country)>.
+async fn batch_lookup_university_full(
+    db: &sqlx::PgPool,
+    user_ids: &[i32],
+) -> Result<std::collections::HashMap<i32, (String, String, String)>, AppError> {
+    if user_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let placeholders: Vec<String> = user_ids.iter().enumerate().map(|(i, _)| format!("${}", i + 1)).collect();
+    let query_str = format!(
+        r#"
+        SELECT sv.user_id, univ.name, univ.tier, univ.country
+        FROM student_verifications sv
+        INNER JOIN universities univ ON univ.id = sv.university_id
+        WHERE sv.status = 'approved' AND sv.user_id IN ({})
+        "#,
+        placeholders.join(", ")
+    );
+
+    let mut query = sqlx::query_as::<_, (i32, String, String, String)>(&query_str);
+    for id in user_ids {
+        query = query.bind(id);
+    }
+
+    let rows = query.fetch_all(db).await?;
+    let mut map = std::collections::HashMap::new();
+    for (uid, name, tier, country) in rows {
+        map.insert(uid, (name, tier, country));
+    }
+    Ok(map)
+}
+
+/// Batch lookup interaction status between current user and a list of target user IDs.
+/// Returns HashMap<target_user_id, "none"|"liked"|"matched">.
+async fn batch_lookup_interactions(
+    db: &sqlx::PgPool,
+    user_id: i32,
+    target_ids: &[i32],
+) -> Result<std::collections::HashMap<i32, String>, AppError> {
+    if target_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let placeholders: Vec<String> = target_ids.iter().enumerate().map(|(i, _)| format!("${}", i + 2)).collect();
+    let query_str = format!(
+        r#"
+        SELECT
+            CASE WHEN m.user1_id = $1 THEN m.user2_id ELSE m.user1_id END as target_id,
+            m.is_mutual_match,
+            CASE WHEN m.user1_id = $1 THEN m.user1_liked ELSE m.user2_liked END as i_liked
+        FROM matches m
+        WHERE (
+            (m.user1_id = $1 AND m.user2_id IN ({}))
+            OR (m.user2_id = $1 AND m.user1_id IN ({}))
+        )
+        "#,
+        placeholders.join(", "),
+        placeholders.join(", ")
+    );
+
+    let mut query = sqlx::query_as::<_, (i32, Option<bool>, Option<bool>)>(&query_str);
+    query = query.bind(user_id);
+    for id in target_ids {
+        query = query.bind(id);
+    }
+
+    let rows = query.fetch_all(db).await?;
+    let mut map = std::collections::HashMap::new();
+    for (target_id, is_mutual, i_liked) in rows {
+        let status = if is_mutual.unwrap_or(false) {
+            "matched"
+        } else if i_liked.unwrap_or(false) {
+            "liked"
+        } else {
+            "none"
+        };
+        map.insert(target_id, status.to_string());
+    }
+    Ok(map)
+}
+
+/// Convert ISO 3166-1 alpha-3 country code to flag emoji
+fn country_code_to_flag(code: &str) -> String {
+    // Convert 3-letter to 2-letter for flag emoji
+    let alpha2 = match code.to_uppercase().as_str() {
+        "IND" => "IN", "USA" => "US", "GBR" => "GB", "AUS" => "AU",
+        "CAN" => "CA", "SGP" => "SG", "DEU" => "DE", "FRA" => "FR",
+        "JPN" => "JP", "KOR" => "KR", "CHN" => "CN", "NLD" => "NL",
+        "CHE" => "CH", "ISR" => "IL", "ZAF" => "ZA", "SAU" => "SA",
+        "ARE" => "AE", "BRA" => "BR", "MEX" => "MX", "NZL" => "NZ",
+        "HKG" => "HK", "TWN" => "TW", "MYS" => "MY", "THA" => "TH",
+        "PHL" => "PH", "IDN" => "ID", "VNM" => "VN", "PAK" => "PK",
+        "BGD" => "BD", "LKA" => "LK", "NPL" => "NP", "TUR" => "TR",
+        "RUS" => "RU", "POL" => "PL", "ESP" => "ES", "ITA" => "IT",
+        "IRL" => "IE", "SWE" => "SE", "NOR" => "NO", "DNK" => "DK",
+        "FIN" => "FI", "AUT" => "AT", "BEL" => "BE", "PRT" => "PT",
+        "COL" => "CO", "ARG" => "AR", "PER" => "PE", "CHL" => "CL",
+        "EGY" => "EG", "NGA" => "NG",
+        // If already 2-letter, use as-is
+        s if s.len() == 2 => return regional_indicator(s),
+        _ => return "🌍".to_string(),
+    };
+    regional_indicator(alpha2)
+}
+
+fn regional_indicator(code: &str) -> String {
+    code.chars()
+        .map(|c| char::from_u32(0x1F1E6 + (c as u32 - 'A' as u32)).unwrap_or('?'))
+        .collect()
+}
+
+fn get_student_search_photos(row: &StudentSearchRow) -> Vec<String> {
+    if let Some(Value::Array(items)) = &row.profile_photos {
+        let photos: Vec<String> = items
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        if !photos.is_empty() {
+            return photos;
+        }
+    }
+    if let Some(csv) = &row.profile_photo_url {
+        let photos: Vec<String> = csv
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if !photos.is_empty() {
+            return photos;
+        }
+    }
+    let mut photos = Vec::new();
+    if let Some(v) = &row.profile_photo_1 { if !v.is_empty() { photos.push(v.clone()); } }
+    if let Some(v) = &row.profile_photo_2 { if !v.is_empty() { photos.push(v.clone()); } }
+    if let Some(v) = &row.profile_photo_3 { if !v.is_empty() { photos.push(v.clone()); } }
+    photos
+}
+
+/// GET /search/students/suggestions — Trending universities + search suggestions
+pub async fn student_search_suggestions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let is_student = sqlx::query_scalar::<_, bool>(
+        "SELECT COALESCE(is_student_verified, FALSE) FROM users WHERE id = $1"
+    )
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    if !is_student {
+        return Err(AppError::forbidden("Student verification required"));
+    }
+
+    // Top universities by verified student count
+    let trending = sqlx::query_as::<_, (i64, String, Option<String>, String, String, Option<String>, i64)>(
+        r#"
+        SELECT univ.id, univ.name, univ.short_name, univ.country, univ.country_code,
+               univ.tier, COUNT(sv.id) AS student_count
+        FROM universities univ
+        INNER JOIN student_verifications sv ON sv.university_id = univ.id AND sv.status = 'approved'
+        WHERE univ.is_active = TRUE
+        GROUP BY univ.id, univ.name, univ.short_name, univ.country, univ.country_code, univ.tier
+        ORDER BY student_count DESC
+        LIMIT 20
+        "#
+    )
+    .fetch_all(state.read_pool())
+    .await?;
+
+    let trending_universities: Vec<Value> = trending.iter().map(|(id, name, _short, _country, _cc, _tier, count)| {
+        json!({
+            "id": id.to_string(),
+            "name": name,
+            "student_count": count
+        })
+    }).collect();
+
+    // Top cities with students
+    let top_cities = sqlx::query_as::<_, (String, i64)>(
+        r#"
+        SELECT l.city, COUNT(DISTINCT sv.user_id) AS student_count
+        FROM user_locations l
+        INNER JOIN student_verifications sv ON sv.user_id = l.user_id AND sv.status = 'approved'
+        WHERE l.city IS NOT NULL AND l.city != ''
+        GROUP BY l.city
+        ORDER BY student_count DESC
+        LIMIT 15
+        "#
+    )
+    .fetch_all(state.read_pool())
+    .await?;
+
+    let cities: Vec<Value> = top_cities.iter().map(|(city, count)| {
+        json!({ "name": city, "student_count": count })
+    }).collect();
+
+    // Countries with student presence
+    let countries = sqlx::query_as::<_, (String, String, i64)>(
+        r#"
+        SELECT univ.country, univ.country_code, COUNT(DISTINCT sv.user_id) AS student_count
+        FROM universities univ
+        INNER JOIN student_verifications sv ON sv.university_id = univ.id AND sv.status = 'approved'
+        GROUP BY univ.country, univ.country_code
+        ORDER BY student_count DESC
+        "#
+    )
+    .fetch_all(state.read_pool())
+    .await?;
+
+    let country_list: Vec<Value> = countries.iter().map(|(name, code, count)| {
+        json!({
+            "code": code,
+            "name": name,
+            "flag": country_code_to_flag(code),
+            "student_count": count
+        })
+    }).collect();
+
+    Ok(Json(json!({
+        "trending_universities": trending_universities,
+        "top_cities": cities,
+        "countries": country_list
+    })))
+}
+
+/// POST /search/students/{user_id}/like — Like a student from search results
+pub async fn like_student_from_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(target_user_id): AxumPath<i32>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Both must be verified students
+    let both_verified = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*) FROM users
+        WHERE id IN ($1, $2) AND is_student_verified = TRUE
+        "#
+    )
+    .bind(user_id)
+    .bind(target_user_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    if both_verified < 2 {
+        return Err(AppError::forbidden("Both users must be verified students"));
+    }
+
+    // Check if already swiped
+    let existing = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM swipes WHERE from_user_id = $1 AND to_user_id = $2"
+    )
+    .bind(user_id as i64)
+    .bind(target_user_id as i64)
+    .fetch_one(&state.db)
+    .await?;
+
+    if existing > 0 {
+        return Err(AppError::bad_request("Already swiped on this user"));
+    }
+
+    // Record the swipe
+    sqlx::query(
+        "INSERT INTO swipes (from_user_id, to_user_id, action, source) VALUES ($1, $2, 'like', 'student_search')"
+    )
+    .bind(user_id as i64)
+    .bind(target_user_id as i64)
+    .execute(&state.db)
+    .await?;
+
+    // Check for mutual match
+    let mutual = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM swipes WHERE from_user_id = $1 AND to_user_id = $2 AND action = 'like'"
+    )
+    .bind(target_user_id as i64)
+    .bind(user_id as i64)
+    .fetch_one(&state.db)
+    .await?;
+
+    let mut match_id: Option<String> = None;
+    if mutual > 0 {
+        let new_match_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO matches (id, user1_id, user2_id, status, user1_liked, user2_liked, created_at)
+            VALUES ($1, $2, $3, 'accepted', TRUE, TRUE, NOW())
+            ON CONFLICT DO NOTHING
+            "#
+        )
+        .bind(&new_match_id)
+        .bind(user_id)
+        .bind(target_user_id)
+        .execute(&state.db)
+        .await?;
+        match_id = Some(new_match_id);
+    }
+
+    Ok(Json(json!({
+        "liked": true,
+        "is_match": mutual > 0,
+        "match_id": match_id,
+        "source": "student_search"
+    })))
+}
+
+/// POST /search/students/{user_id}/message — Premium: direct message from search
+#[derive(Debug, Deserialize)]
+pub struct DirectMessageRequest {
+    pub message: String,
+}
+
+pub async fn direct_message_from_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(target_user_id): AxumPath<i32>,
+    Json(payload): Json<DirectMessageRequest>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Premium check
+    let active_pass = get_active_pass(&state.db, user_id).await?;
+    if active_pass.is_none() {
+        return Err(AppError::forbidden(
+            "Premium subscription required to message directly. Upgrade to unlock direct messaging."
+        ));
+    }
+
+    // Both must be verified students
+    let both_verified = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM users WHERE id IN ($1, $2) AND is_student_verified = TRUE"
+    )
+    .bind(user_id)
+    .bind(target_user_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    if both_verified < 2 {
+        return Err(AppError::forbidden("Both users must be verified students"));
+    }
+
+    // Validate message
+    let message = payload.message.trim();
+    if message.is_empty() || message.len() > 500 {
+        return Err(AppError::bad_request("Message must be 1-500 characters"));
+    }
+
+    // Ensure a match exists (create if premium direct message)
+    let existing_match = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT id FROM matches
+        WHERE (user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1)
+        LIMIT 1
+        "#
+    )
+    .bind(user_id)
+    .bind(target_user_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let match_id = if let Some(mid) = existing_match {
+        mid
+    } else {
+        // Premium privilege: create a direct connection (like LinkedIn InMail)
+        let new_match_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO matches (id, user1_id, user2_id, status, user1_liked, user2_liked, created_at)
+            VALUES ($1, $2, $3, 'pending_direct', TRUE, FALSE, NOW())
+            "#
+        )
+        .bind(&new_match_id)
+        .bind(user_id)
+        .bind(target_user_id)
+        .execute(&state.db)
+        .await?;
+        new_match_id
+    };
+
+    // Send the message
+    let message_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        r#"
+        INSERT INTO messages (id, match_id, sender_id, content, message_type, created_at)
+        VALUES ($1, $2, $3, $4, 'direct_search', NOW())
+        "#
+    )
+    .bind(&message_id)
+    .bind(&match_id)
+    .bind(user_id)
+    .bind(message)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "sent": true,
+        "message_id": message_id,
+        "match_id": match_id,
+        "type": "direct_search_message",
+        "premium_feature": true
+    })))
+}
+
+/// GET /search/students/profile/{user_id} — View a student's full profile from search
+pub async fn view_student_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(target_user_id): AxumPath<i32>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Must be verified student
+    let is_student = sqlx::query_scalar::<_, bool>(
+        "SELECT COALESCE(is_student_verified, FALSE) FROM users WHERE id = $1"
+    )
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    if !is_student {
+        return Err(AppError::forbidden("Student verification required"));
+    }
+
+    let active_pass = get_active_pass(&state.db, user_id).await?;
+    let is_premium = active_pass.is_some();
+
+    // Fetch target profile with university info
+    let profile = sqlx::query_as::<_, StudentSearchRow>(
+        r#"
+        SELECT u.id, u.name, u.dob, u.gender, u.bio,
+               u.profile_photo_url, u.profile_photos,
+               u.profile_photo_1, u.profile_photo_2, u.profile_photo_3,
+               u.is_verified, u.attractiveness_score, u.looking_for,
+               u.profession_title, u.height_cm,
+               l.city, l.latitude, l.longitude,
+               univ.name AS university_name,
+               univ.short_name AS university_short_name,
+               univ.tier AS university_tier,
+               univ.country AS university_country
+        FROM users u
+        INNER JOIN student_verifications sv ON sv.user_id = u.id AND sv.status = 'approved'
+        INNER JOIN universities univ ON univ.id = sv.university_id
+        LEFT JOIN user_locations l ON l.user_id = u.id
+        WHERE u.id = $1
+        "#
+    )
+    .bind(target_user_id)
+    .fetch_optional(state.read_pool())
+    .await?
+    .ok_or_else(|| AppError::not_found("Student profile not found"))?;
+
+    let photos = get_student_search_photos(&profile);
+    let age = profile.dob.map(|dob| {
+        let today = chrono::Utc::now().date_naive();
+        today.years_since(dob).unwrap_or(0) as i32
+    });
+
+    // Check existing interaction
+    let already_liked = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM swipes WHERE from_user_id = $1 AND to_user_id = $2 AND action = 'like'"
+    )
+    .bind(user_id as i64)
+    .bind(target_user_id as i64)
+    .fetch_one(state.read_pool())
+    .await
+    .unwrap_or(0);
+
+    let is_matched = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*) FROM matches
+        WHERE ((user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1))
+          AND status IN ('accepted', 'pending_direct')
+        "#
+    )
+    .bind(user_id)
+    .bind(target_user_id)
+    .fetch_one(state.read_pool())
+    .await
+    .unwrap_or(0);
+
+    let interaction_status = if is_matched > 0 {
+        "matched"
+    } else if already_liked > 0 {
+        "liked"
+    } else {
+        "none"
+    };
+
+    Ok(Json(json!({
+        "profile": {
+            "id": profile.id.to_string(),
+            "name": profile.name,
+            "age": age,
+            "gender": profile.gender,
+            "bio": profile.bio,
+            "photos": photos,
+            "is_verified": profile.is_verified.unwrap_or(false),
+            "looking_for": profile.looking_for,
+            "study": profile.profession_title,
+            "height_cm": profile.height_cm,
+            "city": profile.city,
+            "country": profile.university_country,
+            "university": profile.university_name,
+            "university_tier": profile.university_tier.as_ref().map(|t| format_tier(t)),
+            "distance": serde_json::Value::Null,
+            "can_message": is_premium || is_matched > 0,
+            "interaction_status": interaction_status
+        },
+        "is_premium": is_premium
+    })))
+}
+
+// ============================================================================
+// Unified Profile View — works from discover, reels, search, or any surface
+// ============================================================================
+
+/// GET /profile/{user_id} — Unified profile view from any surface
+pub async fn get_user_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(target_user_id): AxumPath<i32>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let source = params.get("source").cloned().unwrap_or_else(|| "profile".to_string());
+
+    if user_id == target_user_id {
+        return Err(AppError::bad_request("Use /me for your own profile"));
+    }
+
+    let read_db = state.read_pool();
+
+    // Fetch target user
+    let target = sqlx::query_as::<_, DiscoverUserRow>(
+        r#"
+        SELECT u.id, u.name, u.dob, u.gender, u.bio, u.profile_photo_url, u.profile_photos,
+               u.profile_photo_1, u.profile_photo_2, u.profile_photo_3,
+               u.is_verified, u.attractiveness_score, u.looking_for,
+               u.profession_title, u.height_cm,
+               l.city, l.latitude, l.longitude
+        FROM users u
+        LEFT JOIN user_locations l ON l.user_id = u.id
+        WHERE u.id = $1 AND u.is_active = TRUE
+        "#
+    )
+    .bind(target_user_id)
+    .fetch_optional(read_db)
+    .await?
+    .ok_or_else(|| AppError::not_found("User not found"))?;
+
+    let photos = get_photos_from_row(&target);
+    let age = target.dob.map(calculate_age);
+
+    // Distance from viewer
+    let my_location = fetch_user_location(read_db, user_id).await?;
+    let distance_km = if let (Some(ul), Some(lat), Some(lon)) = (&my_location, target.latitude, target.longitude) {
+        ul.latitude.zip(ul.longitude).map(|(ulat, ulon)| haversine_km(ulat, ulon, lat, lon))
+    } else {
+        None
+    };
+
+    // University info (name, tier, country)
+    let uni_map = batch_lookup_university_full(read_db, &[target_user_id]).await?;
+    let uni_info = uni_map.get(&target_user_id);
+
+    // Interaction status
+    let interaction_map = batch_lookup_interactions(read_db, user_id, &[target_user_id]).await?;
+    let interaction_status = interaction_map.get(&target_user_id).cloned().unwrap_or_else(|| "none".to_string());
+
+    // Premium check for messaging
+    let active_pass = get_active_pass(&state.db, user_id).await?;
+    let is_premium = active_pass.is_some();
+    let can_message = is_premium || interaction_status == "matched";
+
+    // Log profile view event for ML
+    let _ = log_interaction_event(
+        &state.db, user_id, target_user_id,
+        "profile_view", None, None, Some(&source),
+    ).await;
+
+    Ok(Json(json!({
+        "profile": {
+            "id": target.id,
+            "name": target.name,
+            "age": age,
+            "gender": target.gender,
+            "bio": target.bio,
+            "photos": photos,
+            "is_verified": target.is_verified.unwrap_or(false),
+            "looking_for": target.looking_for,
+            "study": target.profession_title,
+            "height_cm": target.height_cm,
+            "city": target.city,
+            "country": uni_info.map(|(_, _, country)| country.clone()),
+            "university": uni_info.map(|(name, _, _)| name.clone()),
+            "university_tier": uni_info.map(|(_, tier, _)| format_tier(tier)),
+            "distance": distance_km,
+            "distance_text": distance_km.map(format_distance),
+            "interaction_status": interaction_status,
+            "can_message": can_message,
+            "can_like": interaction_status == "none"
+        },
+        "source": source,
+        "is_premium": is_premium
+    })))
+}
+
+// ============================================================================
+// Like from Reel — like the reel creator directly from the reel feed
+// ============================================================================
+
+/// POST /reels/{reel_id}/like-creator — Like the creator of a reel (dating action)
+pub async fn like_reel_creator(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(reel_id): AxumPath<i64>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Get the reel's creator
+    let creator_id_i64 = sqlx::query_scalar::<_, i64>("SELECT user_id FROM reels WHERE id = $1 AND is_active = TRUE")
+        .bind(reel_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::not_found("Reel not found"))?;
+    let creator_id = creator_id_i64 as i32;
+
+    if user_id == creator_id {
+        return Err(AppError::bad_request("Cannot like yourself"));
+    }
+
+    // Determine user order (lower ID is user1)
+    let (user1_id, user2_id, is_user1) = if user_id < creator_id {
+        (user_id, creator_id, true)
+    } else {
+        (creator_id, user_id, false)
+    };
+
+    // Check for existing match record
+    let existing = sqlx::query_as::<_, MatchCheckRow>(
+        "SELECT id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match FROM matches WHERE user1_id = $1 AND user2_id = $2",
+    )
+    .bind(user1_id)
+    .bind(user2_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (is_match, match_id) = if let Some(m) = existing {
+        let other_liked = if is_user1 { m.user2_liked } else { m.user1_liked };
+        if other_liked.unwrap_or(false) {
+            // Mutual match!
+            sqlx::query(
+                "UPDATE matches SET is_mutual_match = TRUE, status = 'accepted', user1_liked = TRUE, user2_liked = TRUE WHERE id = $1"
+            )
+            .bind(&m.id)
+            .execute(&state.db)
+            .await?;
+            (true, Some(m.id))
+        } else {
+            // Update our like
+            let col = if is_user1 { "user1_liked" } else { "user2_liked" };
+            sqlx::query(&format!("UPDATE matches SET {} = TRUE WHERE id = $1", col))
+                .bind(&m.id)
+                .execute(&state.db)
+                .await?;
+            (false, Some(m.id))
+        }
+    } else {
+        // Create new match record
+        let new_id = sqlx::query_scalar::<_, String>(
+            r#"
+            INSERT INTO matches (user1_id, user2_id, user1_liked, user2_liked, is_mutual_match, status)
+            VALUES ($1, $2, $3, $4, FALSE, 'pending')
+            RETURNING id
+            "#,
+        )
+        .bind(user1_id)
+        .bind(user2_id)
+        .bind(is_user1)
+        .bind(!is_user1)
+        .fetch_one(&state.db)
+        .await
+        .ok();
+
+        (false, new_id)
+    };
+
+    // Log the interaction for ML (source = reel)
+    let _ = log_interaction_event(
+        &state.db, user_id, creator_id,
+        "like", None, None, Some("reel"),
+    ).await;
+
+    // Also record in swipes for consistency
+    let _ = sqlx::query(
+        "INSERT INTO swipes (from_user_id, to_user_id, action, source) VALUES ($1, $2, 'like', 'reel') ON CONFLICT DO NOTHING"
+    )
+    .bind(user_id as i64)
+    .bind(creator_id as i64)
+    .execute(&state.db)
+    .await;
+
+    state.metrics.inc_swipe_writes();
+
+    Ok(Json(json!({
+        "liked": true,
+        "is_match": is_match,
+        "match_id": match_id,
+        "creator_id": creator_id,
+        "source": "reel",
+        "reel_id": reel_id
     })))
 }

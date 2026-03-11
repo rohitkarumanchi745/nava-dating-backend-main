@@ -94,10 +94,13 @@ All endpoints require `Authorization: Bearer <jwt>` header unless noted.
 
 | Operation | Type | Description |
 |-----------|------|-------------|
-| `discover(filters: { useAi, limit })` | Query | Get swipeable profiles ranked by RL agent with `compatibilityScore` |
+| `discover(filters: { useAi, limit })` | Query | Get swipeable profiles ranked by RL agent with `compatibilityScore`, `superLikedYou` tag |
 | `likeUser(targetUserId)` | Mutation | Like a profile → feeds RL agent, returns `{ success, isMutual, matchId }` |
 | `passUser(targetUserId)` | Mutation | Skip a profile → feeds RL agent with negative signal |
 | `matches` | Query | Get all matches with partner details (mutual + received likes) |
+| `searchUniversities(query, limit)` | Query | Autocomplete university search with student counts |
+| `universityProfiles(universityId, gender, limit)` | Query | Browse profiles from a university with gender filter |
+| `unifiedSearch(query, gender, limit)` | Query | Combined search across universities and user profiles |
 
 ### ML Computation Endpoints
 
@@ -131,17 +134,38 @@ All endpoints require `Authorization: Bearer <jwt>` header unless noted.
 | `/llm/failed` | POST | Mark labeling job as failed |
 | `/llm/export` | GET | Export training snapshot for offline analysis |
 
+### Super Like
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/match/super-like` | POST | Super like a user — checks consumable balance (Platinum unlimited, Gold 5/day, purchased packs), records swipe, feeds RL agent with 3× reward signal |
+| `/profiles/super-like` | POST | Alias for `/match/super-like` |
+
+Super-likers appear higher in discover feed (+0.15 ML score boost) and are tagged with `superLikedYou: true`.
+
 ### University & Student Discovery
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/universities/search` | GET | Search universities by name |
+| `/universities/search` | GET | Search universities by name (autocomplete) |
 | `/universities/countries` | GET | List countries with universities |
 | `/universities/discover` | GET | Discover profiles from same university |
+| `/universities/{id}/profiles` | GET | Browse all profiles from a university with `?gender=male\|female&limit=50` filter |
 | `/universities/reels` | GET | University-specific reel feed |
 | `/universities/passes` | POST/GET | Purchase/get student discovery passes |
 
-### Reel Conversations
+### Global Student Search
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/search/students` | GET | Search student profiles by name with gender filter |
+| `/search/students/suggestions` | GET | Quick search suggestions (universities + profiles) |
+| `/search/unified` | GET | Combined search across universities and user profiles |
+| `/search/student/{id}` | GET | View detailed student profile |
+| `/search/student/{id}/like` | POST | Like a student from search results |
+| `/search/student/{id}/message` | POST | Send direct message from search |
+
+### Reel Conversations & Match Flow
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -150,6 +174,15 @@ All endpoints require `Authorization: Bearer <jwt>` header unless noted.
 | `/reels/inbox` | GET | Get messages received from reel viewers |
 | `/reels/reply` | POST | Reply to a reel message |
 | `/reels/message/read` | POST | Mark reel messages as read |
+| `/reels/match-request` | POST | Request a match from reel conversation (after mutual engagement) |
+| `/reels/match-accept` | POST | Accept or decline a reel match request → creates real match on accept |
+
+### Cross-Surface Actions
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/profiles/{id}` | GET | Get any user's public profile |
+| `/reels/{reel_id}/like-creator` | POST | Like a reel creator directly from their reel |
 
 ### Admin
 
@@ -255,7 +288,7 @@ Call states: `idle → connecting → ringing → active → idle`
 | **Backend** | Rust, Axum, Tokio, SQLx, async-graphql |
 | **Real-Time** | WebSocket pub/sub (chat + call signaling), typing indicators, read receipts |
 | **Databases** | PostgreSQL 16 (primary + read replicas), PgBouncer (connection pooling), Redis 7, Neo4j 5, ClickHouse |
-| **Event Bus** | In-process `tokio::broadcast` (typed DomainEvent enum, 17 event variants, 4096 capacity) |
+| **Event Bus** | In-process `tokio::broadcast` (typed DomainEvent enum, 23 event variants, 4096 capacity) |
 | **Analytics Engine** | Apache DataFusion v44 (Arrow RecordBatch, in-process SQL over Postgres data) |
 | **ML Engine** | Q-Learning RL (28-dim state, epsilon-greedy), LinUCB Contextual Bandit (UCB scoring), Shadow Scoring, FedAvg with Differential Privacy, On-Device Personalization Head, Cold-Start Biasing, Notification Click Predictor |
 | **Computer Vision** | tract-onnx (ArcFace, FER+, NSFW CNN/ViT, NIMA, Liveness), blur/low-light detection, photo ranking, duplicate face detection |
@@ -457,7 +490,8 @@ SQL candidates → Multi-signal scoring → Re-rank by blended score → Return 
   Filters       ┌─── 55% RL score (Q-learning)                  Like/Pass feeds back
   (age, dist,   ├─── 20% Geo score (gravity model + density)    into RL + LinUCB training
    verified)    ├─── 20% Affinity score (interest/lang/intent/CF)(every 10 swipes → checkpoint)
-                └─── + churn boost (up to 0.15 for at-risk users)
+                ├─── + churn boost (up to 0.15 for at-risk users)
+                └─── + super like boost (+0.15 if candidate super-liked you)
                       LinUCB shadow scoring (observability, top-half agreement)
 ```
 
@@ -594,10 +628,16 @@ Single Rust binary with clean domain boundaries, replacing the previous microser
 DomainEvent::UserRegistered       →  welcome notification, analytics
 DomainEvent::UserVerified         →  engagement notification
 DomainEvent::MatchCreated         →  match notification to both users
+DomainEvent::SwipeLike            →  RL agent training (1× reward)
+DomainEvent::SwipeSuperLike       →  super like notification + RL agent training (3× reward)
+DomainEvent::SwipePass            →  RL agent training (negative signal)
 DomainEvent::MessageSent          →  push notification to recipient
 DomainEvent::PaymentCompleted     →  premium activation, analytics
 DomainEvent::SubscriptionActivated →  confirmation notification
 DomainEvent::ReferralSignup       →  ambassador commission tracking
+DomainEvent::ReelMessage/Reply    →  reel conversation notifications
+DomainEvent::ReelMatchRequested   →  match request notification
+DomainEvent::ReelMatchAccepted    →  match accepted notification + real match creation
 DomainEvent::AnalyticsEvent       →  ClickHouse sink
 DomainEvent::SendPush/Email/Sms  →  notification delivery (FCM, APNs, SMTP, Twilio)
 ```
@@ -621,10 +661,10 @@ DomainEvent::SendPush/Email/Sms  →  notification delivery (FCM, APNs, SMTP, Tw
 ```
 ├── rust-backend/              # Modular Monolith (single Axum binary)
 │   ├── src/
-│   │   ├── handlers/          # REST + GraphQL endpoint handlers (150+)
+│   │   ├── handlers/          # REST + GraphQL endpoint handlers (170+)
 │   │   ├── modules/           # Domain modules (modular monolith)
 │   │   │   ├── events/        # In-process event bus (tokio::broadcast)
-│   │   │   │   └── mod.rs     # EventBus, DomainEvent (17 variants), EventEnvelope
+│   │   │   │   └── mod.rs     # EventBus, DomainEvent (23 variants), EventEnvelope
 │   │   │   ├── notifications/ # Notification module (replaces notification-service)
 │   │   │   │   ├── mod.rs     # NotificationModule, event listener, handler dispatch
 │   │   │   │   ├── policy.rs  # Thompson Sampling bandit, send-time optimization, daily caps, quiet hours
@@ -804,7 +844,7 @@ voiceIntroUrl, isProfileComplete, isVerified, isStudentVerified
 ```
 id, name, age, bio, location, photos[], interests[], languages[],
 compatibilityScore (RL-scored), professionTitle, isVerified,
-voiceIntroUrl, hasVoiceIntro, hasReels
+voiceIntroUrl, hasVoiceIntro, hasReels, superLikedYou
 ```
 
 ### ChatMessage

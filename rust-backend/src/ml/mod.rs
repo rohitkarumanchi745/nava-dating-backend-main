@@ -259,6 +259,18 @@ impl MlService {
         let churn_pred = self.engagement.churn.predict(&churn_features);
         let churn_boost = self.engagement.churn_boost(&churn_pred);
 
+        // Fetch candidates who have super-liked this user — they get a ranking boost
+        let super_likers: std::collections::HashSet<i32> = sqlx::query_scalar::<_, i64>(
+            "SELECT from_user_id FROM swipes WHERE to_user_id = $1 AND action = 'superlike'"
+        )
+        .bind(user_id as i64)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id as i32)
+        .collect();
+
         let mut rl_scored: Vec<(i32, f64)> = Vec::with_capacity(candidate_ids.len());
         let mut linucb_scored: Vec<(i32, f64)> = Vec::with_capacity(candidate_ids.len());
         let mut blended: Vec<(i32, f64)> = Vec::with_capacity(candidate_ids.len());
@@ -308,11 +320,16 @@ impl MlService {
                 cf_score,
             );
 
-            // Blend: RL 55% + Geo 20% + Affinity 20% + Churn boost (additive)
+            // Super like boost: +0.15 if this candidate super-liked the user
+            // This pushes super-likers ~15 percentile points higher in ranking
+            let super_like_boost = if super_likers.contains(&cid) { 0.15 } else { 0.0 };
+
+            // Blend: RL 55% + Geo 20% + Affinity 20% + Churn boost + Super Like boost
             let final_score = 0.55 * rl_score
                 + 0.20 * geo_score
                 + 0.20 * affinity_result.total
-                + churn_boost;
+                + churn_boost
+                + super_like_boost;
 
             blended.push((cid, final_score));
         }
@@ -370,7 +387,27 @@ impl MlService {
         candidate_id: i32,
         liked: bool,
     ) {
-        let reward = if liked { 1.0 } else { -0.5 };
+        self.record_swipe_weighted(pool, user_id, candidate_id, liked, false).await;
+    }
+
+    /// Record a swipe with optional super-like weighting.
+    /// Super likes get 3× reward signal, teaching the model that super-liked
+    /// profiles are high-intent matches worth surfacing.
+    pub async fn record_swipe_weighted(
+        &mut self,
+        pool: &PgPool,
+        user_id: i32,
+        candidate_id: i32,
+        liked: bool,
+        is_super_like: bool,
+    ) {
+        let reward = if is_super_like {
+            3.0  // 3× stronger positive signal for super likes
+        } else if liked {
+            1.0
+        } else {
+            -0.5
+        };
         let action = if liked { 1 } else { 0 };
 
         // Get features with graceful fallback

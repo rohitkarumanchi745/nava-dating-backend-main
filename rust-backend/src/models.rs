@@ -149,11 +149,9 @@ pub struct UserLocationFullRow {
 pub struct UserSubscriptionRow {
     pub id: i32,
     pub subscription_type: Option<String>,
-    pub pass_type: Option<String>,
     pub start_date: Option<NaiveDateTime>,
     pub end_date: Option<NaiveDateTime>,
     pub status: Option<String>,
-    pub is_active: Option<bool>,
 }
 
 #[derive(Debug, FromRow)]
@@ -591,6 +589,15 @@ pub struct DiscoverProfile {
     pub distance_text: Option<String>,
     pub city: Option<String>,
     pub compatibility_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub university: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub university_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interaction_status: Option<String>,
+    /// True if this person has super-liked the viewing user
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub super_liked_you: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

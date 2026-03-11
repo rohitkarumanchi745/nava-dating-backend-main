@@ -20,6 +20,7 @@ use crate::services::trust_safety::TrustSafetyService;
 use crate::services::moderation::ModerationPipeline;
 use crate::middleware::dual_write::DualWriteManager;
 use crate::ml::MlService;
+use crate::modules::events::EventBus;
 
 /// Shared application state
 #[derive(Clone)]
@@ -47,6 +48,8 @@ pub struct AppState {
     pub trust_safety: Option<Arc<TrustSafetyService>>,
     // Content moderation pipeline
     pub moderation: Option<Arc<ModerationPipeline>>,
+    // Event bus for domain events (notifications, analytics)
+    pub event_bus: Arc<EventBus>,
 }
 
 // Allow extracting AppState from Arc<AppState>

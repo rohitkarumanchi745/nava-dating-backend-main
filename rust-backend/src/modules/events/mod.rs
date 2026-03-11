@@ -37,6 +37,7 @@ pub enum DomainEvent {
     // Matching
     MatchCreated { match_id: i32, user1_id: i32, user2_id: i32 },
     SwipeLike { user_id: i32, target_user_id: i32 },
+    SwipeSuperLike { user_id: i32, target_user_id: i32 },
     SwipePass { user_id: i32, target_user_id: i32 },
 
     // Chat
@@ -58,6 +59,13 @@ pub enum DomainEvent {
     // Ambassador
     ReferralSignup { ambassador_id: i32, referred_user_id: i32, referral_name: String },
     CommissionEarned { ambassador_id: i32, amount_cents: i64 },
+
+    // Reels
+    ReelMessage { reel_id: i32, sender_id: i32, receiver_id: i32, content_preview: String },
+    ReelReply { reel_id: i32, replier_id: i32, original_sender_id: i32, content_preview: String },
+    ReelMatchEligible { reel_id: i32, user_a: i32, user_b: i32 },
+    ReelMatchRequested { reel_id: i32, requester_id: i32, target_id: i32 },
+    ReelMatchAccepted { reel_id: i32, match_id: String, user1_id: i32, user2_id: i32 },
 
     // Notifications (commands)
     SendPush { user_id: i32, title: String, body: String, data: Option<serde_json::Value> },
@@ -109,6 +117,7 @@ impl EventBus {
             DomainEvent::PremiumActivated { .. } => "user.premium_activated",
             DomainEvent::MatchCreated { .. } => "match.created",
             DomainEvent::SwipeLike { .. } => "match.swipe_like",
+            DomainEvent::SwipeSuperLike { .. } => "match.swipe_super_like",
             DomainEvent::SwipePass { .. } => "match.swipe_pass",
             DomainEvent::MessageSent { .. } => "chat.message_sent",
             DomainEvent::OrderCreated { .. } => "payment.order_created",
@@ -118,6 +127,11 @@ impl EventBus {
             DomainEvent::SubscriptionCancelled { .. } => "payment.subscription_cancelled",
             DomainEvent::ReferralSignup { .. } => "ambassador.referral_signup",
             DomainEvent::CommissionEarned { .. } => "ambassador.commission_earned",
+            DomainEvent::ReelMessage { .. } => "reel.message",
+            DomainEvent::ReelReply { .. } => "reel.reply",
+            DomainEvent::ReelMatchEligible { .. } => "reel.match_eligible",
+            DomainEvent::ReelMatchRequested { .. } => "reel.match_requested",
+            DomainEvent::ReelMatchAccepted { .. } => "reel.match_accepted",
             DomainEvent::SendPush { .. } => "notification.send_push",
             DomainEvent::SendEmail { .. } => "notification.send_email",
             DomainEvent::SendSms { .. } => "notification.send_sms",

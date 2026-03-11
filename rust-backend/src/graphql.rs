@@ -139,6 +139,38 @@ pub struct ProfessionOption {
     pub title: String,
 }
 
+#[derive(SimpleObject, Clone, Debug)]
+pub struct UniversityResult {
+    pub id: i64,
+    pub name: String,
+    pub domain: Option<String>,
+    pub country: Option<String>,
+    pub tier: Option<String>,
+    pub student_count: i64,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct UniversityProfileResult {
+    pub university: UniversityInfo,
+    pub profiles: Vec<DiscoverProfile>,
+    pub total: i64,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct UniversityInfo {
+    pub id: i64,
+    pub name: String,
+    pub domain: Option<String>,
+    pub country: Option<String>,
+    pub tier: Option<String>,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct UnifiedSearchResult {
+    pub universities: Vec<UniversityResult>,
+    pub profiles: Vec<DiscoverProfile>,
+}
+
 // ============================================================================
 // Input Types
 // ============================================================================
@@ -590,6 +622,258 @@ impl QueryRoot {
             created_at: r.created_at.map(|dt| dt.to_string()),
             is_read: r.is_read.unwrap_or(false),
         }).collect())
+    }
+
+    /// Search universities by name (autocomplete)
+    #[graphql(name = "searchUniversities")]
+    async fn search_universities(
+        &self,
+        ctx: &Context<'_>,
+        query: String,
+        limit: Option<i32>,
+    ) -> Result<Vec<UniversityResult>> {
+        let state = ctx.data::<AppState>()?;
+        let _user_id = get_user_id_from_context(ctx)?;
+
+        let search = format!("%{}%", query.trim());
+        let lim = limit.unwrap_or(10).min(50);
+
+        let rows = sqlx::query_as::<_, UniversitySearchRow>(
+            r#"
+            SELECT u.id, u.name, u.domain, u.country, u.tier,
+                   COUNT(sv.id) as student_count
+            FROM universities u
+            LEFT JOIN student_verifications sv ON sv.university_name = u.name AND sv.status = 'approved'
+            WHERE u.name ILIKE $1
+            GROUP BY u.id, u.name, u.domain, u.country, u.tier
+            ORDER BY COUNT(sv.id) DESC, u.name
+            LIMIT $2
+            "#,
+        )
+        .bind(&search)
+        .bind(lim)
+        .fetch_all(&state.db)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| UniversityResult {
+            id: r.id,
+            name: r.name,
+            domain: r.domain,
+            country: r.country,
+            tier: r.tier,
+            student_count: r.student_count.unwrap_or(0),
+        }).collect())
+    }
+
+    /// Get profiles from a specific university with optional gender filter
+    #[graphql(name = "universityProfiles")]
+    async fn university_profiles(
+        &self,
+        ctx: &Context<'_>,
+        university_id: i64,
+        gender: Option<String>,
+        limit: Option<i32>,
+    ) -> Result<UniversityProfileResult> {
+        let state = ctx.data::<AppState>()?;
+        let _user_id = get_user_id_from_context(ctx)?;
+
+        let lim = limit.unwrap_or(50).min(100);
+
+        // Get university info
+        let uni = sqlx::query_as::<_, UniversityInfoRow>(
+            "SELECT id, name, domain, country, tier FROM universities WHERE id = $1",
+        )
+        .bind(university_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| Error::new("University not found"))?;
+
+        let gender_filter = gender.as_deref().filter(|g| !g.trim().is_empty());
+
+        let (profiles, total) = if let Some(g) = gender_filter {
+            let rows = sqlx::query_as::<_, DiscoverRow>(
+                r#"
+                SELECT u.id, u.name, u.dob, u.gender, u.bio, u.location_text,
+                       u.profile_photo_1, u.profile_photo_2, u.profile_photo_3, u.profile_photos,
+                       u.interests, u.languages, u.is_verified, u.attractiveness_score,
+                       u.voice_intro_url, u.voice_intro_duration,
+                       u.profession_title, u.profession_category, u.looking_for, u.height_cm
+                FROM users u
+                JOIN student_verifications sv ON sv.user_id = u.id AND sv.status = 'approved'
+                WHERE sv.university_name = $1
+                  AND u.is_profile_complete = true AND u.is_active = true
+                  AND LOWER(u.gender) = LOWER($2)
+                ORDER BY u.attractiveness_score DESC NULLS LAST
+                LIMIT $3
+                "#,
+            )
+            .bind(&uni.name)
+            .bind(g)
+            .bind(lim)
+            .fetch_all(&state.db)
+            .await?;
+
+            let count = sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT COUNT(*) FROM users u
+                JOIN student_verifications sv ON sv.user_id = u.id AND sv.status = 'approved'
+                WHERE sv.university_name = $1 AND u.is_profile_complete = true AND u.is_active = true
+                  AND LOWER(u.gender) = LOWER($2)
+                "#,
+            )
+            .bind(&uni.name)
+            .bind(g)
+            .fetch_one(&state.db)
+            .await?;
+
+            (rows, count)
+        } else {
+            let rows = sqlx::query_as::<_, DiscoverRow>(
+                r#"
+                SELECT u.id, u.name, u.dob, u.gender, u.bio, u.location_text,
+                       u.profile_photo_1, u.profile_photo_2, u.profile_photo_3, u.profile_photos,
+                       u.interests, u.languages, u.is_verified, u.attractiveness_score,
+                       u.voice_intro_url, u.voice_intro_duration,
+                       u.profession_title, u.profession_category, u.looking_for, u.height_cm
+                FROM users u
+                JOIN student_verifications sv ON sv.user_id = u.id AND sv.status = 'approved'
+                WHERE sv.university_name = $1
+                  AND u.is_profile_complete = true AND u.is_active = true
+                ORDER BY u.attractiveness_score DESC NULLS LAST
+                LIMIT $2
+                "#,
+            )
+            .bind(&uni.name)
+            .bind(lim)
+            .fetch_all(&state.db)
+            .await?;
+
+            let count = sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT COUNT(*) FROM users u
+                JOIN student_verifications sv ON sv.user_id = u.id AND sv.status = 'approved'
+                WHERE sv.university_name = $1 AND u.is_profile_complete = true AND u.is_active = true
+                "#,
+            )
+            .bind(&uni.name)
+            .fetch_one(&state.db)
+            .await?;
+
+            (rows, count)
+        };
+
+        let discover_profiles: Vec<DiscoverProfile> = profiles.into_iter().map(|r| {
+            discover_row_to_profile(r)
+        }).collect();
+
+        Ok(UniversityProfileResult {
+            university: UniversityInfo {
+                id: uni.id,
+                name: uni.name,
+                domain: uni.domain,
+                country: uni.country,
+                tier: uni.tier,
+            },
+            profiles: discover_profiles,
+            total,
+        })
+    }
+
+    /// Unified search across universities and profiles
+    #[graphql(name = "unifiedSearch")]
+    async fn unified_search(
+        &self,
+        ctx: &Context<'_>,
+        query: String,
+        gender: Option<String>,
+        limit: Option<i32>,
+    ) -> Result<UnifiedSearchResult> {
+        let state = ctx.data::<AppState>()?;
+        let _user_id = get_user_id_from_context(ctx)?;
+
+        let search = format!("%{}%", query.trim());
+        let lim = limit.unwrap_or(20).min(50);
+
+        // Search universities
+        let uni_rows = sqlx::query_as::<_, UniversitySearchRow>(
+            r#"
+            SELECT u.id, u.name, u.domain, u.country, u.tier,
+                   COUNT(sv.id) as student_count
+            FROM universities u
+            LEFT JOIN student_verifications sv ON sv.university_name = u.name AND sv.status = 'approved'
+            WHERE u.name ILIKE $1
+            GROUP BY u.id, u.name, u.domain, u.country, u.tier
+            ORDER BY COUNT(sv.id) DESC, u.name
+            LIMIT $2
+            "#,
+        )
+        .bind(&search)
+        .bind(lim)
+        .fetch_all(&state.db)
+        .await?;
+
+        let universities: Vec<UniversityResult> = uni_rows.into_iter().map(|r| UniversityResult {
+            id: r.id,
+            name: r.name,
+            domain: r.domain,
+            country: r.country,
+            tier: r.tier,
+            student_count: r.student_count.unwrap_or(0),
+        }).collect();
+
+        // Search profiles by name
+        let gender_filter = gender.as_deref().filter(|g| !g.trim().is_empty());
+
+        let profile_rows = if let Some(g) = gender_filter {
+            sqlx::query_as::<_, DiscoverRow>(
+                r#"
+                SELECT u.id, u.name, u.dob, u.gender, u.bio, u.location_text,
+                       u.profile_photo_1, u.profile_photo_2, u.profile_photo_3, u.profile_photos,
+                       u.interests, u.languages, u.is_verified, u.attractiveness_score,
+                       u.voice_intro_url, u.voice_intro_duration,
+                       u.profession_title, u.profession_category, u.looking_for, u.height_cm
+                FROM users u
+                WHERE u.name ILIKE $1
+                  AND u.is_profile_complete = true AND u.is_active = true
+                  AND LOWER(u.gender) = LOWER($2)
+                ORDER BY u.attractiveness_score DESC NULLS LAST
+                LIMIT $3
+                "#,
+            )
+            .bind(&search)
+            .bind(g)
+            .bind(lim)
+            .fetch_all(&state.db)
+            .await?
+        } else {
+            sqlx::query_as::<_, DiscoverRow>(
+                r#"
+                SELECT u.id, u.name, u.dob, u.gender, u.bio, u.location_text,
+                       u.profile_photo_1, u.profile_photo_2, u.profile_photo_3, u.profile_photos,
+                       u.interests, u.languages, u.is_verified, u.attractiveness_score,
+                       u.voice_intro_url, u.voice_intro_duration,
+                       u.profession_title, u.profession_category, u.looking_for, u.height_cm
+                FROM users u
+                WHERE u.name ILIKE $1
+                  AND u.is_profile_complete = true AND u.is_active = true
+                ORDER BY u.attractiveness_score DESC NULLS LAST
+                LIMIT $2
+                "#,
+            )
+            .bind(&search)
+            .bind(lim)
+            .fetch_all(&state.db)
+            .await?
+        };
+
+        let profiles: Vec<DiscoverProfile> = profile_rows.into_iter().map(|r| {
+            discover_row_to_profile(r)
+        }).collect();
+
+        Ok(UnifiedSearchResult {
+            universities,
+            profiles,
+        })
     }
 
     /// Get student verification status
@@ -1502,6 +1786,77 @@ struct UserCompatibilityRow {
     languages: Option<serde_json::Value>,
     looking_for: Option<String>,
     gender: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct UniversitySearchRow {
+    id: i64,
+    name: String,
+    domain: Option<String>,
+    country: Option<String>,
+    tier: Option<String>,
+    student_count: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct UniversityInfoRow {
+    id: i64,
+    name: String,
+    domain: Option<String>,
+    country: Option<String>,
+    tier: Option<String>,
+}
+
+/// Convert a DiscoverRow to a GraphQL DiscoverProfile
+fn discover_row_to_profile(r: DiscoverRow) -> DiscoverProfile {
+    let age = r.dob.map(|dob| {
+        let today = chrono::Utc::now().date_naive();
+        let mut age = today.year() - dob.year();
+        if today.ordinal() < dob.ordinal() {
+            age -= 1;
+        }
+        age
+    });
+
+    let photos: Vec<String> = r.profile_photos
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+        .unwrap_or_else(|| {
+            [r.profile_photo_1, r.profile_photo_2, r.profile_photo_3]
+                .into_iter()
+                .flatten()
+                .collect()
+        });
+
+    let interests: Vec<String> = r.interests
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+
+    let languages: Vec<String> = r.languages
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+
+    let has_voice = r.voice_intro_url.is_some();
+
+    DiscoverProfile {
+        id: i64::from(r.id),
+        name: r.name,
+        age,
+        gender: r.gender,
+        bio: r.bio,
+        location: r.location_text,
+        photos,
+        interests,
+        compatibility_score: None,
+        distance_km: None,
+        is_verified: r.is_verified.unwrap_or(false),
+        voice_intro_url: r.voice_intro_url,
+        voice_intro_duration: r.voice_intro_duration,
+        has_voice_intro: has_voice,
+        profession_title: r.profession_title,
+        languages,
+        looking_for: r.looking_for,
+        height_cm: r.height_cm,
+    }
 }
 
 fn get_user_id_from_context(ctx: &Context<'_>) -> Result<i64> {

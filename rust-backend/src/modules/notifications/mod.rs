@@ -118,6 +118,23 @@ impl NotificationModule {
             DomainEvent::CommissionEarned { ambassador_id, amount_cents } => {
                 handlers.send_commission_earned(ambassador_id, amount_cents).await
             }
+            DomainEvent::ReelMessage { reel_id, sender_id, receiver_id, content_preview } => {
+                handlers.send_reel_message_notification(receiver_id, sender_id, reel_id, &content_preview).await
+            }
+            DomainEvent::ReelReply { reel_id, replier_id, original_sender_id, content_preview } => {
+                handlers.send_reel_reply_notification(original_sender_id, replier_id, reel_id, &content_preview).await
+            }
+            DomainEvent::ReelMatchEligible { reel_id, user_a, user_b } => {
+                handlers.send_reel_match_eligible_notification(user_a, user_b, reel_id).await?;
+                handlers.send_reel_match_eligible_notification(user_b, user_a, reel_id).await
+            }
+            DomainEvent::ReelMatchRequested { reel_id, requester_id, target_id } => {
+                handlers.send_reel_match_request_notification(target_id, requester_id, reel_id).await
+            }
+            DomainEvent::ReelMatchAccepted { reel_id, match_id, user1_id, user2_id } => {
+                handlers.send_reel_match_accepted_notification(user1_id, user2_id, reel_id, &match_id).await?;
+                handlers.send_reel_match_accepted_notification(user2_id, user1_id, reel_id, &match_id).await
+            }
             DomainEvent::SendPush { user_id, title, body, data } => {
                 handlers.send_push(user_id, &title, &body, data.as_ref()).await
             }
@@ -126,6 +143,9 @@ impl NotificationModule {
             }
             DomainEvent::SendSms { phone_number, message } => {
                 handlers.send_sms(&phone_number, &message).await
+            }
+            DomainEvent::SwipeSuperLike { user_id, target_user_id } => {
+                handlers.send_super_like_notification(target_user_id, user_id).await
             }
             // Events we don't need to send notifications for
             _ => Ok(()),
@@ -244,6 +264,22 @@ impl NotificationHandlers {
         Ok(())
     }
 
+    // ─── Super Like events ──────────────────────────────────────────
+
+    pub async fn send_super_like_notification(&self, target_user_id: i32, from_user_id: i32) -> Result<(), String> {
+        let name = self.user_name(from_user_id).await;
+        let title = "Someone Super Liked you!";
+        let body = format!("{} super liked you! Check them out.", name);
+        self.push.send(target_user_id, title, &body, None).await?;
+        if let Some(ref in_app) = self.in_app {
+            in_app.create(target_user_id, title, &body, "super_like", Some(&serde_json::json!({
+                "type": "super_like",
+                "from_user_id": from_user_id,
+            }))).await?;
+        }
+        Ok(())
+    }
+
     // ─── Chat events ─────────────────────────────────────────────────
 
     pub async fn send_message_notification(&self, recipient_id: i32, sender_id: i32, content_preview: Option<&str>) -> Result<(), String> {
@@ -295,6 +331,64 @@ impl NotificationHandlers {
         self.push.send(ambassador_id, "Commission Earned", &body, None).await
     }
 
+    // ─── Reel events ──────────────────────────────────────────────────
+
+    pub async fn send_reel_message_notification(&self, receiver_id: i32, sender_id: i32, reel_id: i32, preview: &str) -> Result<(), String> {
+        let sender_name = self.user_name(sender_id).await;
+        let truncated = if preview.len() > 50 { format!("{}...", &preview[..47]) } else { preview.to_string() };
+        let title = format!("{} messaged on your reel", sender_name);
+        let data = serde_json::json!({ "type": "reel_message", "reel_id": reel_id, "sender_id": sender_id });
+        self.push.send(receiver_id, &title, &truncated, Some(&data)).await?;
+        if let Some(ref in_app) = self.in_app {
+            in_app.create(receiver_id, &title, &truncated, "reel_message", Some(&data)).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn send_reel_reply_notification(&self, original_sender_id: i32, replier_id: i32, reel_id: i32, preview: &str) -> Result<(), String> {
+        let replier_name = self.user_name(replier_id).await;
+        let truncated = if preview.len() > 50 { format!("{}...", &preview[..47]) } else { preview.to_string() };
+        let title = format!("{} replied to your message", replier_name);
+        let data = serde_json::json!({ "type": "reel_reply", "reel_id": reel_id, "replier_id": replier_id });
+        self.push.send(original_sender_id, &title, &truncated, Some(&data)).await?;
+        if let Some(ref in_app) = self.in_app {
+            in_app.create(original_sender_id, &title, &truncated, "reel_reply", Some(&data)).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn send_reel_match_eligible_notification(&self, user_id: i32, other_user_id: i32, reel_id: i32) -> Result<(), String> {
+        let other_name = self.user_name(other_user_id).await;
+        let title = "Ready to match!";
+        let body = format!("You and {} have been chatting — request a match now!", other_name);
+        let data = serde_json::json!({ "type": "reel_match_eligible", "reel_id": reel_id, "other_user_id": other_user_id });
+        self.push.send(user_id, title, &body, Some(&data)).await?;
+        if let Some(ref in_app) = self.in_app {
+            in_app.create(user_id, title, &body, "reel_match_eligible", Some(&data)).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn send_reel_match_request_notification(&self, target_id: i32, requester_id: i32, reel_id: i32) -> Result<(), String> {
+        let requester_name = self.user_name(requester_id).await;
+        let title = "Match request!";
+        let body = format!("{} wants to match with you!", requester_name);
+        let data = serde_json::json!({ "type": "reel_match_request", "reel_id": reel_id, "requester_id": requester_id });
+        let utc_offset = self.user_utc_offset(target_id).await;
+        self.gated_send(target_id, NotifCategory::NewMatch, utc_offset, Some(&data)).await?;
+        Ok(())
+    }
+
+    pub async fn send_reel_match_accepted_notification(&self, user_id: i32, other_user_id: i32, reel_id: i32, match_id: &str) -> Result<(), String> {
+        let other_name = self.user_name(other_user_id).await;
+        let title = "It's a match!";
+        let body = format!("You and {} matched from a reel conversation!", other_name);
+        let data = serde_json::json!({ "type": "reel_match", "reel_id": reel_id, "match_id": match_id, "other_user_id": other_user_id });
+        let utc_offset = self.user_utc_offset(user_id).await;
+        self.gated_send(user_id, NotifCategory::NewMatch, utc_offset, Some(&data)).await?;
+        Ok(())
+    }
+
     // ─── Direct commands ─────────────────────────────────────────────
 
     pub async fn send_push(&self, user_id: i32, title: &str, body: &str, data: Option<&serde_json::Value>) -> Result<(), String> {
@@ -324,6 +418,17 @@ impl NotificationHandlers {
     }
 
     // ─── Private ─────────────────────────────────────────────────────
+
+    async fn user_name(&self, user_id: i32) -> String {
+        sqlx::query_scalar::<_, Option<String>>("SELECT name FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten()
+            .unwrap_or_else(|| "Someone".to_string())
+    }
 
     async fn user_utc_offset(&self, user_id: i32) -> i32 {
         let device_offset: Option<i32> = sqlx::query_scalar(
