@@ -43,6 +43,7 @@ use tower_http::{
     compression::CompressionLayer,
     cors::{Any, CorsLayer},
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    services::ServeDir,
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
@@ -302,6 +303,7 @@ async fn main() {
 
     // Load configuration first
     let config = Config::from_env();
+    let upload_dir = config.upload_dir.clone();
 
     // Initialize telemetry (with optional OpenTelemetry support)
     // Enable distributed tracing with: cargo build --features otel
@@ -724,7 +726,12 @@ async fn main() {
     };
 
     // Build the application with middleware stack
+    // Ensure uploads directory exists
+    tokio::fs::create_dir_all(&upload_dir).await.ok();
+
     let app = Router::new()
+        // Static file serving for uploaded photos
+        .nest_service("/uploads", ServeDir::new(&upload_dir))
         // Health & Metrics (enhanced for load balancers)
         .route("/health", get(health))
         .route("/health/detailed", get(health_detailed))  // Detailed health for monitoring
