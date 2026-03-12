@@ -511,7 +511,8 @@ pub async fn update_profile(
                 "Failed to save photo: {err}"
             )));
         }
-        saved_paths.push(path.to_string_lossy().to_string());
+        // Store URL path (not filesystem path) so it's directly usable by clients
+        saved_paths.push(format!("/uploads/{}", filename));
 
         // Build insights from pipeline quality scores
         if let Some(ref qr) = pipeline_result.quality {
