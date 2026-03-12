@@ -1151,30 +1151,68 @@ impl MutationRoot {
         let clean_photo_2 = profile_photo_2.filter(|p| !p.starts_with('#') && !p.is_empty());
         let clean_photo_3 = profile_photo_3.filter(|p| !p.starts_with('#') && !p.is_empty());
 
-        // Handle uploaded photo files - save them and collect URLs
+        // Handle uploaded photo files — run full pipeline (resize, NSFW, EXIF strip, quality)
         let mut uploaded_urls: Vec<String> = Vec::new();
-        for upload in photos.into_iter() {
+        let upload_dir = &state.config.upload_dir;
+        tokio::fs::create_dir_all(upload_dir).await.ok();
+
+        for (slot_idx, upload) in photos.into_iter().enumerate() {
             let upload_value = upload.value(ctx)?;
-            let filename = upload_value.filename.clone();
 
-            // Generate unique filename
-            let ext = filename.rsplit('.').next().unwrap_or("jpg");
-            let unique_name = format!("{}_{}.{}", user_id, uuid::Uuid::new_v4(), ext);
-
-            // Read file content using std::io::Read
+            // Read bytes
             let mut reader = upload_value.into_read();
             let mut content = Vec::new();
             std::io::Read::read_to_end(&mut reader, &mut content).ok();
 
-            // Save to uploads directory
-            let upload_dir = std::path::Path::new("/app/uploads/photos");
-            if !upload_dir.exists() {
-                std::fs::create_dir_all(upload_dir).ok();
-            }
-            let file_path = upload_dir.join(&unique_name);
-            std::fs::write(&file_path, &content).ok();
+            if content.is_empty() { continue; }
 
-            let photo_url = format!("/uploads/photos/{}", unique_name);
+            use crate::services::photo_pipeline::{run_pipeline, PhotoVerdict, PipelineTimeouts};
+            use image::ImageEncoder;
+
+            let photo_slot = format!("profile_photo_{}", slot_idx + 1);
+            let pipeline_timeouts = PipelineTimeouts::default();
+
+            let pipeline_result = match run_pipeline(
+                content,
+                user_id as i32,
+                &photo_slot,
+                state.vision.clone(),
+                state.moderation.clone(),
+                &state.db,
+                &pipeline_timeouts,
+            ).await {
+                Ok(r) => r,
+                Err(e) => return Err(async_graphql::Error::new(format!("Photo processing failed: {}", e))),
+            };
+
+            if pipeline_result.verdict == PhotoVerdict::Rejected {
+                let reason = pipeline_result.stages.iter()
+                    .find(|s| !s.passed)
+                    .and_then(|s| s.detail.as_deref())
+                    .unwrap_or("policy violation");
+                return Err(async_graphql::Error::new(format!("Photo {} rejected: {}", slot_idx + 1, reason)));
+            }
+
+            let image = match pipeline_result.processed_image.as_ref() {
+                Some(img) => img,
+                None => continue,
+            };
+
+            // Encode to JPEG
+            let mut jpeg_bytes = Vec::new();
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_bytes, 85);
+            if encoder.encode(
+                image.as_bytes(),
+                image.width(),
+                image.height(),
+                image.color().into(),
+            ).is_err() { continue; }
+
+            let unique_name = format!("{}_photo_{}_{}.jpg", user_id, slot_idx + 1, uuid::Uuid::new_v4());
+            let file_path = std::path::Path::new(upload_dir).join(&unique_name);
+            tokio::fs::write(&file_path, &jpeg_bytes).await.ok();
+
+            let photo_url = format!("/uploads/{}", unique_name);
             uploaded_urls.push(photo_url);
         }
 
