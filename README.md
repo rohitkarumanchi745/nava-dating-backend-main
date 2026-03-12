@@ -94,13 +94,29 @@ All endpoints require `Authorization: Bearer <jwt>` header unless noted.
 
 | Operation | Type | Description |
 |-----------|------|-------------|
-| `discover(filters: { useAi, limit })` | Query | Get swipeable profiles ranked by RL agent with `compatibilityScore`, `superLikedYou` tag |
+| `discover(filters)` | Query | Swipeable profiles ranked by RL agent with `compatibilityScore`, `superLikedYou` tag |
 | `likeUser(targetUserId)` | Mutation | Like a profile → feeds RL agent, returns `{ success, isMutual, matchId }` |
 | `passUser(targetUserId)` | Mutation | Skip a profile → feeds RL agent with negative signal |
-| `matches` | Query | Get all matches with partner details (mutual + received likes) |
-| `searchUniversities(query, limit)` | Query | Autocomplete university search with student counts |
+| `matches` | Query | All mutual matches with `partner`, `likeType` ("swipe"\|"super_like"), `message` fields |
+| `sentLikes` | Query | Likes sent by current user that haven't matched yet — `{ id, name, age, photo, likeType, likedAt }` |
+| `receivedLikes` | Query | Likes received from others — includes `message` if sent as message request |
+| `searchUniversities(query, limit)` | Query | University autocomplete with student counts (open to all auth'd users — no student verification required) |
 | `universityProfiles(universityId, gender, limit)` | Query | Browse profiles from a university with gender filter |
 | `unifiedSearch(query, gender, limit)` | Query | Combined search across universities and user profiles |
+
+### Profile Updates (GraphQL)
+
+| Operation | Type | Description |
+|-----------|------|-------------|
+| `update_profile(name, gender, dob, bio, university, universityLocation, study, ...)` | Mutation | Full profile update — accepts `Upload` scalar for photos, runs full photo pipeline (NSFW, liveness, resize, EXIF strip) |
+
+**Photo uploads:** Sent as GraphQL `Upload` scalar, processed through quality/NSFW/liveness pipeline, saved to `uploads/` directory, served at `GET /uploads/{filename}`. Photos that fail pipeline return an error with the rejection reason.
+
+### AI Insights (REST)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/ai/insights/{user_id}` | GET | Compatibility breakdown between current user and target — score 0-100, labels (Great Match / Good Match / etc.), breakdown by personality (55%), proximity (20%), interests/languages/goals (20%), super like boost, highlights |
 
 ### ML Computation Endpoints
 
@@ -270,8 +286,52 @@ Call states: `idle → connecting → ringing → active → idle`
 |----------|--------|-------------|
 | `/student/verify` | POST | Send OTP to .edu email |
 | `/student/verify-otp` | POST | Verify student OTP → adds verified badge |
-| `/student/status` | GET | Check student verification status |
+| `/student/verify/domain-otp` | POST | OTP to any institutional domain in university whitelist (.ac.in, .edu.in, etc.) |
+| `/student/verify/document` | POST | Upload student ID / enrollment letter / fee receipt / bonafide cert (multipart) |
+| `/student/status` | GET | Check student verification status + assurance level |
 | `/verify/selfie` | POST | Selfie liveness + face verification |
+| `/admin/verification/queue` | GET | Pending document verifications for human review (admin) |
+| `/admin/verification/{doc_id}/decision` | POST | Approve / reject / needs_more_info a submitted document (admin) |
+
+**Verification assurance levels:** `high` (email OTP / domain OTP / in-person), `medium` (document upload), `low` (campus IP supplemental)
+
+### Profile (REST)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/update-profile` | POST | Multipart: name, dob, gender, university, university_location, study, photos |
+| `/update-bio` | POST | Update bio text |
+| `/profile/me` | GET | Get current user's full profile |
+| `/profile/status` | GET | Profile completeness check |
+| `/profile/city-arrival` | PUT | Set city + arrival date; auto-sets `is_new_in_city` flag if within 60 days |
+| `/preferences` | POST | Update discovery preferences |
+
+### Student Search (REST)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/search/students` | GET | Search verified students with filters |
+| `/search/students/suggestions` | GET | Trending universities + search suggestions |
+| `/search/unified` | GET | Combined university + student name search |
+| `/search/student/{id}` | GET | View a student's full profile |
+
+**Search filters:** `q`, `university`, `university_id`, `city`, `country`, `gender`, `min_age`, `max_age`, `tier`, `class_year`, `is_alumni`, `new_in_city`
+
+### University Discovery (REST)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/universities/search` | GET | Search universities by name (no student verification required — open to all auth'd users for onboarding) |
+| `/universities/countries` | GET | List countries with universities |
+| `/universities/{id}/profiles` | GET | Browse student profiles at a university |
+
+### Referral & Invites (REST)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/referral/my-code` | GET | Get personal referral code + invite URL for QR generation |
+| `/api/referral/record` | POST | Record a referral (called on new user signup with code) |
+| `/api/referral/verify` | POST | Verify referral completion |
 
 ### Location (REST)
 
