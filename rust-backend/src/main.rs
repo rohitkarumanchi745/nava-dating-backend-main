@@ -132,7 +132,7 @@ use handlers::{
     ambassador::{
         ambassador_login, get_ambassador_profile, get_performance, get_daily_breakdown,
         get_hourly_breakdown, get_leaderboard, get_subscribers, get_active_subscribers,
-        admin_get_daily_signups, record_referral, verify_referral,
+        admin_get_daily_signups, record_referral, verify_referral, get_my_referral_code,
     },
 };
 
@@ -792,6 +792,7 @@ async fn main() {
         .route("/api/ambassador/subscribers", get(get_subscribers))
         .route("/api/ambassador/subscribers/active", get(get_active_subscribers))
         .route("/api/admin/ambassadors/daily", get(admin_get_daily_signups))
+        .route("/api/referral/my-code", get(get_my_referral_code))
         .route("/api/referral/record", post(record_referral))
         .route("/api/referral/verify", post(verify_referral))
         // Student

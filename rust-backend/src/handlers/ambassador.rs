@@ -16,6 +16,7 @@
 
 use axum::{
     extract::{Query, State},
+    http::HeaderMap,
     Json,
 };
 use chrono::NaiveDate;
@@ -669,5 +670,61 @@ pub async fn verify_referral(
     Ok(Json(json!({
         "success": verified,
         "message": if verified { "Referral verified" } else { "No pending referral found" }
+    })))
+}
+
+/// GET /api/referral/my-code
+/// Returns the user's personal referral code and invite link (creates one if none exists).
+/// iOS uses the invite_url to generate a QR code via CIQRCodeGenerator.
+pub async fn get_my_referral_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::handlers::extract_bearer_token;
+    use crate::handlers::decode_access_token;
+
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Look up existing active code
+    let existing = sqlx::query_as::<_, (String, i32, i32)>(
+        "SELECT code, COALESCE(current_uses, 0), reward_value FROM referral_codes WHERE user_id = $1 AND is_active = TRUE LIMIT 1"
+    )
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (code, uses, reward_days) = if let Some(row) = existing {
+        row
+    } else {
+        // Generate a unique 8-char code: first 4 chars of user name hash + 4 random
+        let raw = format!("{}{}", user_id, uuid::Uuid::new_v4());
+        let code = raw.chars()
+            .filter(|c| c.is_alphanumeric())
+            .take(8)
+            .collect::<String>()
+            .to_uppercase();
+
+        sqlx::query(r#"
+            INSERT INTO referral_codes (user_id, code, code_type, reward_type, reward_value, referee_reward_value, is_active)
+            VALUES ($1, $2, 'user', 'premium_days', 7, 7, TRUE)
+            ON CONFLICT (code) DO NOTHING
+        "#)
+        .bind(user_id)
+        .bind(&code)
+        .execute(&state.db)
+        .await?;
+
+        (code, 0, 7)
+    };
+
+    let invite_url = format!("https://nava.app/invite/{}", code);
+
+    Ok(Json(json!({
+        "code": code,
+        "invite_url": invite_url,
+        "uses": uses,
+        "reward_days": reward_days,
+        "share_text": format!("Join me on Nava! Use my invite code {} and get {} days of premium free. {}", code, reward_days, invite_url),
     })))
 }
