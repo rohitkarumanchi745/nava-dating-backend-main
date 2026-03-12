@@ -188,6 +188,9 @@ pub struct UpdateProfileInput {
     pub profession_title: Option<String>,
     pub height_cm: Option<i32>,
     pub photos: Option<Vec<String>>,
+    pub university: Option<String>,
+    pub university_location: Option<String>,
+    pub study: Option<String>,
 }
 
 #[derive(InputObject)]
@@ -1035,6 +1038,9 @@ impl MutationRoot {
         #[graphql(name = "profession_category")] profession_category: Option<String>,
         #[graphql(name = "profession_title")] profession_title: Option<String>,
         #[graphql(name = "height_cm")] height_cm: Option<i32>,
+        university: Option<String>,
+        #[graphql(name = "university_location")] university_location: Option<String>,
+        study: Option<String>,
         #[graphql(name = "profile_photo_1")] profile_photo_1: Option<String>,
         #[graphql(name = "profile_photo_2")] profile_photo_2: Option<String>,
         #[graphql(name = "profile_photo_3")] profile_photo_3: Option<String>,
@@ -1073,6 +1079,18 @@ impl MutationRoot {
             params.push(val.clone());
         }
         if let Some(ref val) = profession_title {
+            updates.push(format!("profession_title = ${}", params.len() + 2));
+            params.push(val.clone());
+        }
+        if let Some(ref val) = university {
+            updates.push(format!("university = ${}", params.len() + 2));
+            params.push(val.clone());
+        }
+        if let Some(ref val) = university_location {
+            updates.push(format!("location_text = ${}", params.len() + 2));
+            params.push(val.clone());
+        }
+        if let Some(ref val) = study {
             updates.push(format!("profession_title = ${}", params.len() + 2));
             params.push(val.clone());
         }
