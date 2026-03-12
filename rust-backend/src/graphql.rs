@@ -57,6 +57,21 @@ pub struct Match {
     pub status: Option<String>,
     pub matched_at: Option<String>,
     pub partner: Option<User>,
+    pub like_type: Option<String>,  // "swipe" | "super_like" | "message_request"
+    pub message: Option<String>,    // intro message if sent with like
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct LikedProfile {
+    pub id: i64,
+    pub name: Option<String>,
+    pub age: Option<i32>,
+    pub photo: Option<String>,
+    pub university: Option<String>,
+    pub study: Option<String>,
+    pub like_type: String,          // "like" | "super_like"
+    pub message: Option<String>,    // intro message if sent with like
+    pub liked_at: Option<String>,
 }
 
 #[derive(SimpleObject, Clone, Debug)]
@@ -546,10 +561,19 @@ impl QueryRoot {
         let user_id_i32 = user_id as i32;
         let rows = sqlx::query_as::<_, MatchRow>(
             r#"
-            SELECT id, user1_id, user2_id, is_mutual_match, status, created_at as matched_at
-            FROM matches
-            WHERE (user1_id = $1 OR user2_id = $1) AND is_mutual_match = true
-            ORDER BY created_at DESC
+            SELECT m.id, m.user1_id, m.user2_id, m.is_mutual_match, m.status,
+                   m.created_at as matched_at,
+                   CASE WHEN s.action = 'super_like' THEN 'super_like' ELSE 'swipe' END AS like_type,
+                   msg.content AS message
+            FROM matches m
+            LEFT JOIN swipes s ON (
+                (s.from_user_id = m.user1_id AND s.to_user_id = m.user2_id)
+                OR (s.from_user_id = m.user2_id AND s.to_user_id = m.user1_id)
+            ) AND s.action IN ('like', 'super_like')
+            LEFT JOIN messages msg ON msg.match_id = m.id AND msg.message_type = 'like_message'
+                AND msg.sender_id != $1
+            WHERE (m.user1_id = $1 OR m.user2_id = $1) AND m.is_mutual_match = true
+            ORDER BY m.created_at DESC
             "#,
         )
         .bind(user_id_i32)
@@ -570,10 +594,75 @@ impl QueryRoot {
                 status: row.status,
                 matched_at: row.matched_at.map(|dt| dt.to_string()),
                 partner,
+                like_type: row.like_type.or(Some("swipe".to_string())),
+                message: row.message,
             });
         }
 
         Ok(matches)
+    }
+
+    /// Get likes the current user has sent (pending, not yet matched)
+    #[graphql(name = "sentLikes")]
+    async fn sent_likes(&self, ctx: &Context<'_>) -> Result<Vec<LikedProfile>> {
+        let state = ctx.data::<AppState>()?;
+        let user_id = get_user_id_from_context(ctx)? as i32;
+
+        let rows = sqlx::query_as::<_, LikedProfileRow>(r#"
+            SELECT u.id, u.name, u.dob, u.profile_photo_1, u.profile_photo_url,
+                   u.profile_photos, u.university, u.profession_title,
+                   s.action as like_type, s.created_at as liked_at,
+                   NULL::text as message
+            FROM swipes s
+            JOIN users u ON u.id = s.to_user_id::int
+            WHERE s.from_user_id = $1
+              AND s.action IN ('like', 'super_like')
+              AND NOT EXISTS (
+                  SELECT 1 FROM matches m
+                  WHERE (m.user1_id = $1 AND m.user2_id = s.to_user_id::int)
+                     OR (m.user2_id = $1 AND m.user1_id = s.to_user_id::int)
+              )
+            ORDER BY s.created_at DESC
+            LIMIT 100
+        "#)
+        .bind(user_id)
+        .fetch_all(&state.db)
+        .await?;
+
+        Ok(rows.into_iter().map(liked_profile_row_to_type).collect())
+    }
+
+    /// Get likes received from other users (pending message requests + swipe likes)
+    #[graphql(name = "receivedLikes")]
+    async fn received_likes(&self, ctx: &Context<'_>) -> Result<Vec<LikedProfile>> {
+        let state = ctx.data::<AppState>()?;
+        let user_id = get_user_id_from_context(ctx)? as i32;
+
+        let rows = sqlx::query_as::<_, LikedProfileRow>(r#"
+            SELECT u.id, u.name, u.dob, u.profile_photo_1, u.profile_photo_url,
+                   u.profile_photos, u.university, u.profession_title,
+                   s.action as like_type, s.created_at as liked_at,
+                   msg.content as message
+            FROM swipes s
+            JOIN users u ON u.id = s.from_user_id::int
+            LEFT JOIN messages msg ON msg.sender_id = s.from_user_id::int
+                AND msg.receiver_id = $1
+                AND msg.message_type = 'like_message'
+            WHERE s.to_user_id = $1
+              AND s.action IN ('like', 'super_like')
+              AND NOT EXISTS (
+                  SELECT 1 FROM matches m
+                  WHERE (m.user1_id = $1 AND m.user2_id = s.from_user_id::int)
+                     OR (m.user2_id = $1 AND m.user1_id = s.from_user_id::int)
+              )
+            ORDER BY s.action DESC, s.created_at DESC
+            LIMIT 100
+        "#)
+        .bind(user_id)
+        .fetch_all(&state.db)
+        .await?;
+
+        Ok(rows.into_iter().map(liked_profile_row_to_type).collect())
     }
 
     /// Get conversation messages for a match
@@ -1424,6 +1513,8 @@ impl MutationRoot {
                 status: Some("active".to_string()),
                 matched_at: Some(chrono::Utc::now().to_string()),
                 partner,
+                like_type: Some("swipe".to_string()),
+                message: None,
             })
         } else {
             Ok(Match {
@@ -1434,6 +1525,8 @@ impl MutationRoot {
                 status: Some("pending".to_string()),
                 matched_at: None,
                 partner: None,
+                like_type: Some("swipe".to_string()),
+                message: None,
             })
         }
     }
@@ -1809,6 +1902,8 @@ struct MatchRow {
     is_mutual_match: Option<bool>,
     status: Option<String>,
     matched_at: Option<NaiveDateTime>,
+    like_type: Option<String>,
+    message: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1816,6 +1911,51 @@ struct MatchCheckRow {
     id: String,
     user1_liked: Option<bool>,
     user2_liked: Option<bool>,
+}
+
+#[derive(sqlx::FromRow)]
+struct LikedProfileRow {
+    id: i32,
+    name: Option<String>,
+    dob: Option<chrono::NaiveDate>,
+    profile_photo_1: Option<String>,
+    profile_photo_url: Option<String>,
+    profile_photos: Option<serde_json::Value>,
+    university: Option<String>,
+    profession_title: Option<String>,
+    like_type: Option<String>,
+    liked_at: Option<NaiveDateTime>,
+    message: Option<String>,
+}
+
+fn liked_profile_row_to_type(row: LikedProfileRow) -> LikedProfile {
+    let photo = row.profile_photo_1
+        .or_else(|| {
+            row.profile_photos
+                .as_ref()
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .or(row.profile_photo_url);
+
+    let age = row.dob.map(|dob| {
+        let today = chrono::Utc::now().date_naive();
+        today.years_since(dob).unwrap_or(0) as i32
+    });
+
+    LikedProfile {
+        id: row.id as i64,
+        name: row.name,
+        age,
+        photo,
+        university: row.university,
+        study: row.profession_title,
+        like_type: row.like_type.unwrap_or_else(|| "like".to_string()),
+        message: row.message,
+        liked_at: row.liked_at.map(|dt| dt.to_string()),
+    }
 }
 
 #[derive(sqlx::FromRow)]
