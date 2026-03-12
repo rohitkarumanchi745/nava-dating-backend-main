@@ -339,6 +339,9 @@ pub async fn update_profile(
     let mut name: Option<String> = None;
     let mut dob_raw: Option<String> = None;
     let mut gender: Option<String> = None;
+    let mut university: Option<String> = None;
+    let mut university_location: Option<String> = None;
+    let mut study: Option<String> = None;
     // Collect raw photo bytes first; pipeline runs after multipart parsing.
     let mut photo_bytes: Vec<Option<Vec<u8>>> = vec![None, None, None];
 
@@ -365,6 +368,24 @@ pub async fn update_profile(
                 let value = read_text_field(&mut field, 32).await?;
                 if !value.trim().is_empty() {
                     gender = Some(value.to_lowercase());
+                }
+            }
+            "university" => {
+                let value = read_text_field(&mut field, 256).await?;
+                if !value.trim().is_empty() {
+                    university = Some(value);
+                }
+            }
+            "university_location" => {
+                let value = read_text_field(&mut field, 256).await?;
+                if !value.trim().is_empty() {
+                    university_location = Some(value);
+                }
+            }
+            "study" => {
+                let value = read_text_field(&mut field, 200).await?;
+                if !value.trim().is_empty() {
+                    study = Some(value);
                 }
             }
             "profile_photo_1" | "profile_photo_2" | "profile_photo_3" => {
@@ -560,6 +581,9 @@ pub async fn update_profile(
             profile_photo_3 = $7,
             profile_photos = $8,
             attractiveness_score = $9,
+            university = COALESCE($11, university),
+            location_text = COALESCE($12, location_text),
+            profession_title = COALESCE($13, profession_title),
             is_profile_complete = TRUE,
             updated_at = NOW(),
             last_photo_updated_at = NOW()
@@ -576,6 +600,9 @@ pub async fn update_profile(
     .bind(photos_json)
     .bind(avg_attractiveness)
     .bind(user_id)
+    .bind(&university)
+    .bind(&university_location)
+    .bind(&study)
     .execute(&state.db)
     .await?;
 
@@ -6982,19 +7009,8 @@ pub async fn search_universities(
     Query(params): Query<UniversitySearchQuery>,
 ) -> Result<Json<Value>, AppError> {
     let token = extract_bearer_token(&headers)?;
-    let user_id = decode_access_token(&token, &state.config.secret_key)?;
-
-    // Verify user is a verified student
-    let is_verified = sqlx::query_scalar::<_, bool>(
-        "SELECT COALESCE(is_student_verified, FALSE) FROM users WHERE id = $1"
-    )
-    .bind(user_id)
-    .fetch_one(&state.db)
-    .await?;
-
-    if !is_verified {
-        return Err(AppError::forbidden("Student verification required to search universities"));
-    }
+    let _user_id = decode_access_token(&token, &state.config.secret_key)?;
+    // Auth required but no student verification needed — university search is used during onboarding
 
     let search_term = format!("%{}%", params.q.to_lowercase());
     let limit = params.limit.unwrap_or(20).min(50);
