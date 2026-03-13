@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use axum::extract::FromRef;
-use neo4rs::Graph;
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -30,8 +29,7 @@ pub struct AppState {
     /// Falls back to primary if not configured.
     pub db_read: Option<PgPool>,
     pub redis: Option<ConnectionManager>,
-    pub neo4j: Option<Arc<Graph>>,
-    pub graph_service: Option<Arc<GraphService>>,
+    pub graph_service: Arc<GraphService>,
     pub dual_write: Arc<DualWriteManager>,
     pub config: Config,
     pub vision: Option<Arc<Mutex<VisionAnalyzer>>>,
@@ -80,14 +78,9 @@ impl AppState {
         self.redis.as_ref().map(|conn| RedisService::new(conn.clone()))
     }
 
-    /// Get GraphService for dual-database operations
-    pub fn graph(&self) -> Option<&GraphService> {
-        self.graph_service.as_ref().map(|g| g.as_ref())
-    }
-
-    /// Check if Neo4j is available
-    pub async fn is_neo4j_available(&self) -> bool {
-        self.dual_write.can_write_neo4j().await
+    /// Get GraphService for graph queries
+    pub fn graph(&self) -> &GraphService {
+        self.graph_service.as_ref()
     }
 
     /// Check if PostgreSQL is available

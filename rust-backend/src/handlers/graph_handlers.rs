@@ -24,7 +24,6 @@ use crate::state::AppState;
 use crate::error::AppError;
 use crate::auth::{Claims, AdminClaims};
 use crate::services::graph_service::{RecommendationReason, UserRecommendation};
-use crate::middleware::dual_write::HealthResponse;
 
 // -----------------------------------------------------------------------------
 // Request/Response Types
@@ -45,7 +44,7 @@ fn default_limit() -> i32 {
 #[derive(Debug, Serialize)]
 pub struct RecommendationResponse {
     pub recommendations: Vec<UserRecommendationDto>,
-    pub source: String, // "neo4j" or "postgres_fallback"
+    pub source: String,
     pub total: usize,
 }
 
@@ -126,18 +125,9 @@ pub async fn get_fof_recommendations(
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| AppError::bad_request("Invalid user ID"))?;
 
-    let graph_service = state.graph()
-        .ok_or_else(|| AppError::internal("Graph service unavailable"))?;
-
-    let recommendations = graph_service
+    let recommendations = state.graph()
         .get_friend_of_friend_recommendations(user_id, params.limit)
         .await?;
-
-    let source = if state.is_neo4j_available().await {
-        "neo4j"
-    } else {
-        "postgres_fallback"
-    };
 
     let total = recommendations.len();
     let recommendations: Vec<UserRecommendationDto> = recommendations
@@ -147,7 +137,7 @@ pub async fn get_fof_recommendations(
 
     Ok(Json(RecommendationResponse {
         recommendations,
-        source: source.to_string(),
+        source: "postgres".to_string(),
         total,
     }))
 }
@@ -163,18 +153,9 @@ pub async fn get_university_recommendations(
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| AppError::bad_request("Invalid user ID"))?;
 
-    let graph_service = state.graph()
-        .ok_or_else(|| AppError::internal("Graph service unavailable"))?;
-
-    let recommendations = graph_service
+    let recommendations = state.graph()
         .get_university_recommendations(user_id, params.limit)
         .await?;
-
-    let source = if state.is_neo4j_available().await {
-        "neo4j"
-    } else {
-        "postgres_fallback"
-    };
 
     let total = recommendations.len();
     let recommendations: Vec<UserRecommendationDto> = recommendations
@@ -184,7 +165,7 @@ pub async fn get_university_recommendations(
 
     Ok(Json(RecommendationResponse {
         recommendations,
-        source: source.to_string(),
+        source: "postgres".to_string(),
         total,
     }))
 }
@@ -200,18 +181,9 @@ pub async fn get_interest_recommendations(
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| AppError::bad_request("Invalid user ID"))?;
 
-    let graph_service = state.graph()
-        .ok_or_else(|| AppError::internal("Graph service unavailable"))?;
-
-    let recommendations = graph_service
+    let recommendations = state.graph()
         .get_interest_recommendations(user_id, params.limit)
         .await?;
-
-    let source = if state.is_neo4j_available().await {
-        "neo4j"
-    } else {
-        "postgres_fallback"
-    };
 
     let total = recommendations.len();
     let recommendations: Vec<UserRecommendationDto> = recommendations
@@ -221,7 +193,7 @@ pub async fn get_interest_recommendations(
 
     Ok(Json(RecommendationResponse {
         recommendations,
-        source: source.to_string(),
+        source: "postgres".to_string(),
         total,
     }))
 }
@@ -237,8 +209,7 @@ pub async fn get_combined_recommendations(
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| AppError::bad_request("Invalid user ID"))?;
 
-    let graph_service = state.graph()
-        .ok_or_else(|| AppError::internal("Graph service unavailable"))?;
+    let graph_service = state.graph();
 
     // Fetch from all sources concurrently
     let (fof, university, interests) = tokio::join!(
@@ -283,17 +254,11 @@ pub async fn get_combined_recommendations(
         .map(|r| r.into())
         .collect();
 
-    let source = if state.is_neo4j_available().await {
-        "neo4j"
-    } else {
-        "postgres_fallback"
-    };
-
     let total = recommendations.len();
 
     Ok(Json(RecommendationResponse {
         recommendations,
-        source: source.to_string(),
+        source: "postgres".to_string(),
         total,
     }))
 }
@@ -306,10 +271,7 @@ pub async fn get_fraud_analysis(
     _admin: AdminClaims, // Requires admin authorization
     Path(user_id): Path<Uuid>,
 ) -> Result<Json<FraudAnalysisResponse>, AppError> {
-    let graph_service = state.graph()
-        .ok_or_else(|| AppError::internal("Graph service unavailable"))?;
-
-    let analysis = graph_service.detect_fraud_patterns(user_id).await?;
+    let analysis = state.graph().detect_fraud_patterns(user_id).await?;
 
     let risk_level = if analysis.fraud_score >= 70.0 {
         "high"
@@ -427,10 +389,7 @@ pub async fn get_university_network(
         .ok_or_else(|| AppError::not_found("User not verified with any university"))?;
 
     // Get potential matches from same university
-    let graph_service = state.graph()
-        .ok_or_else(|| AppError::internal("Graph service unavailable"))?;
-
-    let recommendations = graph_service
+    let recommendations = state.graph()
         .get_university_recommendations(user_id, 10)
         .await?;
 
@@ -447,75 +406,41 @@ pub async fn get_university_network(
     }))
 }
 
+/// Graph health status response
+#[derive(Debug, Serialize)]
+pub struct GraphHealthResponse {
+    pub status: String,
+    pub postgres_healthy: bool,
+}
+
 /// Get database health status
 /// GET /api/graph/health
 #[instrument(skip(state))]
 pub async fn get_graph_health(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<HealthResponse>, AppError> {
-    let status = state.database_health().await;
-    Ok(Json(status.into()))
+) -> Result<Json<GraphHealthResponse>, AppError> {
+    let health = state.graph().health_check().await;
+    Ok(Json(GraphHealthResponse {
+        status: if health.postgres_healthy { "healthy".to_string() } else { "degraded".to_string() },
+        postgres_healthy: health.postgres_healthy,
+    }))
 }
 
-/// Trigger manual sync (admin only)
+/// Trigger manual sync (admin only) — no-op now that Neo4j is removed
 /// POST /api/graph/sync
 #[derive(Debug, Serialize)]
 pub struct SyncResponse {
-    pub users_synced: i32,
-    pub users_errors: i32,
-    pub relationships_synced: i32,
-    pub relationships_errors: i32,
-    pub universities_synced: i32,
-    pub universities_errors: i32,
+    pub message: String,
 }
 
-#[instrument(skip(state, _admin))]
+#[instrument(skip(_state, _admin))]
 pub async fn trigger_sync(
-    State(state): State<Arc<AppState>>,
-    _admin: AdminClaims, // Requires admin authorization
+    State(_state): State<Arc<AppState>>,
+    _admin: AdminClaims,
 ) -> Result<Json<SyncResponse>, AppError> {
-    let graph_service = state.graph()
-        .ok_or_else(|| AppError::internal("Graph service unavailable"))?;
-
-    // Run all syncs concurrently
-    let (users_result, relationships_result, universities_result) = tokio::join!(
-        graph_service.sync_users_to_neo4j(),
-        graph_service.sync_relationships_to_neo4j(),
-        graph_service.sync_universities_to_neo4j()
-    );
-
-    let users = users_result.unwrap_or(crate::services::graph_service::SyncResult {
-        synced: 0,
-        errors: 0,
-        sync_type: "users".to_string(),
-    });
-
-    let relationships = relationships_result.unwrap_or(crate::services::graph_service::SyncResult {
-        synced: 0,
-        errors: 0,
-        sync_type: "relationships".to_string(),
-    });
-
-    let universities = universities_result.unwrap_or(crate::services::graph_service::SyncResult {
-        synced: 0,
-        errors: 0,
-        sync_type: "universities".to_string(),
-    });
-
-    info!(
-        "Manual sync completed: users={}/{}, relationships={}/{}, universities={}/{}",
-        users.synced, users.errors,
-        relationships.synced, relationships.errors,
-        universities.synced, universities.errors
-    );
-
+    info!("Sync endpoint called — no-op (Neo4j removed, Postgres is source of truth)");
     Ok(Json(SyncResponse {
-        users_synced: users.synced,
-        users_errors: users.errors,
-        relationships_synced: relationships.synced,
-        relationships_errors: relationships.errors,
-        universities_synced: universities.synced,
-        universities_errors: universities.errors,
+        message: "No sync needed — all data is in PostgreSQL".to_string(),
     }))
 }
 

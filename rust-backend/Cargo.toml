@@ -21,8 +21,6 @@ sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chron
 # Redis
 redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
 
-# Neo4j Graph Database
-neo4rs = "0.8"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

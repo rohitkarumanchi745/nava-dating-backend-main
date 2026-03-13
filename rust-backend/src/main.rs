@@ -58,7 +58,6 @@ use services::freshness::FreshnessDecayJob;
 use middleware::dual_write::DualWriteManager;
 use middleware::security::security_headers_middleware;
 use handlers::graph_handlers::graph_routes;
-use jobs::sync_job::{SyncJobRunner, SyncJobConfig};
 use jobs::dlq_processor::{DlqProcessorRunner, DlqProcessorConfig};
 
 use auth::decode_access_token;
@@ -437,33 +436,9 @@ async fn main() {
         None
     };
 
-    // Neo4j connection (optional - for graph-powered features)
-    // Using HTTP API for Neo4j 5.x compatibility (Bolt protocol has auth issues with neo4rs)
-    let neo4j_uri = std::env::var("NEO4J_URI").ok();
-    let neo4j_user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".to_string());
-    let neo4j_password = std::env::var("NEO4J_PASSWORD").ok();
-
-
-    let (neo4j, graph_service) = if let (Some(uri), Some(password)) = (neo4j_uri, neo4j_password) {
-        // Parse host from URI
-        let uri_clean = uri.replace("bolt://", "").replace("neo4j://", "");
-        let host = uri_clean.split(':').next().unwrap_or("127.0.0.1");
-
-        // Create HTTP-based Neo4j service (works with Neo4j 5.x)
-        let service = GraphService::with_http(host, &neo4j_user, &password, db.clone());
-
-        // Test connection
-        if service.health_check().await.neo4j_healthy {
-            info!("Connected to Neo4j at {} via HTTP API", uri);
-            (None, Some(Arc::new(service)))
-        } else {
-            warn!("Failed to connect to Neo4j HTTP API. Continuing without graph features.");
-            (None, None)
-        }
-    } else {
-        info!("Neo4j not configured. Graph features disabled.");
-        (None, None)
-    };
+    // Graph service backed by PostgreSQL CTEs (no Neo4j dependency)
+    let graph_service = Arc::new(GraphService::new(db.clone()));
+    info!("Graph service initialized (PostgreSQL CTE mode)");
 
     // Initialize dual-write manager for fault tolerance
     let dual_write = Arc::new(DualWriteManager::new());
@@ -566,7 +541,6 @@ async fn main() {
         db,
         db_read: db_read_replica,
         redis,
-        neo4j,
         graph_service,
         dual_write: dual_write.clone(),
         config,
@@ -582,20 +556,6 @@ async fn main() {
         moderation,
         event_bus: event_bus.clone(),
     };
-
-    // Run startup sync if Neo4j is connected
-    if state.graph_service.is_some() {
-        if let Err(e) = jobs::sync_job::run_startup_sync(&state).await {
-            warn!("Startup sync failed: {}. Will sync in background.", e);
-        }
-
-        // Start background sync jobs
-        let sync_runner = SyncJobRunner::new(Arc::new(state.clone()), SyncJobConfig::default());
-        tokio::spawn(async move {
-            sync_runner.start().await;
-        });
-        info!("Background sync jobs started");
-    }
 
     // Start DLQ processor for payment retry handling
     if state.payment_service.is_some() {

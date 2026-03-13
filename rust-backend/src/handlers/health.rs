@@ -32,7 +32,6 @@ pub struct ExtendedHealthResponse {
     pub uptime_secs: u64,
     pub db: DbHealthStatus,
     pub redis: RedisHealthStatus,
-    pub neo4j: &'static str,
     pub vision: &'static str,
     pub metrics: HealthMetrics,
 }
@@ -92,9 +91,6 @@ pub async fn health_detailed(State(state): State<AppState>) -> (StatusCode, Json
         false
     };
 
-    // Neo4j health
-    let neo4j_ok = state.graph_service.is_some();
-
     // Vision health
     let vision_ok = state.vision.is_some();
 
@@ -125,7 +121,6 @@ pub async fn health_detailed(State(state): State<AppState>) -> (StatusCode, Json
             status: if redis_ok { "healthy" } else { "unavailable" },
             connected: redis_ok,
         },
-        neo4j: if neo4j_ok { "connected" } else { "unavailable" },
         vision: if vision_ok { "enabled" } else { "disabled" },
         metrics,
     };
