@@ -1392,6 +1392,15 @@ impl MutationRoot {
         .execute(&state.db)
         .await;
 
+        // Sync university to Neo4j (STUDIES_AT relationship) — fire and forget
+        if let Some(ref uname) = university {
+            if !uname.is_empty() {
+                if let Ok(graph) = ctx.data::<crate::services::graph_service::GraphService>() {
+                    let _ = graph.set_user_university(user_id as i32, uname).await;
+                }
+            }
+        }
+
         // Return success
         Ok(true)
     }

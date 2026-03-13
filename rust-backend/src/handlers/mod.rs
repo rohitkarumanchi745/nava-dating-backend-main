@@ -2883,6 +2883,138 @@ pub async fn verify_student_document(
     })))
 }
 
+// ============================================================================
+// Alumni Verification
+// ============================================================================
+
+/// POST /alumni/verify-degree  (multipart)
+/// Fields: file (binary), university_name (string, optional), graduation_year (string, optional)
+/// Auto-approves if image is valid; otherwise queues for 24h manual review.
+pub async fn verify_alumni_degree(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut university_name: Option<String> = None;
+    let mut graduation_year: Option<i32> = None;
+
+    while let Some(mut field) = multipart.next_field().await
+        .map_err(|_| AppError::bad_request("Invalid multipart data"))? {
+        match field.name().unwrap_or("") {
+            "file"            => { file_bytes = Some(field.bytes().await.unwrap_or_default().to_vec()); }
+            "university_name" => { university_name = Some(field.text().await.unwrap_or_default()); }
+            "graduation_year" => {
+                if let Ok(y) = field.text().await.unwrap_or_default().parse::<i32>() {
+                    graduation_year = Some(y);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let file_bytes = file_bytes.ok_or_else(|| AppError::bad_request("file is required"))?;
+    if file_bytes.is_empty() { return Err(AppError::bad_request("file is empty")); }
+    if file_bytes.len() > state.config.max_photo_bytes {
+        return Err(AppError::bad_request(format!(
+            "File exceeds {}MB limit",
+            state.config.max_photo_bytes / 1024 / 1024
+        )));
+    }
+
+    // Store document — derive extension from magic bytes so HEIC/PNG/PDF are all preserved
+    let ext = detect_image_ext(&file_bytes);
+    let uploads_dir = std::path::Path::new("uploads/verification/alumni");
+    tokio::fs::create_dir_all(uploads_dir).await
+        .map_err(|e| AppError::Internal(format!("Upload dir error: {}", e)))?;
+    let file_name = format!("alumni_degree_{}_{}_{}.{}", user_id, uuid::Uuid::new_v4(), Utc::now().timestamp(), ext);
+    let file_path = uploads_dir.join(&file_name);
+    tokio::fs::write(&file_path, &file_bytes).await
+        .map_err(|e| AppError::Internal(format!("Failed to store file: {}", e)))?;
+    let doc_path = file_path.to_string_lossy().to_string();
+
+    let uni_name = university_name.as_deref().unwrap_or("Unknown University");
+    let expires_at = (Utc::now() + chrono::Duration::days(90)).naive_utc();
+
+    // Delete any prior pending alumni verification
+    sqlx::query("DELETE FROM student_verifications WHERE user_id = $1 AND is_alumni = TRUE AND status = 'pending'")
+        .bind(user_id).execute(&state.db).await?;
+
+    let sv_id = sqlx::query_scalar::<_, i32>(r#"
+        INSERT INTO student_verifications
+            (user_id, university_name, graduation_year, email, status, verification_method,
+             is_alumni, alumni_doc_path, assurance_level, submitted_at, expires_at)
+        VALUES ($1, $2, $3, '', 'pending', 'alumni_degree', TRUE, $4, 'medium', NOW(), $5)
+        RETURNING id
+    "#)
+    .bind(user_id).bind(uni_name).bind(graduation_year).bind(&doc_path).bind(expires_at)
+    .fetch_one(&state.db).await?;
+
+    Ok(Json(json!({
+        "submitted": true,
+        "verification_id": sv_id,
+        "method": "alumni_degree",
+        "status": "pending",
+        "message": "Degree submitted for review. We'll verify within 24 hours.",
+        "auto_approved": false
+    })))
+}
+
+/// POST /alumni/verify-linkedin
+/// Body: { "linkedin_url": "https://linkedin.com/in/...", "university_name": "..." }
+/// Always goes to manual review.
+pub async fn verify_alumni_linkedin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let linkedin_url = body.get("linkedin_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::bad_request("linkedin_url is required"))?;
+
+    // Basic URL validation
+    if !linkedin_url.starts_with("https://www.linkedin.com/in/") && !linkedin_url.starts_with("https://linkedin.com/in/") {
+        return Err(AppError::bad_request("Please provide a valid LinkedIn profile URL (https://linkedin.com/in/...)"));
+    }
+
+    let university_name = body.get("university_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown University");
+
+    let expires_at = (Utc::now() + chrono::Duration::days(90)).naive_utc();
+
+    // Delete any prior pending alumni linkedin verification
+    sqlx::query("DELETE FROM student_verifications WHERE user_id = $1 AND is_alumni = TRUE AND status = 'pending' AND verification_method = 'alumni_linkedin'")
+        .bind(user_id).execute(&state.db).await?;
+
+    let sv_id = sqlx::query_scalar::<_, i32>(r#"
+        INSERT INTO student_verifications
+            (user_id, university_name, email, status, verification_method,
+             is_alumni, linkedin_url, assurance_level, submitted_at, expires_at)
+        VALUES ($1, $2, '', 'pending', 'alumni_linkedin', TRUE, $3, 'low', NOW(), $4)
+        RETURNING id
+    "#)
+    .bind(user_id).bind(university_name).bind(&linkedin_url).bind(expires_at)
+    .fetch_one(&state.db).await?;
+
+    Ok(Json(json!({
+        "submitted": true,
+        "verification_id": sv_id,
+        "method": "alumni_linkedin",
+        "status": "pending",
+        "message": "LinkedIn profile submitted for manual review. This typically takes 24–48 hours.",
+        "auto_approved": false
+    })))
+}
+
 /// GET /admin/verification/queue — List pending document verifications (admin only)
 pub async fn admin_verification_queue(
     State(state): State<AppState>,
@@ -3164,10 +3296,16 @@ pub async fn create_spot(
         .await
         .map_err(|_| AppError::internal("Failed to create spots directory"))?;
 
-    let ext = if mime.contains("mp4") {
+    let ext = if mime.contains("quicktime") || mime.contains("mov") {
+        "mov"
+    } else if mime.contains("mp4") || mime.contains("m4v") {
         "mp4"
     } else if mime.contains("webm") {
         "webm"
+    } else if mime.contains("hevc") {
+        "hevc"
+    } else if mime.contains("x-m4v") {
+        "m4v"
     } else if mime.contains("audio") {
         "m4a"
     } else {
@@ -3555,6 +3693,32 @@ fn encode_jpeg(image: &DynamicImage) -> Result<Vec<u8>, AppError> {
 async fn cleanup_files(paths: &[String]) {
     for path in paths {
         let _ = fs::remove_file(path).await;
+    }
+}
+
+/// Detect a safe file extension from the first few magic bytes.
+/// Used for storing alumni degree docs in their original format.
+fn detect_image_ext(bytes: &[u8]) -> &'static str {
+    if bytes.len() < 4 { return "bin"; }
+    match &bytes[..4] {
+        [0xFF, 0xD8, 0xFF, _]       => "jpg",
+        [0x89, 0x50, 0x4E, 0x47]    => "png",
+        [0x47, 0x49, 0x46, _]       => "gif",
+        [0x49, 0x49, 0x2A, 0x00]
+        | [0x4D, 0x4D, 0x00, 0x2A]  => "tiff",
+        [0x25, 0x50, 0x44, 0x46]    => "pdf",
+        [0x52, 0x49, 0x46, 0x46]    => "webp",  // RIFF....WEBP
+        _ => {
+            // HEIC/HEIF: ftyp box at offset 4
+            if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+                let brand = &bytes[8..12];
+                if brand == b"heic" || brand == b"heis" || brand == b"heix" { return "heic"; }
+                if brand == b"heif" || brand == b"mif1"                     { return "heif"; }
+                if brand == b"isom" || brand == b"mp41" || brand == b"mp42" { return "mp4";  }
+                if brand == b"qt  "                                         { return "mov";  }
+            }
+            "bin"
+        }
     }
 }
 
@@ -4791,6 +4955,64 @@ pub struct CreateReelPayload {
     pub location_tag: Option<String>,
 }
 
+/// POST /reels/upload-video — accepts multipart video binary, stores to disk, returns video_url.
+/// Called immediately when the user picks a video (pre-upload before tapping Post).
+pub async fn upload_reel_video(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let mut video_data: Option<Vec<u8>> = None;
+    let mut mime_type: Option<String> = None;
+
+    while let Some(mut field) = multipart.next_field().await.map_err(|_| AppError::bad_request("Invalid multipart"))? {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "video" {
+            let ct = field.content_type().map(|v| v.to_string()).unwrap_or_default();
+            if !ct.starts_with("video/") {
+                return Err(AppError::bad_request("Field 'video' must be a video file"));
+            }
+            mime_type = Some(ct);
+            video_data = Some(read_binary_field(&mut field, state.config.max_video_bytes).await?);
+        } else {
+            // drain unknown fields
+            while field.chunk().await.map_err(|_| AppError::bad_request("Read error"))?.is_some() {}
+        }
+    }
+
+    let video_bytes = video_data.ok_or_else(|| AppError::bad_request("Missing 'video' field"))?;
+    let mime = mime_type.unwrap_or_else(|| "video/mp4".to_string());
+
+    let ext = if mime.contains("quicktime") || mime.contains("mov") {
+        "mov"
+    } else if mime.contains("mp4") || mime.contains("m4v") {
+        "mp4"
+    } else if mime.contains("webm") {
+        "webm"
+    } else if mime.contains("hevc") {
+        "hevc"
+    } else {
+        "mp4"
+    };
+
+    let upload_dir = &state.config.upload_dir;
+    fs::create_dir_all(format!("{}/reels", upload_dir))
+        .await
+        .map_err(|_| AppError::internal("Failed to create reels directory"))?;
+
+    let filename = format!("reels/{}_{}_{}.{}", user_id, Utc::now().timestamp(), Uuid::new_v4(), ext);
+    let disk_path = format!("{}/{}", upload_dir, filename);
+    fs::write(&disk_path, &video_bytes)
+        .await
+        .map_err(|_| AppError::internal("Failed to save video"))?;
+
+    let video_url = format!("/uploads/{}", filename);
+    Ok(Json(json!({ "video_url": video_url })))
+}
+
 pub async fn create_reel(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4867,7 +5089,14 @@ pub async fn get_reel_feed(
     .await?
     .unwrap_or(0.3); // New users get 30% exploration
 
-    // ── Step 2: Candidate generation — 5x limit, exclude seen reels ──
+    // ── Step 2a: Load viewer's city for location boosting ──
+    let viewer_city: Option<String> = sqlx::query_scalar("SELECT city FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(read_db)
+        .await?
+        .flatten();
+
+    // ── Step 2b: Candidate generation — 5x limit, exclude seen reels ──
     let candidate_pool = (limit * 5).min(200);
 
     #[derive(sqlx::FromRow)]
@@ -4889,6 +5118,7 @@ pub async fn get_reel_feed(
         creator_photo: Option<String>,
         creator_verified: Option<bool>,
         creator_attractiveness: Option<f64>,
+        creator_city: Option<String>,
     }
 
     let candidates = sqlx::query_as::<_, ReelCandidate>(
@@ -4897,7 +5127,8 @@ pub async fn get_reel_feed(
                r.caption, r.tags, r.category, r.engagement_score, r.avg_watch_percent,
                r.view_count, r.like_count, r.created_at,
                u.name as creator_name, u.profile_photo_1 as creator_photo,
-               u.is_verified as creator_verified, u.attractiveness_score as creator_attractiveness
+               u.is_verified as creator_verified, u.attractiveness_score as creator_attractiveness,
+               COALESCE(r.creator_city, u.city) as creator_city
         FROM reels r
         JOIN users u ON u.id = r.user_id
         WHERE r.is_active = TRUE
@@ -4947,9 +5178,15 @@ pub async fn get_reel_feed(
             .unwrap_or(168.0); // Default 7 days old
         let freshness = (-0.693 * age_hours / 24.0).exp(); // ln(2)/24h
 
-        // ── Creator compatibility (15%) ──
+        // ── Creator compatibility (10%) ──
         let attractiveness = r.creator_attractiveness.unwrap_or(0.0).min(1.0);
         let creator_score = attractiveness;
+
+        // ── Location boost (10%) — same city = strong boost ──
+        let location_score = match (&viewer_city, &r.creator_city) {
+            (Some(vc), Some(cc)) if !vc.is_empty() && vc.to_lowercase() == cc.to_lowercase() => 1.0,
+            _ => 0.0,
+        };
 
         // ── Exploration (5%) — pseudo-random for diversity ──
         rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -4957,12 +5194,14 @@ pub async fn get_reel_feed(
         let explore = if random_val < exploration_rate { 0.5 + random_val } else { 0.0 };
 
         // ── Weighted combination ──
+        // Location replaces 5% from creator + 5% from noise — local content surfaces first
         let score = cat_score * 0.35
             + engagement * 0.20
             + freshness * 0.15
-            + creator_score * 0.15
+            + creator_score * 0.10
+            + location_score * 0.10
             + explore * 0.05
-            + random_val * 0.10; // 10% noise for diversity
+            + random_val * 0.05; // 5% noise for diversity
 
         (score, idx)
     }).collect();
@@ -5066,12 +5305,20 @@ pub async fn get_reel_feed(
 pub struct TrackReelViewPayload {
     pub reel_id: i32,
     pub watch_duration_sec: i32,
+    /// Precise watch duration in milliseconds (preferred over watch_duration_sec)
+    pub watch_duration_ms: Option<i64>,
     pub watch_percent: f64,
     pub rewatched: Option<bool>,
     pub source: Option<String>,
     pub session_id: Option<String>,
     pub scroll_velocity: Option<f64>,
     pub position_in_feed: Option<i32>,
+    /// Number of times user skipped forward (negative interest signal)
+    pub seek_forward_count: Option<i32>,
+    /// Number of times user rewound (positive — wanted to re-see something)
+    pub seek_backward_count: Option<i32>,
+    /// Number of times user paused (positive — stopped to look/read)
+    pub pause_count: Option<i32>,
 }
 
 pub async fn track_reel_view(
@@ -5084,45 +5331,117 @@ pub async fn track_reel_view(
 
     let session_id = payload.session_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    let reel_owner_i64 = sqlx::query_scalar::<_, i64>("SELECT user_id FROM reels WHERE id = $1")
-        .bind(payload.reel_id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::not_found("Reel not found"))?;
-    let reel_owner = reel_owner_i64 as i32;
+    // Fetch reel owner + duration + creator city in one query
+    #[derive(sqlx::FromRow)]
+    struct ReelMeta { user_id: i64, duration_sec: Option<i32>, creator_city: Option<String> }
+    let meta = sqlx::query_as::<_, ReelMeta>(
+        "SELECT r.user_id, r.duration_sec, u.city as creator_city FROM reels r JOIN users u ON u.id = r.user_id WHERE r.id = $1"
+    )
+    .bind(payload.reel_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::not_found("Reel not found"))?;
+    let reel_owner = meta.user_id as i32;
 
-    // Interest score: watch%, duration, rewatch, scroll speed
-    let interest_score = calc_interest_score(payload.watch_percent, payload.watch_duration_sec, payload.rewatched.unwrap_or(false), payload.scroll_velocity);
+    // Viewer city for same-city signal
+    let viewer_city: Option<String> = sqlx::query_scalar("SELECT city FROM users WHERE id = $1")
+        .bind(user_id).fetch_optional(&state.db).await?.flatten();
+    let same_city = match (&viewer_city, &meta.creator_city) {
+        (Some(vc), Some(cc)) if !vc.is_empty() => vc.to_lowercase() == cc.to_lowercase(),
+        _ => false,
+    };
+
+    let seek_fwd = payload.seek_forward_count.unwrap_or(0);
+    let seek_bwd = payload.seek_backward_count.unwrap_or(0);
+    let pauses   = payload.pause_count.unwrap_or(0);
+    let rewatched = payload.rewatched.unwrap_or(false);
+
+    // ── Precise reward formula v2 ──────────────────────────────────────────
+    // d_norm: fraction of reel actually watched (capped 0–1)
+    let d_norm = if let Some(dur) = meta.duration_sec.filter(|&d| d > 0) {
+        (payload.watch_duration_sec as f64 / dur as f64).min(1.0)
+    } else {
+        (payload.watch_percent / 100.0).min(1.0)
+    };
+
+    let mut reward: f64 = 0.0;
+    reward += 0.35 * (payload.watch_percent / 100.0).min(1.0); // 0–0.35
+    reward += 0.15 * d_norm;                                    // 0–0.15
+    if rewatched { reward += 0.15; }                            // +0.15
+    reward += (seek_bwd as f64 * 0.05).min(0.15);              // rewind: 0–+0.15
+    reward -= (seek_fwd as f64 * 0.04).min(0.15);              // skip:   0–-0.15
+    reward += (pauses as f64 * 0.03).min(0.10);                // pause:  0–+0.10
+
+    // Same-city multiplier (config-tunable: 1.0–1.20, default 1.10)
+    if same_city {
+        reward *= state.config.reel_same_city_multiplier;
+    }
+
+    // Hard cap: max 4.0, floor -0.5 (like/message bonuses stack on top at call site)
+    reward = reward.clamp(-0.5, 4.0);
+
+    // Shadow cohort: deterministic by user_id (same user always in same bucket).
+    // user_id % 100 < fraction*100 → v2; everyone else → v1 (control).
+    let cohort_threshold = (state.config.reel_shadow_cohort_fraction * 100.0).round() as i32;
+    let reward_version = if (user_id % 100) < cohort_threshold {
+        state.config.reel_reward_version.as_str() // "v2"
+    } else {
+        "v1" // control — reward formula identical, tag differs for Prometheus split
+    };
+
+    let watch_duration_ms = payload.watch_duration_ms
+        .unwrap_or_else(|| payload.watch_duration_sec as i64 * 1000);
+
+    // Interest score for preference model
+    let interest_score = calc_interest_score(
+        payload.watch_percent, payload.watch_duration_sec,
+        rewatched, payload.scroll_velocity,
+        seek_fwd, seek_bwd, pauses,
+    );
 
     sqlx::query(
         r#"
-        INSERT INTO reel_views (reel_id, viewer_id, watch_duration_sec, watch_percent, rewatched, source, session_id, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+        INSERT INTO reel_views (reel_id, viewer_id, watch_duration_sec, watch_percent, rewatched,
+                                seek_forward_count, seek_backward_count, pause_count,
+                                source, session_id, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
         ON CONFLICT (reel_id, viewer_id, session_id) DO UPDATE SET
-            watch_duration_sec = GREATEST(reel_views.watch_duration_sec, $3),
-            watch_percent = GREATEST(reel_views.watch_percent, $4),
-            rewatched = $5 OR reel_views.rewatched,
-            rewatch_count = CASE WHEN $5 THEN reel_views.rewatch_count + 1 ELSE reel_views.rewatch_count END
+            watch_duration_sec  = GREATEST(reel_views.watch_duration_sec, $3),
+            watch_percent       = GREATEST(reel_views.watch_percent, $4),
+            rewatched           = $5 OR reel_views.rewatched,
+            rewatch_count       = CASE WHEN $5 THEN reel_views.rewatch_count + 1 ELSE reel_views.rewatch_count END,
+            seek_forward_count  = reel_views.seek_forward_count  + $6,
+            seek_backward_count = reel_views.seek_backward_count + $7,
+            pause_count         = reel_views.pause_count         + $8
         "#,
     )
     .bind(payload.reel_id).bind(user_id).bind(payload.watch_duration_sec).bind(payload.watch_percent)
-    .bind(payload.rewatched.unwrap_or(false)).bind(&payload.source).bind(&session_id)
+    .bind(rewatched).bind(seek_fwd).bind(seek_bwd).bind(pauses)
+    .bind(&payload.source).bind(&session_id)
     .execute(&state.db).await?;
 
-    // Update reel stats
+    // Update reel aggregate stats
     sqlx::query("UPDATE reels SET view_count = view_count + 1, avg_watch_percent = (avg_watch_percent * view_count + $2) / (view_count + 1), updated_at = NOW() WHERE id = $1")
         .bind(payload.reel_id).bind(payload.watch_percent).execute(&state.db).await?;
 
-    // Log for ML training
-    let reward = if payload.watch_percent >= 90.0 { 1.0 } else if payload.watch_percent >= 50.0 { 0.5 } else if payload.watch_percent >= 25.0 { 0.2 } else { -0.1 };
-    log_reel_event(&state.db, user_id, payload.reel_id, reel_owner, "view", payload.watch_percent, payload.watch_duration_sec, payload.scroll_velocity, payload.source.as_deref(), payload.position_in_feed, reward).await?;
+    log_reel_event(&state.db, user_id, payload.reel_id, reel_owner, "view",
+        payload.watch_percent, watch_duration_ms, payload.scroll_velocity,
+        payload.source.as_deref(), payload.position_in_feed,
+        seek_fwd, seek_bwd, pauses,
+        same_city, false, false, 0,
+        reward, reward_version).await?;
 
-    // Update preferences if showed interest
     if payload.watch_percent > 50.0 {
         update_content_prefs(&state.db, user_id, payload.reel_id, interest_score).await?;
     }
 
-    Ok(Json(json!({ "tracked": true, "interest_score": interest_score })))
+    Ok(Json(json!({
+        "tracked": true,
+        "interest_score": interest_score,
+        "reward": reward,
+        "reward_version": reward_version,
+        "same_city": same_city
+    })))
 }
 
 /// Like reel - strong interest signal
@@ -5149,7 +5468,7 @@ pub async fn like_reel(
 
     if result.rows_affected() > 0 {
         sqlx::query("UPDATE reels SET like_count = like_count + 1, updated_at = NOW() WHERE id = $1").bind(payload.reel_id).execute(&state.db).await?;
-        log_reel_event(&state.db, user_id, payload.reel_id, reel_owner, "like", 100.0, 0, None, None, None, 2.0).await?;
+        log_reel_event(&state.db, user_id, payload.reel_id, reel_owner, "like", 100.0, 0, None, None, None, 0, 0, 0, false, true, false, 0, 2.0, "v2").await?;
         update_content_prefs(&state.db, user_id, payload.reel_id, 1.0).await?;
     }
 
@@ -5225,7 +5544,10 @@ pub async fn send_reel_message(
     .execute(&state.db).await?;
 
     // Log for ML - messages are highest value
-    log_reel_event(&state.db, sender_id, payload.reel_id, receiver_id, "message", 100.0, 0, None, None, None, 3.0 + effort_score).await?;
+    // Effort bonus: +0.1 per 20 chars, capped at +0.5
+    let effort_bonus = ((payload.content.len() as f64 / 20.0) * 0.1).min(0.5);
+    let msg_reward = (3.0 + effort_bonus).min(4.0);
+    log_reel_event(&state.db, sender_id, payload.reel_id, receiver_id, "message", 100.0, 0, None, None, None, 0, 0, 0, false, false, true, payload.content.len() as i32, msg_reward, "v2").await?;
     update_content_prefs(&state.db, sender_id, payload.reel_id, effort_score).await?;
 
     // Record for response tracking
@@ -5335,7 +5657,7 @@ pub async fn reply_reel_message(
         ON CONFLICT (user_id) DO UPDATE SET total_responses_received = user_response_patterns.total_responses_received + 1, conversations_continued = user_response_patterns.conversations_continued + $2, response_rate = (user_response_patterns.total_responses_received + 1)::float / GREATEST(user_response_patterns.total_messages_sent, 1), updated_at = NOW()"#)
         .bind(orig_sender_id).bind(if conversation_continued { 1 } else { 0 }).execute(&state.db).await?;
 
-    log_reel_event(&state.db, user_id, orig_reel_id, orig_sender_id, "reply", 100.0, 0, None, None, None, 4.0).await?;
+    log_reel_event(&state.db, user_id, orig_reel_id, orig_sender_id, "reply", 100.0, 0, None, None, None, 0, 0, 0, false, false, true, 0, 4.0, "v2").await?;
 
     // Check match eligibility
     check_reel_match_eligibility(&state.db, orig_reel_id, user_a, user_b).await?;
@@ -5737,12 +6059,21 @@ pub async fn get_my_learned_patterns(
 // Helper functions for reel ML
 // ============================================================================
 
-fn calc_interest_score(watch_pct: f64, duration: i32, rewatched: bool, scroll_vel: Option<f64>) -> f64 {
-    let mut score = (watch_pct / 100.0) * 0.4;
-    if rewatched { score += 0.2; }
-    score += ((duration as f64) / 30.0).min(1.0) * 0.2;
-    if let Some(v) = scroll_vel { score += (1.0 - (v / 100.0).min(1.0)) * 0.2; }
-    score.min(1.0)
+fn calc_interest_score(
+    watch_pct: f64, duration: i32, rewatched: bool,
+    scroll_vel: Option<f64>, seek_fwd: i32, seek_bwd: i32, pauses: i32,
+) -> f64 {
+    let mut score = (watch_pct / 100.0) * 0.35;
+    if rewatched { score += 0.15; }
+    score += ((duration as f64) / 30.0).min(1.0) * 0.15;
+    if let Some(v) = scroll_vel { score += (1.0 - (v / 100.0).min(1.0)) * 0.10; }
+    // Seek backward = positive: user rewound to re-watch something (high interest)
+    score += (seek_bwd as f64 * 0.05).min(0.15);
+    // Seek forward = negative: user skipped ahead (low interest in that section)
+    score -= (seek_fwd as f64 * 0.04).min(0.15);
+    // Pauses = positive: user stopped to read caption / look at something
+    score += (pauses as f64 * 0.03).min(0.10);
+    score.clamp(0.0, 1.0)
 }
 
 fn calc_message_effort(content: &str, has_reaction: bool) -> f64 {
@@ -5754,9 +6085,33 @@ fn calc_message_effort(content: &str, has_reaction: bool) -> f64 {
     score.min(1.0)
 }
 
-async fn log_reel_event(db: &PgPool, user_id: i32, reel_id: i32, owner_id: i32, event_type: &str, watch_pct: f64, duration: i32, scroll_vel: Option<f64>, source: Option<&str>, position: Option<i32>, reward: f64) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO reel_engagement_events (user_id, reel_id, reel_owner_id, event_type, watch_percent, time_on_reel_sec, scroll_velocity, source, position_in_feed, reward, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())")
-        .bind(user_id).bind(reel_id).bind(owner_id).bind(event_type).bind(watch_pct).bind(duration).bind(scroll_vel).bind(source).bind(position).bind(reward).execute(db).await?;
+#[allow(clippy::too_many_arguments)]
+async fn log_reel_event(
+    db: &PgPool,
+    user_id: i32, reel_id: i32, owner_id: i32, event_type: &str,
+    watch_pct: f64, duration_ms: i64, scroll_vel: Option<f64>,
+    source: Option<&str>, position: Option<i32>,
+    seek_fwd: i32, seek_bwd: i32, pauses: i32,
+    same_city: bool, liked: bool, messaged: bool, message_length: i32,
+    reward: f64, reward_version: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO reel_engagement_events
+            (user_id, reel_id, reel_owner_id, event_type,
+             watch_percent, time_on_reel_sec, watch_duration_ms, scroll_velocity,
+             source, position_in_feed,
+             seek_forward_count, seek_backward_count, pause_count,
+             same_city, liked, messaged, message_length,
+             reward, reward_version, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW())"#,
+    )
+    .bind(user_id).bind(reel_id).bind(owner_id).bind(event_type)
+    .bind(watch_pct).bind((duration_ms / 1000) as i32).bind(duration_ms).bind(scroll_vel)
+    .bind(source).bind(position)
+    .bind(seek_fwd).bind(seek_bwd).bind(pauses)
+    .bind(same_city).bind(liked).bind(messaged).bind(message_length)
+    .bind(reward).bind(reward_version)
+    .execute(db).await?;
     Ok(())
 }
 
@@ -7013,9 +7368,17 @@ pub async fn search_universities(
     let _user_id = decode_access_token(&token, &state.config.secret_key)?;
     // Auth required but no student verification needed — university search is used during onboarding
 
-    let search_term = format!("%{}%", params.q.to_lowercase());
-    let limit = params.limit.unwrap_or(20).min(50);
+    let q = params.q.trim().to_lowercase();
+    let prefix = format!("{}%", q);
+    let contains = format!("%{}%", q);
+    let limit = params.limit.unwrap_or(30).min(100);
+    // tsquery: prefix match on each word using :* for partial FTS
+    let tsquery = q.split_whitespace()
+        .map(|w| format!("{}:*", w))
+        .collect::<Vec<_>>()
+        .join(" & ");
 
+    // Hybrid search: trigram similarity (O(log n) via GIN) + FTS ts_rank + exact/prefix boost
     let universities = if let Some(country) = &params.country {
         sqlx::query_as::<_, UniversityRow>(
             r#"
@@ -7023,13 +7386,42 @@ pub async fn search_universities(
             FROM universities
             WHERE is_active = TRUE
               AND country_code = $1
-              AND (LOWER(name) LIKE $2 OR LOWER(short_name) LIKE $2 OR LOWER(domain) LIKE $2)
-            ORDER BY tier DESC, name ASC
-            LIMIT $3
+              AND (
+                LOWER(name) LIKE $3
+                OR LOWER(short_name) LIKE $3
+                OR LOWER(city) LIKE $3
+                OR LOWER(state_province) LIKE $3
+                OR (search_vector IS NOT NULL AND search_vector @@ to_tsquery('simple', $5))
+                OR similarity(LOWER(name), $2) > 0.15
+                OR similarity(LOWER(short_name), $2) > 0.2
+              )
+            ORDER BY
+              CASE
+                WHEN LOWER(short_name) = $2        THEN 1000
+                WHEN LOWER(name) = $2              THEN 900
+                WHEN LOWER(short_name) LIKE $4     THEN 800
+                WHEN LOWER(name) LIKE $4           THEN 700
+                WHEN LOWER(short_name) LIKE $3     THEN 600
+                WHEN LOWER(name) LIKE $3           THEN 500
+                WHEN LOWER(city) LIKE $3           THEN 300
+                WHEN LOWER(state_province) LIKE $3 THEN 200
+                ELSE 0
+              END
+              + CASE WHEN search_vector IS NOT NULL
+                  THEN COALESCE(ts_rank(search_vector, to_tsquery('simple', $5))::numeric * 100, 0)
+                  ELSE 0 END
+              + similarity(LOWER(name), $2) * 80
+              + CASE tier WHEN 'tier1' THEN 50 WHEN 'tier2' THEN 30 ELSE 10 END
+              DESC,
+              name ASC
+            LIMIT $6
             "#
         )
         .bind(country)
-        .bind(&search_term)
+        .bind(&q)
+        .bind(&contains)
+        .bind(&prefix)
+        .bind(&tsquery)
         .bind(limit)
         .fetch_all(&state.db)
         .await?
@@ -7039,12 +7431,41 @@ pub async fn search_universities(
             SELECT id, name, short_name, domain, country, country_code, state_province, city, tier
             FROM universities
             WHERE is_active = TRUE
-              AND (LOWER(name) LIKE $1 OR LOWER(short_name) LIKE $1 OR LOWER(domain) LIKE $1)
-            ORDER BY tier DESC, name ASC
-            LIMIT $2
+              AND (
+                LOWER(name) LIKE $2
+                OR LOWER(short_name) LIKE $2
+                OR LOWER(city) LIKE $2
+                OR LOWER(state_province) LIKE $2
+                OR (search_vector IS NOT NULL AND search_vector @@ to_tsquery('simple', $4))
+                OR similarity(LOWER(name), $1) > 0.15
+                OR similarity(LOWER(short_name), $1) > 0.2
+              )
+            ORDER BY
+              CASE
+                WHEN LOWER(short_name) = $1        THEN 1000
+                WHEN LOWER(name) = $1              THEN 900
+                WHEN LOWER(short_name) LIKE $3     THEN 800
+                WHEN LOWER(name) LIKE $3           THEN 700
+                WHEN LOWER(short_name) LIKE $2     THEN 600
+                WHEN LOWER(name) LIKE $2           THEN 500
+                WHEN LOWER(city) LIKE $2           THEN 300
+                WHEN LOWER(state_province) LIKE $2 THEN 200
+                ELSE 0
+              END
+              + CASE WHEN search_vector IS NOT NULL
+                  THEN COALESCE(ts_rank(search_vector, to_tsquery('simple', $4))::numeric * 100, 0)
+                  ELSE 0 END
+              + similarity(LOWER(name), $1) * 80
+              + CASE tier WHEN 'tier1' THEN 50 WHEN 'tier2' THEN 30 ELSE 10 END
+              DESC,
+              name ASC
+            LIMIT $5
             "#
         )
-        .bind(&search_term)
+        .bind(&q)
+        .bind(&contains)
+        .bind(&prefix)
+        .bind(&tsquery)
         .bind(limit)
         .fetch_all(&state.db)
         .await?
@@ -7078,7 +7499,7 @@ pub async fn search_universities(
             "domain": u.domain,
             "country": u.country,
             "country_code": u.country_code,
-            "state": u.state_province,
+            "state_province": u.state_province,
             "city": u.city,
             "tier": u.tier,
             "student_count": student_counts.get(&u.id).unwrap_or(&0)
@@ -7405,6 +7826,79 @@ pub async fn get_university_reels(
         "count": results.len(),
         "offset": offset,
         "limit": limit
+    })))
+}
+
+/// GET /reels/user/:user_id — fetch a user's public reels (paginated)
+/// Used by ProfileView "My Reels" tab and UserReelsView.
+pub async fn get_user_reels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(target_user_id): AxumPath<i64>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let _viewer_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let limit: i64 = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(30).min(50);
+    let offset: i64 = params.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+
+    let reels = sqlx::query_as::<_, (
+        i64, String, Option<String>, Option<String>,
+        Option<i32>, Option<i32>, Option<i32>, Option<NaiveDateTime>,
+        Option<Value>, Option<String>,
+    )>(
+        r#"
+        SELECT r.id, r.video_url, r.thumbnail_url, r.caption,
+               r.view_count, r.like_count, r.duration_sec, r.created_at,
+               r.tags, r.category
+        FROM reels r
+        WHERE r.user_id = $1
+          AND r.is_active = TRUE
+        ORDER BY r.created_at DESC
+        LIMIT $2 OFFSET $3
+        "#,
+    )
+    .bind(target_user_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(state.read_pool())
+    .await?;
+
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reels WHERE user_id = $1 AND is_active = TRUE"
+    )
+    .bind(target_user_id)
+    .fetch_one(state.read_pool())
+    .await
+    .unwrap_or(0);
+
+    let items: Vec<Value> = reels.iter().map(|(
+        id, video_url, thumbnail_url, caption,
+        view_count, like_count, duration_sec, created_at,
+        tags, category,
+    )| {
+        json!({
+            "id": id,
+            "video_url": video_url,
+            "thumbnail_url": thumbnail_url,
+            "caption": caption,
+            "view_count": view_count.unwrap_or(0),
+            "like_count": like_count.unwrap_or(0),
+            "duration_sec": duration_sec,
+            "created_at": created_at,
+            "tags": tags,
+            "category": category,
+        })
+    }).collect();
+
+    Ok(Json(json!({
+        "reels": items,
+        "total": total,
+        "count": items.len(),
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + limit < total,
     })))
 }
 

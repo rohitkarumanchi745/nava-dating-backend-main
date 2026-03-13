@@ -436,6 +436,54 @@ impl GraphService {
     }
 
     // -------------------------------------------------------------------------
+    // University Relationship (Dual-Write)
+    // -------------------------------------------------------------------------
+
+    /// Set STUDIES_AT relationship for a user in Neo4j and sync university node.
+    /// Called whenever update_profile saves a university. Fire-and-forget safe.
+    pub async fn set_user_university(
+        &self,
+        user_id: i32,
+        university_name: &str,
+    ) -> Result<()> {
+        let health = self.health.read().await;
+        if !health.neo4j_healthy {
+            warn!("Neo4j unavailable, skipping STUDIES_AT sync for user {}", user_id);
+            return Ok(());
+        }
+
+        let uid = user_id.to_string();
+        let uname = university_name.replace('\'', "\\'");
+
+        // HTTP API path (preferred)
+        if let Some(ref http) = self.neo4j_http {
+            let cypher = format!(r#"
+                MERGE (u:User {{id: '{uid}'}})
+                MERGE (c:University {{name: '{uname}'}})
+                MERGE (u)-[:STUDIES_AT]->(c)
+                SET c.updated_at = datetime()
+            "#);
+            if let Err(e) = http.execute(&cypher, None).await {
+                warn!("Neo4j STUDIES_AT HTTP write failed for user {}: {}", user_id, e);
+            }
+        } else if let Some(ref bolt) = self.neo4j {
+            let q = Query::new(r#"
+                MERGE (u:User {id: $uid})
+                MERGE (c:University {name: $uname})
+                MERGE (u)-[:STUDIES_AT]->(c)
+                SET c.updated_at = datetime()
+            "#.to_string())
+            .param("uid", uid)
+            .param("uname", university_name.to_string());
+            if let Err(e) = bolt.run(q).await {
+                warn!("Neo4j STUDIES_AT bolt write failed for user {}: {}", user_id, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
     // Swipe Operations (Dual-Write)
     // -------------------------------------------------------------------------
 

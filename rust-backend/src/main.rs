@@ -82,9 +82,12 @@ use handlers::{
     student_status, verify_student, verify_student_otp,
     verify_student_domain_otp, verify_student_document,
     admin_verification_queue, admin_verification_decision,
+    // Alumni
+    verify_alumni_degree, verify_alumni_linkedin,
     // University Discovery
     search_universities, get_university_countries, discover_university_profiles, get_university_profiles,
     get_university_reels, purchase_university_pass, get_my_university_passes,
+    get_user_reels,
     // Student Global Search
     search_students, student_search_suggestions, unified_search, view_student_profile,
     like_student_from_search, direct_message_from_search,
@@ -108,7 +111,7 @@ use handlers::{
     log_reward, get_training_events, get_user_interactions,
     bulk_update_scores, update_spot_embedding,
     // Reels (private message based dating)
-    create_reel, get_reel_feed, track_reel_view, like_reel, unlike_reel,
+    upload_reel_video, create_reel, get_reel_feed, track_reel_view, like_reel, unlike_reel,
     send_reel_message, get_reel_inbox, reply_reel_message, mark_reel_message_read,
     get_reel_conversation, get_my_learned_patterns,
     // LLM Labeling
@@ -808,6 +811,9 @@ async fn main() {
         .route("/student/verify/domain-otp", post(verify_student_domain_otp))
         .route("/student/verify/document", post(verify_student_document))
         .route("/student/status", get(student_status))
+        // Alumni
+        .route("/alumni/verify-degree", post(verify_alumni_degree))
+        .route("/alumni/verify-linkedin", post(verify_alumni_linkedin))
         // Admin verification review
         .route("/admin/verification/queue", get(admin_verification_queue))
         .route("/admin/verification/{doc_id}/decision", post(admin_verification_decision))
@@ -863,6 +869,7 @@ async fn main() {
         .route("/ml/scores/bulk", post(bulk_update_scores))
         .route("/ml/spots/embedding", post(update_spot_embedding))
         // Reels (private message based dating)
+        .route("/reels/upload-video", post(upload_reel_video))  // pre-upload video binary, returns video_url
         .route("/reels", post(create_reel))
         .route("/reels/feed", get(get_reel_feed))
         .route("/reels/view", post(track_reel_view))
@@ -874,6 +881,7 @@ async fn main() {
         .route("/reels/message/read", post(mark_reel_message_read))
         .route("/reels/conversation", get(get_reel_conversation))
         .route("/reels/patterns", get(get_my_learned_patterns))
+        .route("/reels/user/{user_id}", get(get_user_reels))
         .route("/reels/{reel_id}/like-creator", post(like_reel_creator))
         .route("/reels/match-request", post(request_reel_match))
         .route("/reels/match-accept", post(accept_reel_match))

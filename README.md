@@ -84,7 +84,8 @@ All endpoints require `Authorization: Bearer <jwt>` header unless noted.
 | `uploadVoiceIntro(voice)` | GraphQL Mutation (multipart) | Upload voice intro (m4a, max 15s) |
 | `verifySelfie(selfie)` | GraphQL Mutation (multipart) | Selfie liveness verification → `{ verified, confidence, failureReasons[] }` |
 | `/voice-intro` | POST (multipart) | Upload voice intro (iOS REST fallback) |
-| `/reels` | POST (multipart) | Upload video reel (mp4, max 30s) + caption |
+| `/reels/upload-video` | POST (multipart) | Pre-upload video binary immediately on pick — returns `{video_url}`. Starts before user types caption. |
+| `/reels` | POST (JSON) | Create reel with `{video_url, caption}` — instant after pre-upload completes |
 | `/spots` | POST (multipart) | Upload video spot (React Native) |
 | `/verify/selfie` | POST (multipart) | Selfie verification (iOS REST fallback) |
 | `/update-bio` | POST | Quick bio update |
@@ -110,7 +111,7 @@ All endpoints require `Authorization: Bearer <jwt>` header unless noted.
 |-----------|------|-------------|
 | `update_profile(name, gender, dob, bio, university, universityLocation, study, ...)` | Mutation | Full profile update — accepts `Upload` scalar for photos, runs full photo pipeline (NSFW, liveness, resize, EXIF strip) |
 
-**Photo uploads:** Sent as GraphQL `Upload` scalar, processed through quality/NSFW/liveness pipeline, saved to `uploads/` directory, served at `GET /uploads/{filename}`. Photos that fail pipeline return an error with the rejection reason.
+**Photo uploads:** Sent as GraphQL `Upload` scalar, processed through quality/NSFW/liveness pipeline, saved to `uploads/` directory, served at `GET /uploads/{filename}`. Photos that fail pipeline return an error with the rejection reason. Supports HEIC, JPEG, PNG, WebP, ProRAW up to **75 MB**. Video uploads up to **500 MB**.
 
 ### AI Insights (REST)
 
@@ -193,6 +194,13 @@ Super-likers appear higher in discover feed (+0.15 ML score boost) and are tagge
 | `/reels/match-request` | POST | Request a match from reel conversation (after mutual engagement) |
 | `/reels/match-accept` | POST | Accept or decline a reel match request → creates real match on accept |
 
+### Verification (Alumni)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/verify/alumni/degree` | POST (multipart) | Upload degree certificate (HEIC, JPEG, PNG, PDF — up to 75 MB). Backend detects format via magic bytes. |
+| `/verify/alumni/status` | GET | Check alumni verification status |
+
 ### Cross-Surface Actions
 
 | Endpoint | Method | Description |
@@ -253,7 +261,10 @@ Call states: `idle → connecting → ringing → active → idle`
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/reels/feed` | GET | Vertical video feed with user info, like/view counts |
+| `/reels/upload-video` | POST (multipart) | Pre-upload video binary (field: `video`). Saves to `uploads/reels/`. Returns `{video_url}`. Called immediately on video pick — parallel to user browsing filters + typing caption. |
+| `/reels` | POST (JSON) | Finalize reel: `{video_url, caption, tags, category, location_tag}`. Instant since video already uploaded. |
+| `/reels/feed` | GET | Personalized vertical video feed scored by category (35%), engagement (20%), freshness (15%), creator (10%), location (10%), exploration (5%), noise (5%) |
+| `/reels/user/{user_id}` | GET | All reels by a specific user — used for "My Reels" tab on profile |
 | `/reels/like` | POST | Like a reel |
 | `/reels/unlike` | POST | Unlike a reel |
 | `/reels/view` | POST | Track reel view |
@@ -640,7 +651,8 @@ SQL candidates → Multi-signal scoring → Re-rank by blended score → Return 
 - **Responsive Image Variants** — Pre-generate multiple photo sizes on upload: thumbnail (150px), card (400px), full (1080px), original
 - **Modern Formats** — AV1/WEBP transcoding for avatars and thumbnails; JPEG fallback for older clients
 - **Smallest Rendition Serving** — CDN serves the smallest acceptable rendition based on `Accept` header, device pixel ratio, and requested viewport size
-- **Reel Compression** — Adaptive bitrate encoding for video reels (720p/1080p); HLS-ready segments for streaming
+- **Reel Compression** — On-device H.264 compression via `AVAssetExportSession` with `shouldOptimizeForNetworkUse = true` (moov atom → front for fast-start streaming). Upload begins immediately on video pick — before user types caption or selects filter.
+- **Reel Filters** — 7 client-side filters (Original, Vivid, Warm, Cool, Vintage, Drama, Fade) applied via `AVVideoComposition` + `CIFilter` pipeline. Filter thumbnails generated instantly from first frame. Filtered video exported + uploaded in background while user types caption.
 
 ### Client Adaptive Behavior
 - **Battery-Aware Throttling** — Client reports battery level + charging state; server defers non-critical work (reel transcoding notifications, background sync) when battery <20%

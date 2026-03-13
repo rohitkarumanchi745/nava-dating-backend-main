@@ -176,6 +176,26 @@ pub struct Config {
 
     // Content Freshness
     pub freshness_decay_enabled: bool,
+
+    // Reel RL / Reward formula
+    /// Multiplier applied to reel reward when viewer and creator share the same city.
+    /// Range 1.0 (off) – 1.20; tunable via REEL_SAME_CITY_MULTIPLIER env var.
+    pub reel_same_city_multiplier: f64,
+    /// Tag stored alongside every logged reward so shadow-bucket analysis can
+    /// filter by formula version. Bump via REEL_REWARD_VERSION env var.
+    pub reel_reward_version: String,
+
+    // Shadow bucket / A-B rollout
+    /// Fraction of users assigned to the v2 reward cohort (0.0–1.0).
+    /// Assignment is deterministic: user_id % 100 < (fraction * 100).
+    /// 0.10 = 10% shadow cohort. Set to 1.0 to promote v2 to everyone.
+    pub reel_shadow_cohort_fraction: f64,
+    /// Minimum days a shadow bucket must run before promotion is considered.
+    pub reel_shadow_min_days: u32,
+    /// Minimum watch-time uplift (fraction, e.g. 0.05 = 5%) required to promote.
+    pub reel_shadow_promote_watch_uplift: f64,
+    /// Maximum skip-rate increase (fraction) allowed before auto-rollback.
+    pub reel_shadow_rollback_skip_spike: f64,
 }
 
 impl Config {
@@ -216,11 +236,11 @@ impl Config {
         let max_photo_bytes = env::var("MAX_PHOTO_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(10 * 1024 * 1024); // 10MB
+            .unwrap_or(75 * 1024 * 1024); // 75MB — covers ProRAW (~25MB) and HEIC bursts
         let max_video_bytes = env::var("MAX_VIDEO_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(50 * 1024 * 1024); // 50MB
+            .unwrap_or(500 * 1024 * 1024); // 500MB — covers ProRes 4K clips
         let max_spot_duration_sec = env::var("MAX_SPOT_DURATION_SEC")
             .ok()
             .and_then(|value| value.parse::<i32>().ok())
@@ -552,6 +572,34 @@ impl Config {
             .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(true);
 
+        // Reel RL / Reward formula
+        let reel_same_city_multiplier = env::var("REEL_SAME_CITY_MULTIPLIER")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.10)
+            .clamp(1.0, 1.20); // safety guard — never more than 1.20x
+        let reel_reward_version = env::var("REEL_REWARD_VERSION")
+            .unwrap_or_else(|_| "v2".to_string());
+
+        // Shadow bucket
+        let reel_shadow_cohort_fraction = env::var("REEL_SHADOW_COHORT_FRACTION")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.10)          // 10% default shadow cohort
+            .clamp(0.0, 1.0);
+        let reel_shadow_min_days = env::var("REEL_SHADOW_MIN_DAYS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(7);            // must run 7 days before promotion
+        let reel_shadow_promote_watch_uplift = env::var("REEL_SHADOW_PROMOTE_WATCH_UPLIFT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.05);         // 5% watch-time uplift needed
+        let reel_shadow_rollback_skip_spike = env::var("REEL_SHADOW_ROLLBACK_SKIP_SPIKE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.15);         // rollback if skip rate up > 15%
+
         Self {
             bind_addr,
             database_url,
@@ -654,6 +702,12 @@ impl Config {
             moderation_toxicity_threshold,
             moderation_nsfw_threshold,
             freshness_decay_enabled,
+            reel_same_city_multiplier,
+            reel_reward_version,
+            reel_shadow_cohort_fraction,
+            reel_shadow_min_days,
+            reel_shadow_promote_watch_uplift,
+            reel_shadow_rollback_skip_spike,
         }
     }
 
