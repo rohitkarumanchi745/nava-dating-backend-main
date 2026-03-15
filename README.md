@@ -43,11 +43,11 @@ Production backend powering the Nava dating apps (SwiftUI iOS + React Native cro
                                │
  ┌──────────────────────────────────────────────────┐
  │              Data Layer                          │
- │  ┌──────────┐ ┌───────┐ ┌───────┐ ┌─────┐       │
- │  │PostgreSQL│ │ Redis │ │ Neo4j │ │ S3  │       │
- │  │ Primary  │ │(Cache,│ │(Graph │ │(Media│      │
- │  │(Writes)  │ │ OTP)  │ │ Rel.) │ │ CDN)│      │
- │  └────┬─────┘ └───────┘ └───────┘ └─────┘       │
+ │  ┌──────────┐ ┌───────┐ ┌─────┐                │
+ │  │PostgreSQL│ │ Redis │ │ S3  │                │
+ │  │ Primary  │ │(Cache,│ │(Media│               │
+ │  │(Writes)  │ │ OTP)  │ │ CDN)│               │
+ │  └────┬─────┘ └───────┘ └─────┘                │
  │  ┌────▼─────┐ ┌───────────┐ ┌──────────┐        │
  │  │ PgBouncer│ │  Read     │ │ClickHouse│        │
  │  │ (Conn    │ │  Replica  │ │(Analytics│        │
@@ -358,12 +358,12 @@ Call states: `idle → connecting → ringing → active → idle`
 |-------|-------------|
 | **Backend** | Rust, Axum, Tokio, SQLx, async-graphql |
 | **Real-Time** | WebSocket pub/sub (chat + call signaling), typing indicators, read receipts |
-| **Databases** | PostgreSQL 16 (primary + read replicas), PgBouncer (connection pooling), Redis 7, Neo4j 5, ClickHouse |
+| **Databases** | PostgreSQL 16 (primary + read replicas, graph CTEs for FoF/university/fraud), PgBouncer (connection pooling), Redis 7, ClickHouse |
 | **Event Bus** | In-process `tokio::broadcast` (typed DomainEvent enum, 23 event variants, 4096 capacity) |
 | **Analytics Engine** | Apache DataFusion v44 (Arrow RecordBatch, in-process SQL over Postgres data) |
 | **ML Engine** | Q-Learning RL (28-dim state, epsilon-greedy), LinUCB Contextual Bandit (UCB scoring), Shadow Scoring, FedAvg with Differential Privacy, On-Device Personalization Head, Cold-Start Biasing, Notification Click Predictor |
 | **Computer Vision** | tract-onnx (ArcFace, FER+, NSFW CNN/ViT, NIMA, Liveness), blur/low-light detection, photo ranking, duplicate face detection |
-| **Trust & Safety** | Graph anomaly detection (Neo4j), device fingerprinting, GBDT behavioral classifiers, ban evasion detection |
+| **Trust & Safety** | Graph anomaly detection (Postgres CTEs), device fingerprinting, GBDT behavioral classifiers, ban evasion detection |
 | **Content Moderation** | NLP toxicity/hate/harassment classifiers, URL/spam filters, messaging graph anomaly detection, moderation transparency + appeals |
 | **LLM** | LLaMA 3 (content labeling, moderation), batch inference pipeline |
 | **Recommendations** | RL-scored discovery ranking, pgvector 512-dim embeddings, collaborative filtering, content freshness decay |
@@ -392,7 +392,6 @@ Call states: `idle → connecting → ringing → active → idle`
 | | `async-trait` | 0.1 | Async trait support |
 | **Database** | `sqlx` | 0.7 | Async PostgreSQL driver with compile-time query checking, chrono, JSON, UUID, Decimal |
 | | `redis` | 0.24 | Async Redis client with connection manager + tokio integration |
-| | `neo4rs` | 0.8 | Async Neo4j Bolt protocol driver |
 | **Serialization** | `serde` | 1.x | Serialization/deserialization framework |
 | | `serde_json` | 1.x | JSON parsing and generation |
 | | `rust_decimal` | 1.33 | Decimal arithmetic for financial calculations |
@@ -497,7 +496,6 @@ Call states: `idle → connecting → ringing → active → idle`
 |---------|---------|-------------|
 | **PostgreSQL 16** | Primary database (users, matches, payments, ML features) | `sqlx` (Rust), `asyncpg` (Python) |
 | **Redis 7** | Cache, rate limiting, OTP storage, session management, instance heartbeat | `redis` crate (Rust), `redis` package (Python) |
-| **Neo4j 5** | Social graph relationships, friend-of-friend discovery | `neo4rs` (Bolt protocol) |
 | **Apache Kafka** | Event streaming (user, payment, match, chat, analytics topics) | `rdkafka` (Rust), `kafka-python` (Python) |
 | **ClickHouse** | OLAP analytics database (DAU, event aggregation) | HTTP API |
 | **AWS S3** | Photo, voice intro, reel storage | `reqwest` with AWS Signature V4 |
@@ -621,7 +619,7 @@ SQL candidates → Multi-signal scoring → Re-rank by blended score → Return 
 - **Duplicate Face Detection** — Cross-user ArcFace embedding comparison to detect stolen/catfish photos
 
 ### Trust & Safety ML
-- **Graph Anomaly Detection** — Neo4j-based models detecting suspicious swipe/match/message patterns (ring detection, velocity anomalies, fan-out clusters)
+- **Graph Anomaly Detection** — Postgres CTE-based queries detecting suspicious swipe/match/message patterns (ring detection, velocity anomalies, fan-out clusters)
 - **Device Fingerprinting** — Device model, OS version, screen resolution, timezone, language; hashed fingerprint stored for multi-account detection and ban evasion tracking
 - **Behavioral Classifiers (GBDT)** — Gradient-boosted decision tree models on behavioral signals: swipe velocity, like-to-match ratio, message response time distribution, report frequency; produces per-user trust score (0-1)
 - **Ban Evasion Detection** — Device fingerprint + IP + behavioral similarity matching against banned accounts; auto-flags accounts with >80% similarity
@@ -672,7 +670,7 @@ SQL candidates → Multi-signal scoring → Re-rank by blended score → Return 
 - **Shadow-Mode Canary** — Bandit selects variant but always sends control; evaluate uplift with safety gates before promoting to live
 
 ### Background Jobs
-- **Neo4j Sync** — Dual-write consistency: health check (30s), incremental sync (60s), full sync (1h), queue processor for failed operations
+- **Graph Query Cache** — Postgres CTE-based friend-of-friend, university network, and fraud detection queries with Redis cache (TTL 5m)
 - **DLQ Processor** — Auto-retry dead letter queue entries with exponential backoff; stats endpoint at `/api/payments/dlq/stats`
 - **Send-Time Refresh** — Notification send-time histograms rebuilt every 6 hours from engagement data
 
@@ -767,7 +765,7 @@ DomainEvent::SendPush/Email/Sms  →  notification delivery (FCM, APNs, SMTP, Tw
 │   │   ├── middleware/        # Auth, CORS, rate limiting, dual-write, client-adaptive
 │   │   │   ├── security.rs    # Input sanitization, email/phone redaction
 │   │   │   ├── client_adaptive.rs # Battery/thermal/network-class throttling
-│   │   │   └── dual_write.rs  # PostgreSQL ↔ Neo4j consistency with circuit breaker
+│   │   │   └── dual_write.rs  # Graph query helpers (Postgres CTEs)
 │   │   ├── graphql.rs         # GraphQL schema & resolvers
 │   │   ├── websocket.rs       # WebSocket chat + call signaling
 │   │   └── vision/            # Face recognition, liveness, emotion, NSFW
@@ -1175,7 +1173,6 @@ Alert rules defined in `rust-backend/deploy/slo-alerts.yml` (38 alerts). Alertma
 | **ML ranking** | 2s timeout → attractiveness score fallback | Lower-quality discover rankings |
 | **ML `record_swipe`** | Fire-and-forget (`tokio::spawn`) | Zero impact on swipe latency |
 | **Read replica** | Auto-fallback to primary (lag >2s) | No user impact, higher primary load |
-| **Neo4j (graph)** | Dual-write manager queues, PG-only fallback | No user impact |
 | **Redis (cache)** | App runs without cache | Slightly slower responses |
 | **Notification bandit** | Shadow mode sends control variant | No variant optimization, baseline behavior |
 | **FL aggregation** | Stalled rounds, head weights frozen | Personalization stops improving, cold-start biases stale |

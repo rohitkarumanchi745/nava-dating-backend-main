@@ -46,3 +46,9 @@ node_modules/
 # Ambassador Dashboard
 ambassador-dashboard/node_modules/
 ambassador-dashboard/dist/
+
+# ClickHouse data files
+access/
+metadata/
+preprocessed_configs/
+uuid
