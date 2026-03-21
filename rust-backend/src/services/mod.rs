@@ -11,6 +11,7 @@
 //! - Media Optimizer: Responsive image variants, format transcoding
 
 pub mod graph_service;
+pub mod graph;
 pub mod payments;
 pub mod ads;
 pub mod ambassador;

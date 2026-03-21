@@ -10418,3 +10418,150 @@ pub async fn like_back_after_reply(
         "conversation_migrated": true,
     })))
 }
+
+// =============================================================================
+// Graph Abstraction API Handlers
+// Netflix-inspired property graph: FoF, university network, reel collab, fraud
+// =============================================================================
+
+use crate::services::graph::schema::{EdgeType, NodeType};
+
+/// GET /graph/fof?limit=20
+/// Friend-of-Friend recommendations via 2-hop matched_with traversal
+pub async fn graph_fof(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(20usize);
+
+    let recs = state.graph.friend_of_friend(&user_id.to_string(), limit).await?;
+    let count = recs.len();
+    Ok(Json(json!({
+        "recommendations": recs,
+        "count": count,
+        "algorithm": "friend_of_friend_2hop"
+    })))
+}
+
+/// GET /graph/university?limit=50
+/// University network — users at the same university (2-hop via University node)
+pub async fn graph_university_network(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50usize);
+
+    let recs = state.graph.university_network(&user_id.to_string(), limit).await?;
+    let count = recs.len();
+    Ok(Json(json!({
+        "recommendations": recs,
+        "count": count,
+        "algorithm": "university_network_2hop"
+    })))
+}
+
+/// GET /graph/reel-collaborators?limit=30
+/// Users with similar reel taste (2-hop via Reel viewed edges)
+pub async fn graph_reel_collaborators(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(30usize);
+
+    let recs = state.graph.reel_collaborators(&user_id.to_string(), limit).await?;
+    let count = recs.len();
+    Ok(Json(json!({
+        "recommendations": recs,
+        "count": count,
+        "algorithm": "reel_collaborative_filtering_2hop"
+    })))
+}
+
+/// GET /graph/proximity/{target_user_id}
+/// Count mutual connections between current user and target user
+pub async fn graph_proximity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(target_user_id): AxumPath<i64>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let mutual = state.graph.social_proximity(
+        &user_id.to_string(),
+        &target_user_id.to_string(),
+    ).await?;
+
+    Ok(Json(json!({
+        "user_id": user_id,
+        "target_user_id": target_user_id,
+        "mutual_connections": mutual
+    })))
+}
+
+/// GET /graph/fraud/{user_id}
+/// Detect multi-account fraud via shared device graph traversal
+pub async fn graph_fraud_check(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(target_user_id): AxumPath<i64>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let _caller = decode_access_token(&token, &state.config.secret_key)?;
+
+    let result = state.graph.fraud_check(&target_user_id.to_string()).await?;
+
+    Ok(Json(json!({
+        "fraud_analysis": result,
+        "traversal": "shared_device_2hop"
+    })))
+}
+
+/// GET /graph/stats
+/// Graph stats: node counts, edge type distribution
+pub async fn graph_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let _user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let stats = state.graph.stats().await?;
+
+    Ok(Json(json!({
+        "stats": stats,
+        "layer": "nava_graph_abstraction_v1"
+    })))
+}
+
+/// POST /graph/edge
+/// Write a validated edge into the graph
+/// Body: { from_type, from_id, edge_type, to_type, to_id, properties? }
+pub async fn graph_write_edge(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let _user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let from_type  = NodeType::from_str(body["from_type"].as_str().unwrap_or("user"));
+    let from_id    = body["from_id"].as_str().ok_or_else(|| AppError::bad_request("from_id required"))?.to_string();
+    let edge_type  = EdgeType::from_str(body["edge_type"].as_str().unwrap_or("liked"));
+    let to_type    = NodeType::from_str(body["to_type"].as_str().unwrap_or("user"));
+    let to_id      = body["to_id"].as_str().ok_or_else(|| AppError::bad_request("to_id required"))?.to_string();
+    let properties = body.get("properties").cloned();
+
+    state.graph.write_edge(from_type, &from_id, edge_type, to_type, &to_id, properties).await?;
+
+    Ok(Json(json!({ "ok": true, "edge": format!("{} -[{}]-> {}", from_id, edge_type, to_id) })))
+}

@@ -50,6 +50,7 @@ use tower_http::{
 use tracing::{error, info, warn, Span};
 use vision::VisionAnalyzer;
 use services::graph_service::GraphService;
+use services::graph::GraphAbstraction;
 use services::payments::PaymentService;
 use services::ads::AdsService;
 use services::trust_safety::TrustSafetyService;
@@ -87,6 +88,9 @@ use handlers::{
     search_universities, get_university_countries, discover_university_profiles, get_university_profiles,
     get_university_reels, purchase_university_pass, get_my_university_passes,
     get_user_reels,
+    // Graph Abstraction API
+    graph_fof, graph_university_network, graph_reel_collaborators,
+    graph_proximity, graph_fraud_check, graph_stats, graph_write_edge,
     // Student Global Search
     search_students, student_search_suggestions, unified_search, view_student_profile,
     like_student_from_search, direct_message_from_search,
@@ -440,6 +444,10 @@ async fn main() {
     let graph_service = Arc::new(GraphService::new(db.clone()));
     info!("Graph service initialized (PostgreSQL CTE mode)");
 
+    // Netflix-inspired property graph abstraction (FoF, university, reel collab, fraud)
+    let graph_abstraction = Arc::new(GraphAbstraction::new(db.clone(), redis.clone()));
+    info!("Graph abstraction initialized (property graph + forward/reverse indexes + Redis cache)");
+
     // Initialize dual-write manager for fault tolerance
     let dual_write = Arc::new(DualWriteManager::new());
 
@@ -542,6 +550,7 @@ async fn main() {
         db_read: db_read_replica,
         redis,
         graph_service,
+        graph: graph_abstraction,
         dual_write: dual_write.clone(),
         config,
         vision,
@@ -845,6 +854,14 @@ async fn main() {
         .route("/reels/{reel_id}/like-creator", post(like_reel_creator))
         .route("/reels/match-request", post(request_reel_match))
         .route("/reels/match-accept", post(accept_reel_match))
+        // Graph Abstraction API (Netflix-inspired property graph)
+        .route("/graph/fof", get(graph_fof))
+        .route("/graph/university", get(graph_university_network))
+        .route("/graph/reel-collaborators", get(graph_reel_collaborators))
+        .route("/graph/proximity/{target_user_id}", get(graph_proximity))
+        .route("/graph/fraud/{user_id}", get(graph_fraud_check))
+        .route("/graph/stats", get(graph_stats))
+        .route("/graph/edge", post(graph_write_edge))
         // LLM Labeling System
         .route("/llm/queue", post(queue_reel_labeling))
         .route("/llm/batch", get(get_labeling_batch))

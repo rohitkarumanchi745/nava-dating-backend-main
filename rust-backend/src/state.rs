@@ -13,6 +13,7 @@ use crate::models::CallSession;
 use crate::redis_service::RedisService;
 use crate::vision::VisionAnalyzer;
 use crate::services::graph_service::GraphService;
+use crate::services::graph::GraphAbstraction;
 use crate::services::payments::PaymentService;
 use crate::services::ads::AdsService;
 use crate::services::trust_safety::TrustSafetyService;
@@ -30,6 +31,8 @@ pub struct AppState {
     pub db_read: Option<PgPool>,
     pub redis: Option<ConnectionManager>,
     pub graph_service: Arc<GraphService>,
+    /// Netflix-inspired property graph abstraction (FoF, university, reel collab, fraud)
+    pub graph: Arc<GraphAbstraction>,
     pub dual_write: Arc<DualWriteManager>,
     pub config: Config,
     pub vision: Option<Arc<Mutex<VisionAnalyzer>>>,
