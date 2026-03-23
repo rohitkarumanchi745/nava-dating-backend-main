@@ -73,6 +73,10 @@ pub struct Config {
     pub max_video_bytes: usize,
     pub max_spot_duration_sec: i32,
     pub upload_dir: String,
+    /// Public base URL of this server (e.g. https://api.nava.app).
+    /// Used to construct absolute media URLs for push notification rich attachments.
+    /// If empty, rich image attachments are skipped.
+    pub public_url: String,
 
     // Discovery
     pub discover_limit: i32,
@@ -245,7 +249,13 @@ impl Config {
             .ok()
             .and_then(|value| value.parse::<i32>().ok())
             .unwrap_or(30);
-        let upload_dir = env::var("UPLOAD_DIR").unwrap_or_else(|_| "uploads".to_string());
+        let public_url = env::var("PUBLIC_URL").unwrap_or_default();
+        let upload_dir = env::var("UPLOAD_DIR").unwrap_or_else(|_| {
+            // Default to an absolute path next to the binary so files survive restarts
+            let mut p = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            p.push("uploads");
+            p.to_string_lossy().to_string()
+        });
         let discover_limit = env::var("DISCOVER_LIMIT")
             .ok()
             .and_then(|value| value.parse::<i32>().ok())
@@ -640,6 +650,7 @@ impl Config {
             max_video_bytes,
             max_spot_duration_sec,
             upload_dir,
+            public_url,
             discover_limit,
             default_max_distance_km,
             free_spots_limit,

@@ -1175,14 +1175,7 @@ impl MutationRoot {
             updates.push(format!("university = ${}", params.len() + 2));
             params.push(val.clone());
         }
-        if let Some(ref val) = university_location {
-            updates.push(format!("location_text = ${}", params.len() + 2));
-            params.push(val.clone());
-        }
-        if let Some(ref val) = study {
-            updates.push(format!("profession_title = ${}", params.len() + 2));
-            params.push(val.clone());
-        }
+        // university_location and study are not users table columns — ignored here
 
         updates.push("updated_at = NOW()".to_string());
 

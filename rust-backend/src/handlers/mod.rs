@@ -3461,7 +3461,11 @@ pub async fn verify_selfie(
 
     let mut best_similarity: Option<f32> = None;
     for path in photo_paths {
-        let bytes = match fs::read(&path).await {
+        // photo_paths are URL paths like "/uploads/photos/123.jpg";
+        // strip the leading "/uploads" prefix and resolve against upload_dir
+        let relative = path.trim_start_matches("/uploads/");
+        let disk_path = format!("{}/{}", state.config.upload_dir, relative);
+        let bytes = match fs::read(&disk_path).await {
             Ok(bytes) => bytes,
             Err(_) => continue,
         };
@@ -5011,34 +5015,121 @@ pub async fn upload_reel_video(
 pub async fn create_reel(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<CreateReelPayload>,
+    mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
 
-    let tags_json = payload.tags.as_ref().and_then(|t| serde_json::to_value(t).ok());
+    let mut video_bytes: Option<Vec<u8>> = None;
+    let mut video_mime: Option<String> = None;
+    let mut caption: Option<String> = None;
+    let mut category: Option<String> = None;
+    let mut tags_str: Option<String> = None;
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| AppError::bad_request("Invalid multipart data"))?
+    {
+        match field.name().unwrap_or("") {
+            "video" => {
+                video_mime = Some(field.content_type().unwrap_or("video/mp4").to_string());
+                video_bytes = Some(read_binary_field(&mut field, state.config.max_video_bytes).await?);
+            }
+            "caption" => {
+                caption = field.text().await.ok();
+            }
+            "category" => {
+                category = field.text().await.ok();
+            }
+            "tags" => {
+                tags_str = field.text().await.ok();
+            }
+            _ => {
+                while field.chunk().await.map_err(|_| AppError::bad_request("Read error"))?.is_some() {}
+            }
+        }
+    }
+
+    let video_data = video_bytes.ok_or_else(|| AppError::bad_request("Missing 'video' field"))?;
+    let mime = video_mime.unwrap_or_else(|| "video/mp4".to_string());
+    let ext = if mime.contains("quicktime") || mime.contains("mov") {
+        "mov"
+    } else if mime.contains("m4v") {
+        "m4v"
+    } else {
+        "mp4"
+    };
+
+    // Save video to disk
+    let upload_dir = &state.config.upload_dir;
+    fs::create_dir_all(format!("{}/reels", upload_dir))
+        .await
+        .map_err(|_| AppError::internal("Failed to create reels directory"))?;
+
+    let filename = format!("reels/{}_{}_{}.{}", user_id, Utc::now().timestamp(), Uuid::new_v4(), ext);
+    let disk_path = format!("{}/{}", upload_dir, filename);
+    fs::write(&disk_path, &video_data)
+        .await
+        .map_err(|_| AppError::internal("Failed to save video"))?;
+
+    let video_url = format!("/uploads/{}", filename);
+
+    let tags_json = tags_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok());
 
     let reel_id = sqlx::query_scalar::<_, i64>(
         r#"
-        INSERT INTO reels (user_id, video_url, thumbnail_url, duration_sec, caption, audio_track, tags, category, location_tag, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        INSERT INTO reels (user_id, video_url, caption, category, tags, created_at)
+        VALUES ($1, $2, $3, $4, $5, NOW())
         RETURNING id
         "#,
     )
     .bind(user_id)
-    .bind(&payload.video_url)
-    .bind(&payload.thumbnail_url)
-    .bind(payload.duration_sec)
-    .bind(&payload.caption)
-    .bind(&payload.audio_track)
+    .bind(&video_url)
+    .bind(&caption)
+    .bind(&category)
     .bind(&tags_json)
-    .bind(&payload.category)
-    .bind(&payload.location_tag)
     .fetch_one(&state.db)
     .await?;
 
+    // Spawn HLS transcoding in the background — doesn't block the upload response
+    {
+        let db_clone = state.db.clone();
+        let upload_dir_clone = upload_dir.clone();
+        let disk_path_clone = disk_path.clone();
+        tokio::spawn(async move {
+            let _ = sqlx::query("UPDATE reels SET hls_state = 'processing' WHERE id = $1")
+                .bind(reel_id)
+                .execute(&db_clone)
+                .await;
+
+            match crate::hls::transcode_to_hls(reel_id, &disk_path_clone, &upload_dir_clone).await {
+                Ok(hls_url) => {
+                    let _ = sqlx::query(
+                        "UPDATE reels SET hls_url = $1, hls_state = 'ready' WHERE id = $2",
+                    )
+                    .bind(&hls_url)
+                    .bind(reel_id)
+                    .execute(&db_clone)
+                    .await;
+                    tracing::info!("HLS ready for reel {}: {}", reel_id, hls_url);
+                }
+                Err(e) => {
+                    let _ = sqlx::query("UPDATE reels SET hls_state = 'failed' WHERE id = $1")
+                        .bind(reel_id)
+                        .execute(&db_clone)
+                        .await;
+                    tracing::warn!("HLS transcoding failed for reel {} (falling back to direct video): {}", reel_id, e);
+                }
+            }
+        });
+    }
+
     Ok(Json(json!({
         "reel_id": reel_id,
+        "hls_state": "processing",
         "message": "Reel created successfully"
     })))
 }
@@ -5085,7 +5176,7 @@ pub async fn get_reel_feed(
     .unwrap_or(0.3); // New users get 30% exploration
 
     // ── Step 2a: Load viewer's city for location boosting ──
-    let viewer_city: Option<String> = sqlx::query_scalar("SELECT city FROM users WHERE id = $1")
+    let viewer_city: Option<String> = sqlx::query_scalar("SELECT city FROM user_locations WHERE user_id = $1")
         .bind(user_id)
         .fetch_optional(read_db)
         .await?
@@ -5099,6 +5190,8 @@ pub async fn get_reel_feed(
         id: i64,
         user_id: i32,
         video_url: String,
+        hls_url: Option<String>,
+        hls_state: Option<String>,
         thumbnail_url: Option<String>,
         duration_sec: Option<i32>,
         caption: Option<String>,
@@ -5118,14 +5211,16 @@ pub async fn get_reel_feed(
 
     let candidates = sqlx::query_as::<_, ReelCandidate>(
         r#"
-        SELECT r.id, r.user_id::int4 as user_id, r.video_url, r.thumbnail_url, r.duration_sec,
+        SELECT r.id, r.user_id::int4 as user_id, r.video_url, r.hls_url, r.hls_state,
+               r.thumbnail_url, r.duration_sec,
                r.caption, r.tags, r.category, r.engagement_score, r.avg_watch_percent,
                r.view_count, r.like_count, r.created_at,
                u.name as creator_name, u.profile_photo_1 as creator_photo,
                u.is_verified as creator_verified, u.attractiveness_score as creator_attractiveness,
-               COALESCE(r.creator_city, u.city) as creator_city
+               COALESCE(r.creator_city, ul.city) as creator_city
         FROM reels r
         JOIN users u ON u.id = r.user_id
+        LEFT JOIN user_locations ul ON ul.user_id = r.user_id
         WHERE r.is_active = TRUE
           AND r.user_id != $1
           AND NOT EXISTS (
@@ -5247,6 +5342,8 @@ pub async fn get_reel_feed(
             "id": r.id,
             "user_id": r.user_id,
             "video_url": r.video_url,
+            "hls_url": r.hls_url,
+            "hls_state": r.hls_state,
             "thumbnail_url": r.thumbnail_url,
             "duration_sec": r.duration_sec,
             "caption": r.caption,
@@ -5330,7 +5427,7 @@ pub async fn track_reel_view(
     #[derive(sqlx::FromRow)]
     struct ReelMeta { user_id: i64, duration_sec: Option<i32>, creator_city: Option<String> }
     let meta = sqlx::query_as::<_, ReelMeta>(
-        "SELECT r.user_id, r.duration_sec, u.city as creator_city FROM reels r JOIN users u ON u.id = r.user_id WHERE r.id = $1"
+        "SELECT r.user_id, r.duration_sec, ul.city as creator_city FROM reels r JOIN users u ON u.id = r.user_id LEFT JOIN user_locations ul ON ul.user_id = r.user_id WHERE r.id = $1"
     )
     .bind(payload.reel_id)
     .fetch_optional(&state.db)
@@ -7367,6 +7464,65 @@ pub async fn search_universities(
     let prefix = format!("{}%", q);
     let contains = format!("%{}%", q);
     let limit = params.limit.unwrap_or(30).min(100);
+
+    // Normalize ISO alpha-2 codes (from iOS CLPlacemark.isoCountryCode) to
+    // alpha-3 codes as stored in the DB. Also uppercases everything.
+    let country: Option<String> = params.country.as_deref().map(|c| {
+        match c.to_uppercase().as_str() {
+            "US"       => "USA".into(),
+            "GB" | "UK"=> "GBR".into(),
+            "CA"       => "CAN".into(),
+            "AU"       => "AUS".into(),
+            "IN"       => "IND".into(),
+            "DE"       => "DEU".into(),
+            "SG"       => "SGP".into(),
+            "JP"       => "JPN".into(),
+            "FR"       => "FRA".into(),
+            "NZ"       => "NZL".into(),
+            "AE"       => "ARE".into(),
+            "NL"       => "NLD".into(),
+            other      => other.to_string(),  // already alpha-3 or unknown — pass through
+        }
+    });
+
+    // Empty query: return top universities by tier (filtered by country if provided)
+    if q.is_empty() {
+        let universities = if let Some(country) = &country {
+            sqlx::query_as::<_, UniversityRow>(
+                r#"
+                SELECT id, name, short_name, domain, country, country_code, state_province, city, tier
+                FROM universities
+                WHERE is_active = TRUE AND country_code = $1
+                ORDER BY CASE tier WHEN 'tier1' THEN 1 WHEN 'tier2' THEN 2 ELSE 3 END, name ASC
+                LIMIT $2
+                "#
+            )
+            .bind(country)
+            .bind(limit)
+            .fetch_all(&state.db)
+            .await?
+        } else {
+            sqlx::query_as::<_, UniversityRow>(
+                r#"
+                SELECT id, name, short_name, domain, country, country_code, state_province, city, tier
+                FROM universities
+                WHERE is_active = TRUE
+                ORDER BY CASE tier WHEN 'tier1' THEN 1 WHEN 'tier2' THEN 2 ELSE 3 END, name ASC
+                LIMIT $1
+                "#
+            )
+            .bind(limit)
+            .fetch_all(&state.db)
+            .await?
+        };
+        let result: Vec<Value> = universities.into_iter().map(|u| serde_json::json!({
+            "id": u.id, "name": u.name, "short_name": u.short_name,
+            "domain": u.domain, "country": u.country, "country_code": u.country_code,
+            "state_province": u.state_province, "city": u.city, "tier": u.tier
+        })).collect();
+        return Ok(Json(serde_json::json!({ "universities": result, "total": result.len() })));
+    }
+
     // tsquery: prefix match on each word using :* for partial FTS
     let tsquery = q.split_whitespace()
         .map(|w| format!("{}:*", w))
@@ -7374,7 +7530,7 @@ pub async fn search_universities(
         .join(" & ");
 
     // Hybrid search: trigram similarity (O(log n) via GIN) + FTS ts_rank + exact/prefix boost
-    let universities = if let Some(country) = &params.country {
+    let universities = if let Some(country) = &country {
         sqlx::query_as::<_, UniversityRow>(
             r#"
             SELECT id, name, short_name, domain, country, country_code, state_province, city, tier
@@ -7841,12 +7997,12 @@ pub async fn get_user_reels(
     let reels = sqlx::query_as::<_, (
         i64, String, Option<String>, Option<String>,
         Option<i32>, Option<i32>, Option<i32>, Option<NaiveDateTime>,
-        Option<Value>, Option<String>,
+        Option<Value>, Option<String>, Option<String>, Option<String>,
     )>(
         r#"
         SELECT r.id, r.video_url, r.thumbnail_url, r.caption,
                r.view_count, r.like_count, r.duration_sec, r.created_at,
-               r.tags, r.category
+               r.tags, r.category, r.hls_url, r.hls_state
         FROM reels r
         WHERE r.user_id = $1
           AND r.is_active = TRUE
@@ -7871,11 +8027,13 @@ pub async fn get_user_reels(
     let items: Vec<Value> = reels.iter().map(|(
         id, video_url, thumbnail_url, caption,
         view_count, like_count, duration_sec, created_at,
-        tags, category,
+        tags, category, hls_url, hls_state,
     )| {
         json!({
             "id": id,
             "video_url": video_url,
+            "hls_url": hls_url,
+            "hls_state": hls_state,
             "thumbnail_url": thumbnail_url,
             "caption": caption,
             "view_count": view_count.unwrap_or(0),

@@ -584,7 +584,7 @@ CREATE OR REPLACE VIEW v_ad_revenue_by_language AS
 SELECT
     DATE(ai.created_at) as date,
     ai.language_code,
-    s.language_name,
+    ai.language_code as language_name,
     COUNT(*) as impressions,
     SUM(CASE WHEN ai.clicked THEN 1 ELSE 0 END) as clicks,
     SUM(CASE WHEN ai.completed THEN 1 ELSE 0 END) as completions,
@@ -594,7 +594,7 @@ SELECT
         ELSE 0 END as ecpm_usd
 FROM ad_impressions ai
 LEFT JOIN indian_states s ON ai.state_code = s.state_code
-GROUP BY DATE(ai.created_at), ai.language_code, s.language_name;
+GROUP BY DATE(ai.created_at), ai.language_code;
 
 -- Ad revenue by Indian state
 CREATE OR REPLACE VIEW v_ad_revenue_by_state AS

@@ -22,9 +22,9 @@ ALTER TABLE reels
 
 -- Backfill creator_city from users table
 UPDATE reels r
-SET creator_city = u.city
+SET creator_city = u.current_city
 FROM users u
-WHERE u.id = r.user_id AND u.city IS NOT NULL;
+WHERE u.id = r.user_id AND u.current_city IS NOT NULL;
 
 -- Index for location-filtered reel queries
 CREATE INDEX IF NOT EXISTS idx_reels_creator_city ON reels(creator_city)

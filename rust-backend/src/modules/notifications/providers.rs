@@ -29,7 +29,9 @@ impl PushProvider {
         }
     }
 
-    /// Send push notification to a user (all registered devices)
+    /// Send push notification to a user (all registered devices).
+    /// `data` may include a `"category"` key — if present it is lifted into
+    /// `aps.category` so iOS triggers the matching UNNotificationCategory action set.
     pub async fn send(
         &self,
         user_id: i32,
@@ -41,6 +43,10 @@ impl PushProvider {
 
         if let Some(d) = data {
             payload = payload.with_data(d.clone());
+            // Lift "category" from data into aps.category for actionable notifications
+            if let Some(cat) = d.get("category").and_then(|v| v.as_str()) {
+                payload = payload.with_category(cat);
+            }
         }
 
         let results = self.service.send_to_user(user_id, &payload).await;

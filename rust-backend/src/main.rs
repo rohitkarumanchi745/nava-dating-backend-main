@@ -8,6 +8,7 @@ mod handlers;
 mod jobs;
 mod middleware;
 mod models;
+mod hls;
 mod redis_service;
 mod services;
 mod state;
@@ -586,7 +587,7 @@ async fn main() {
 
     // Notification module (replaces notification-service microservice)
     let notif_module = Arc::new(
-        modules::notifications::NotificationModule::new(state.db.clone()).await,
+        modules::notifications::NotificationModule::new(state.db.clone(), state.config.public_url.clone()).await,
     );
     notif_module.start_listener(event_bus.subscribe());
     info!("Notification module started (event-bus subscriber)");

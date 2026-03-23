@@ -30,12 +30,12 @@ pub struct NotificationModule {
 }
 
 impl NotificationModule {
-    pub async fn new(pool: PgPool) -> Self {
+    pub async fn new(pool: PgPool, public_url: String) -> Self {
         // Ensure policy tables exist
         policy::ensure_policy_tables(&pool).await;
 
         let notif_policy = Arc::new(NotificationPolicy::new(pool.clone()).await);
-        let handlers = Arc::new(NotificationHandlers::new(pool, notif_policy.clone()).await);
+        let handlers = Arc::new(NotificationHandlers::new(pool, notif_policy.clone(), public_url).await);
 
         // Periodically refresh send-time histograms (every 6 hours)
         let policy_refresh = notif_policy.clone();
@@ -162,10 +162,12 @@ pub struct NotificationHandlers {
     sms: SmsProvider,
     in_app: Option<InAppProvider>,
     policy: Arc<NotificationPolicy>,
+    /// Public base URL (e.g. "https://api.nava.app"). Empty → skip rich attachments.
+    public_url: String,
 }
 
 impl NotificationHandlers {
-    pub async fn new(pool: PgPool, policy: Arc<NotificationPolicy>) -> Self {
+    pub async fn new(pool: PgPool, policy: Arc<NotificationPolicy>, public_url: String) -> Self {
         let push = PushProvider::new(pool.clone()).await;
 
         let in_app_provider = InAppProvider::new(pool.clone());
@@ -180,6 +182,7 @@ impl NotificationHandlers {
             sms: SmsProvider::new(),
             in_app: Some(in_app_provider),
             policy,
+            public_url,
         }
     }
 
@@ -258,7 +261,13 @@ impl NotificationHandlers {
     // ─── Match events ────────────────────────────────────────────────
 
     pub async fn send_match_notification(&self, user_id: i32, matched_with: i32) -> Result<(), String> {
-        let data = serde_json::json!({ "type": "new_match", "matched_user_id": matched_with });
+        let photo = self.user_photo_url(matched_with).await;
+        let data = serde_json::json!({
+            "type": "new_match",
+            "matched_user_id": matched_with,
+            "image_url": photo,
+            "category": "MATCH",
+        });
         let utc_offset = self.user_utc_offset(user_id).await;
         self.gated_send(user_id, NotifCategory::NewMatch, utc_offset, Some(&data)).await?;
         Ok(())
@@ -268,14 +277,18 @@ impl NotificationHandlers {
 
     pub async fn send_super_like_notification(&self, target_user_id: i32, from_user_id: i32) -> Result<(), String> {
         let name = self.user_name(from_user_id).await;
+        let photo = self.user_photo_url(from_user_id).await;
         let title = "Someone Super Liked you!";
         let body = format!("{} super liked you! Check them out.", name);
-        self.push.send(target_user_id, title, &body, None).await?;
+        let data = serde_json::json!({
+            "type": "super_like",
+            "from_user_id": from_user_id,
+            "image_url": photo,
+            "category": "LIKE",
+        });
+        self.push.send(target_user_id, title, &body, Some(&data)).await?;
         if let Some(ref in_app) = self.in_app {
-            in_app.create(target_user_id, title, &body, "super_like", Some(&serde_json::json!({
-                "type": "super_like",
-                "from_user_id": from_user_id,
-            }))).await?;
+            in_app.create(target_user_id, title, &body, "super_like", Some(&data)).await?;
         }
         Ok(())
     }
@@ -283,7 +296,14 @@ impl NotificationHandlers {
     // ─── Chat events ─────────────────────────────────────────────────
 
     pub async fn send_message_notification(&self, recipient_id: i32, sender_id: i32, content_preview: Option<&str>) -> Result<(), String> {
-        let data = serde_json::json!({ "type": "new_message", "sender_id": sender_id, "preview": content_preview.unwrap_or("") });
+        let photo = self.user_photo_url(sender_id).await;
+        let data = serde_json::json!({
+            "type": "new_message",
+            "sender_id": sender_id,
+            "preview": content_preview.unwrap_or(""),
+            "image_url": photo,
+            "category": "MESSAGE",
+        });
         let utc_offset = self.user_utc_offset(recipient_id).await;
         self.gated_send(recipient_id, NotifCategory::Message, utc_offset, Some(&data)).await?;
         Ok(())
@@ -335,9 +355,16 @@ impl NotificationHandlers {
 
     pub async fn send_reel_message_notification(&self, receiver_id: i32, sender_id: i32, reel_id: i32, preview: &str) -> Result<(), String> {
         let sender_name = self.user_name(sender_id).await;
+        let photo = self.user_photo_url(sender_id).await;
         let truncated = if preview.len() > 50 { format!("{}...", &preview[..47]) } else { preview.to_string() };
         let title = format!("{} messaged on your reel", sender_name);
-        let data = serde_json::json!({ "type": "reel_message", "reel_id": reel_id, "sender_id": sender_id });
+        let data = serde_json::json!({
+            "type": "reel_message",
+            "reel_id": reel_id,
+            "sender_id": sender_id,
+            "image_url": photo,
+            "category": "REEL",
+        });
         self.push.send(receiver_id, &title, &truncated, Some(&data)).await?;
         if let Some(ref in_app) = self.in_app {
             in_app.create(receiver_id, &title, &truncated, "reel_message", Some(&data)).await?;
@@ -428,6 +455,22 @@ impl NotificationHandlers {
             .flatten()
             .flatten()
             .unwrap_or_else(|| "Someone".to_string())
+    }
+
+    /// Returns a full URL to the user's profile photo, or None if unavailable.
+    /// Requires PUBLIC_URL to be set; without it, returns None (NSE skips attachment).
+    async fn user_photo_url(&self, user_id: i32) -> Option<String> {
+        if self.public_url.is_empty() { return None; }
+        let path: Option<String> = sqlx::query_scalar(
+            "SELECT profile_photo_1 FROM users WHERE id = $1"
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+        path.map(|p| format!("{}{}", self.public_url, p))
     }
 
     async fn user_utc_offset(&self, user_id: i32) -> i32 {

@@ -135,23 +135,23 @@ CREATE INDEX IF NOT EXISTS idx_gdq_unprocessed
 -- matched_with edges from matches table
 INSERT INTO graph_edge_links_fwd (from_type, from_id, edge_type, to_type, to_id, written_at)
 SELECT 'user', user1_id::TEXT, 'matched_with', 'user', user2_id::TEXT, created_at
-FROM matches WHERE is_active = true
+FROM matches WHERE is_mutual_match = true
 ON CONFLICT DO NOTHING;
 
 INSERT INTO graph_edge_links_rev (to_type, to_id, edge_type, from_type, from_id, written_at)
 SELECT 'user', user2_id::TEXT, 'matched_with', 'user', user1_id::TEXT, created_at
-FROM matches WHERE is_active = true
+FROM matches WHERE is_mutual_match = true
 ON CONFLICT DO NOTHING;
 
 -- Also reverse direction for bidirectional matched_with
 INSERT INTO graph_edge_links_fwd (from_type, from_id, edge_type, to_type, to_id, written_at)
 SELECT 'user', user2_id::TEXT, 'matched_with', 'user', user1_id::TEXT, created_at
-FROM matches WHERE is_active = true
+FROM matches WHERE is_mutual_match = true
 ON CONFLICT DO NOTHING;
 
 INSERT INTO graph_edge_links_rev (to_type, to_id, edge_type, from_type, from_id, written_at)
 SELECT 'user', user1_id::TEXT, 'matched_with', 'user', user2_id::TEXT, created_at
-FROM matches WHERE is_active = true
+FROM matches WHERE is_mutual_match = true
 ON CONFLICT DO NOTHING;
 
 -- liked / passed edges from swipes table
@@ -173,13 +173,13 @@ ON CONFLICT DO NOTHING;
 
 -- attends edges from student_verifications
 INSERT INTO graph_edge_links_fwd (from_type, from_id, edge_type, to_type, to_id, written_at)
-SELECT 'user', user_id::TEXT, 'attends', 'university', university_id::TEXT, created_at
-FROM student_verifications WHERE verified = true
+SELECT 'user', user_id::TEXT, 'attends', 'university', university_id::TEXT, COALESCE(verified_at, submitted_at, NOW())
+FROM student_verifications WHERE status = 'verified' AND university_id IS NOT NULL
 ON CONFLICT DO NOTHING;
 
 INSERT INTO graph_edge_links_rev (to_type, to_id, edge_type, from_type, from_id, written_at)
-SELECT 'university', university_id::TEXT, 'attends', 'user', user_id::TEXT, created_at
-FROM student_verifications WHERE verified = true
+SELECT 'university', university_id::TEXT, 'attends', 'user', user_id::TEXT, COALESCE(verified_at, submitted_at, NOW())
+FROM student_verifications WHERE status = 'verified' AND university_id IS NOT NULL
 ON CONFLICT DO NOTHING;
 
 -- created edges from reels table
