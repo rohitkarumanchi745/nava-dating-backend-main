@@ -244,7 +244,7 @@ impl Config {
         let max_video_bytes = env::var("MAX_VIDEO_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(500 * 1024 * 1024); // 500MB — covers ProRes 4K clips
+            .unwrap_or(2 * 1024 * 1024 * 1024); // 2GB — accept any phone video, server normalizes
         let max_spot_duration_sec = env::var("MAX_SPOT_DURATION_SEC")
             .ok()
             .and_then(|value| value.parse::<i32>().ok())
@@ -423,7 +423,7 @@ impl Config {
         let request_timeout_secs = env::var("REQUEST_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(30);
+            .unwrap_or(300); // 5 minutes — video uploads need time
 
         // LLM Labeling
         let llm_enabled = env::var("LLM_ENABLED")

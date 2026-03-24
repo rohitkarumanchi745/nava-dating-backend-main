@@ -5025,6 +5025,14 @@ pub async fn create_reel(
     let mut caption: Option<String> = None;
     let mut category: Option<String> = None;
     let mut tags_str: Option<String> = None;
+    let mut music_id: Option<String> = None;
+    let mut music_title: Option<String> = None;
+    let mut music_artist: Option<String> = None;
+    let mut music_artwork_url: Option<String> = None;
+    let mut music_preview_url: Option<String> = None;
+    let mut music_duration_ms: Option<i32> = None;
+    let mut music_start_ms: Option<i32> = None;
+    let mut music_genre: Option<String> = None;
 
     while let Some(mut field) = multipart
         .next_field()
@@ -5036,15 +5044,17 @@ pub async fn create_reel(
                 video_mime = Some(field.content_type().unwrap_or("video/mp4").to_string());
                 video_bytes = Some(read_binary_field(&mut field, state.config.max_video_bytes).await?);
             }
-            "caption" => {
-                caption = field.text().await.ok();
-            }
-            "category" => {
-                category = field.text().await.ok();
-            }
-            "tags" => {
-                tags_str = field.text().await.ok();
-            }
+            "caption" => { caption = field.text().await.ok(); }
+            "category" => { category = field.text().await.ok(); }
+            "tags" => { tags_str = field.text().await.ok(); }
+            "music_id" => { music_id = field.text().await.ok(); }
+            "music_title" => { music_title = field.text().await.ok(); }
+            "music_artist" => { music_artist = field.text().await.ok(); }
+            "music_artwork_url" => { music_artwork_url = field.text().await.ok(); }
+            "music_preview_url" => { music_preview_url = field.text().await.ok(); }
+            "music_duration_ms" => { music_duration_ms = field.text().await.ok().and_then(|v| v.parse().ok()); }
+            "music_start_ms" => { music_start_ms = field.text().await.ok().and_then(|v| v.parse().ok()); }
+            "music_genre" => { music_genre = field.text().await.ok(); }
             _ => {
                 while field.chunk().await.map_err(|_| AppError::bad_request("Read error"))?.is_some() {}
             }
@@ -5052,6 +5062,7 @@ pub async fn create_reel(
     }
 
     let video_data = video_bytes.ok_or_else(|| AppError::bad_request("Missing 'video' field"))?;
+    tracing::info!("Reel upload received: {:.1}MB from user {}", video_data.len() as f64 / 1_048_576.0, user_id);
     let mime = video_mime.unwrap_or_else(|| "video/mp4".to_string());
     let ext = if mime.contains("quicktime") || mime.contains("mov") {
         "mov"
@@ -5081,8 +5092,11 @@ pub async fn create_reel(
 
     let reel_id = sqlx::query_scalar::<_, i64>(
         r#"
-        INSERT INTO reels (user_id, video_url, caption, category, tags, created_at)
-        VALUES ($1, $2, $3, $4, $5, NOW())
+        INSERT INTO reels (user_id, video_url, caption, category, tags,
+                           music_id, music_title, music_artist, music_artwork_url,
+                           music_preview_url, music_duration_ms, music_start_ms, music_genre,
+                           created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
         RETURNING id
         "#,
     )
@@ -5091,6 +5105,14 @@ pub async fn create_reel(
     .bind(&caption)
     .bind(&category)
     .bind(&tags_json)
+    .bind(&music_id)
+    .bind(&music_title)
+    .bind(&music_artist)
+    .bind(&music_artwork_url)
+    .bind(&music_preview_url)
+    .bind(&music_duration_ms)
+    .bind(&music_start_ms)
+    .bind(&music_genre)
     .fetch_one(&state.db)
     .await?;
 
@@ -5105,6 +5127,12 @@ pub async fn create_reel(
                 .execute(&db_clone)
                 .await;
 
+            // Step 1: Normalize — trim to 30s, cap at 1080p, compress
+            if let Err(e) = crate::hls::normalize_video(&disk_path_clone).await {
+                tracing::warn!("Video normalization failed for reel {} (proceeding with original): {}", reel_id, e);
+            }
+
+            // Step 2: HLS transcode the (now normalized) file
             match crate::hls::transcode_to_hls(reel_id, &disk_path_clone, &upload_dir_clone).await {
                 Ok(hls_url) => {
                     let _ = sqlx::query(
@@ -5132,6 +5160,46 @@ pub async fn create_reel(
         "hls_state": "processing",
         "message": "Reel created successfully"
     })))
+}
+
+/// GET /reels/trending-music — songs most used in reels (for music picker)
+pub async fn get_trending_music(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let _user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let limit: i64 = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(20).min(50);
+
+    let tracks = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, Option<String>, i64)>(
+        r#"
+        SELECT music_id, music_title, music_artist, music_artwork_url, music_preview_url,
+               COUNT(*) as use_count
+        FROM reels
+        WHERE music_id IS NOT NULL AND is_active = TRUE
+        GROUP BY music_id, music_title, music_artist, music_artwork_url, music_preview_url
+        ORDER BY use_count DESC, MAX(created_at) DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(state.read_pool())
+    .await?;
+
+    let items: Vec<Value> = tracks.iter().map(|(id, title, artist, artwork, preview, count)| {
+        json!({
+            "id": id,
+            "title": title,
+            "artist": artist,
+            "artwork_url": artwork,
+            "preview_url": preview,
+            "use_count": count
+        })
+    }).collect();
+
+    Ok(Json(json!({ "trending": items })))
 }
 
 /// Get personalized reel feed
@@ -5207,6 +5275,12 @@ pub async fn get_reel_feed(
         creator_verified: Option<bool>,
         creator_attractiveness: Option<f64>,
         creator_city: Option<String>,
+        music_id: Option<String>,
+        music_title: Option<String>,
+        music_artist: Option<String>,
+        music_artwork_url: Option<String>,
+        music_preview_url: Option<String>,
+        music_start_ms: Option<i32>,
     }
 
     let candidates = sqlx::query_as::<_, ReelCandidate>(
@@ -5217,7 +5291,9 @@ pub async fn get_reel_feed(
                r.view_count, r.like_count, r.created_at,
                u.name as creator_name, u.profile_photo_1 as creator_photo,
                u.is_verified as creator_verified, u.attractiveness_score as creator_attractiveness,
-               COALESCE(r.creator_city, ul.city) as creator_city
+               COALESCE(r.creator_city, ul.city) as creator_city,
+               r.music_id, r.music_title, r.music_artist, r.music_artwork_url,
+               r.music_preview_url, r.music_start_ms
         FROM reels r
         JOIN users u ON u.id = r.user_id
         LEFT JOIN user_locations ul ON ul.user_id = r.user_id
@@ -5360,7 +5436,15 @@ pub async fn get_reel_feed(
             "creator_university_tier": uni_info.map(|(_, tier)| format_tier(tier)),
             "interaction_status": interaction,
             "can_like": interaction == "none",
-            "personalization_score": (score * 100.0).round() / 100.0
+            "personalization_score": (score * 100.0).round() / 100.0,
+            "music": if r.music_id.is_some() { Some(json!({
+                "id": r.music_id,
+                "title": r.music_title,
+                "artist": r.music_artist,
+                "artwork_url": r.music_artwork_url,
+                "preview_url": r.music_preview_url,
+                "start_ms": r.music_start_ms
+            })) } else { None }
         })
     }).collect();
 
@@ -7994,15 +8078,35 @@ pub async fn get_user_reels(
     let limit: i64 = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(30).min(50);
     let offset: i64 = params.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
 
-    let reels = sqlx::query_as::<_, (
-        i64, String, Option<String>, Option<String>,
-        Option<i32>, Option<i32>, Option<i32>, Option<NaiveDateTime>,
-        Option<Value>, Option<String>, Option<String>, Option<String>,
-    )>(
+    #[derive(sqlx::FromRow)]
+    struct UserReel {
+        id: i64,
+        video_url: String,
+        thumbnail_url: Option<String>,
+        caption: Option<String>,
+        view_count: Option<i32>,
+        like_count: Option<i32>,
+        duration_sec: Option<i32>,
+        created_at: Option<NaiveDateTime>,
+        tags: Option<Value>,
+        category: Option<String>,
+        hls_url: Option<String>,
+        hls_state: Option<String>,
+        music_id: Option<String>,
+        music_title: Option<String>,
+        music_artist: Option<String>,
+        music_artwork_url: Option<String>,
+        music_preview_url: Option<String>,
+        music_start_ms: Option<i32>,
+    }
+
+    let reels = sqlx::query_as::<_, UserReel>(
         r#"
         SELECT r.id, r.video_url, r.thumbnail_url, r.caption,
                r.view_count, r.like_count, r.duration_sec, r.created_at,
-               r.tags, r.category, r.hls_url, r.hls_state
+               r.tags, r.category, r.hls_url, r.hls_state,
+               r.music_id, r.music_title, r.music_artist, r.music_artwork_url,
+               r.music_preview_url, r.music_start_ms
         FROM reels r
         WHERE r.user_id = $1
           AND r.is_active = TRUE
@@ -8024,24 +8128,28 @@ pub async fn get_user_reels(
     .await
     .unwrap_or(0);
 
-    let items: Vec<Value> = reels.iter().map(|(
-        id, video_url, thumbnail_url, caption,
-        view_count, like_count, duration_sec, created_at,
-        tags, category, hls_url, hls_state,
-    )| {
+    let items: Vec<Value> = reels.iter().map(|r| {
         json!({
-            "id": id,
-            "video_url": video_url,
-            "hls_url": hls_url,
-            "hls_state": hls_state,
-            "thumbnail_url": thumbnail_url,
-            "caption": caption,
-            "view_count": view_count.unwrap_or(0),
-            "like_count": like_count.unwrap_or(0),
-            "duration_sec": duration_sec,
-            "created_at": created_at,
-            "tags": tags,
-            "category": category,
+            "id": r.id,
+            "video_url": r.video_url,
+            "hls_url": r.hls_url,
+            "hls_state": r.hls_state,
+            "thumbnail_url": r.thumbnail_url,
+            "caption": r.caption,
+            "view_count": r.view_count.unwrap_or(0),
+            "like_count": r.like_count.unwrap_or(0),
+            "duration_sec": r.duration_sec,
+            "created_at": r.created_at,
+            "tags": r.tags,
+            "category": r.category,
+            "music": if r.music_id.is_some() { Some(json!({
+                "id": r.music_id,
+                "title": r.music_title,
+                "artist": r.music_artist,
+                "artwork_url": r.music_artwork_url,
+                "preview_url": r.music_preview_url,
+                "start_ms": r.music_start_ms
+            })) } else { None },
         })
     }).collect();
 

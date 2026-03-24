@@ -115,7 +115,7 @@ use handlers::{
     log_reward, get_training_events, get_user_interactions,
     bulk_update_scores, update_spot_embedding,
     // Reels (private message based dating)
-    upload_reel_video, create_reel, get_reel_feed, track_reel_view, like_reel, unlike_reel,
+    upload_reel_video, create_reel, get_trending_music, get_reel_feed, track_reel_view, like_reel, unlike_reel,
     send_reel_message, get_reel_inbox, reply_reel_message, mark_reel_message_read,
     get_reel_conversation, get_my_learned_patterns,
     // LLM Labeling
@@ -841,6 +841,7 @@ async fn main() {
         // Reels (private message based dating)
         .route("/reels/upload-video", post(upload_reel_video))  // pre-upload video binary, returns video_url
         .route("/reels", post(create_reel))
+        .route("/reels/trending-music", get(get_trending_music))
         .route("/reels/feed", get(get_reel_feed))
         .route("/reels/view", post(track_reel_view))
         .route("/reels/like", post(like_reel))

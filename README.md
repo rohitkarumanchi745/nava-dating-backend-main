@@ -111,7 +111,7 @@ All endpoints require `Authorization: Bearer <jwt>` header unless noted.
 |-----------|------|-------------|
 | `update_profile(name, gender, dob, bio, university, universityLocation, study, ...)` | Mutation | Full profile update — accepts `Upload` scalar for photos, runs full photo pipeline (NSFW, liveness, resize, EXIF strip) |
 
-**Photo uploads:** Sent as GraphQL `Upload` scalar, processed through quality/NSFW/liveness pipeline, saved to `uploads/` directory, served at `GET /uploads/{filename}`. Photos that fail pipeline return an error with the rejection reason. Supports HEIC, JPEG, PNG, WebP, ProRAW up to **75 MB**. Video uploads up to **500 MB**.
+**Photo uploads:** Sent as GraphQL `Upload` scalar, processed through quality/NSFW/liveness pipeline, saved to `uploads/` directory, served at `GET /uploads/{filename}`. Photos that fail pipeline return an error with the rejection reason. Supports HEIC, JPEG, PNG, WebP, ProRAW up to **75 MB**. Video uploads up to **2 GB** (server normalizes to 30s max, progressive resolution reduction if over 50MB).
 
 ### AI Insights (REST)
 
@@ -262,9 +262,10 @@ Call states: `idle → connecting → ringing → active → idle`
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/reels/upload-video` | POST (multipart) | Pre-upload video binary (field: `video`). Saves to `uploads/reels/`. Returns `{video_url}`. Called immediately on video pick — parallel to user browsing filters + typing caption. |
-| `/reels` | POST (JSON) | Finalize reel: `{video_url, caption, tags, category, location_tag}`. Instant since video already uploaded. |
-| `/reels/feed` | GET | Personalized vertical video feed scored by category (35%), engagement (20%), freshness (15%), creator (10%), location (10%), exploration (5%), noise (5%) |
-| `/reels/user/{user_id}` | GET | All reels by a specific user — used for "My Reels" tab on profile |
+| `/reels` | POST (multipart) | Create reel with video, caption, tags, category + optional Apple Music fields (`music_id`, `music_title`, `music_artist`, `music_artwork_url`, `music_preview_url`, `music_duration_ms`, `music_start_ms`, `music_genre`). Accepts up to 2GB — server normalizes (trims to 30s, caps resolution progressively if over 50MB). Background HLS transcoding starts immediately. |
+| `/reels/feed` | GET | Personalized vertical video feed scored by category (35%), engagement (20%), freshness (15%), creator (10%), location (10%), exploration (5%), noise (5%). Returns `hls_url`, `hls_state`, and `music` object per reel. |
+| `/reels/trending-music` | GET | Songs most used in reels, sorted by popularity — for music picker UI |
+| `/reels/user/{user_id}` | GET | All reels by a specific user — used for "My Reels" tab on profile. Includes HLS + music data. |
 | `/reels/like` | POST | Like a reel |
 | `/reels/unlike` | POST | Unlike a reel |
 | `/reels/view` | POST | Track reel view |
@@ -367,7 +368,7 @@ Call states: `idle → connecting → ringing → active → idle`
 | **Content Moderation** | NLP toxicity/hate/harassment classifiers, URL/spam filters, messaging graph anomaly detection, moderation transparency + appeals |
 | **LLM** | LLaMA 3 (content labeling, moderation), batch inference pipeline |
 | **Recommendations** | RL-scored discovery ranking, pgvector 512-dim embeddings, collaborative filtering, content freshness decay |
-| **Media Pipeline** | Responsive image variants (150/400/1080px), AV1/WEBP transcoding, adaptive bitrate reels, CDN smallest-rendition serving |
+| **Media Pipeline** | Responsive image variants (150/400/1080px), AV1/WEBP transcoding, HLS adaptive bitrate reels (FFmpeg 3-variant: 360p/720p/1080p), server-side video normalization (30s trim, progressive resolution reduction), Apple Music metadata, CDN smallest-rendition serving |
 | **File Storage** | AWS S3 + CloudFront CDN (photos, voice intros, reels) |
 | **Payments** | Apple StoreKit 2 (iOS), RevenueCat (React Native), Razorpay, Stripe |
 | **Notification Intelligence** | Thompson Sampling bandit (variant selection), send-time optimization, per-user daily caps, quiet hours, opt-out respect, shadow-mode A/B canary |
@@ -649,8 +650,11 @@ SQL candidates → Multi-signal scoring → Re-rank by blended score → Return 
 - **Responsive Image Variants** — Pre-generate multiple photo sizes on upload: thumbnail (150px), card (400px), full (1080px), original
 - **Modern Formats** — AV1/WEBP transcoding for avatars and thumbnails; JPEG fallback for older clients
 - **Smallest Rendition Serving** — CDN serves the smallest acceptable rendition based on `Accept` header, device pixel ratio, and requested viewport size
-- **Reel Compression** — On-device H.264 compression via `AVAssetExportSession` with `shouldOptimizeForNetworkUse = true` (moov atom → front for fast-start streaming). Upload begins immediately on video pick — before user types caption or selects filter.
+- **Reel Compression** — On-device H.264 compression via `AVAssetExportSession` with `shouldOptimizeForNetworkUse = true` (moov atom → front for fast-start streaming). Upload begins immediately on video pick — before user types caption or selects filter. Client-side progressive resolution reduction (2160p→1080p→720p→540p→480p) targets 50MB max file size; 4K kept if already under limit.
 - **Reel Filters** — 7 client-side filters (Original, Vivid, Warm, Cool, Vintage, Drama, Fade) applied via `AVVideoComposition` + `CIFilter` pipeline. Filter thumbnails generated instantly from first frame. Filtered video exported + uploaded in background while user types caption.
+- **HLS Adaptive Streaming** — Server-side FFmpeg transcoding to 3-variant HLS (360p/720p/1080p) with `master.m3u8`. AVPlayer selects optimal quality based on bandwidth. Background processing: upload returns immediately, HLS transcoding runs async. States: `pending` → `processing` → `ready`/`failed`. iOS falls back to direct `video_url` when HLS not ready.
+- **Server-Side Video Normalization** — Accepts uploads up to 2GB. FFmpeg trims to 30s max, progressively reduces resolution only if file exceeds 50MB (tries 2160p→1440p→1080p→720p→480p). 4K video that fits under 50MB is never downscaled.
+- **Apple Music Integration** — Reels support attached music metadata (Apple Music song ID, title, artist, artwork, preview URL, start offset). MusicKit 30s previews — free for all users, no subscription required. Trending music endpoint aggregates most-used songs across reels.
 
 ### Client Adaptive Behavior
 - **Battery-Aware Throttling** — Client reports battery level + charging state; server defers non-critical work (reel transcoding notifications, background sync) when battery <20%
@@ -767,6 +771,7 @@ DomainEvent::SendPush/Email/Sms  →  notification delivery (FCM, APNs, SMTP, Tw
 │   │   │   ├── client_adaptive.rs # Battery/thermal/network-class throttling
 │   │   │   └── dual_write.rs  # Graph query helpers (Postgres CTEs)
 │   │   ├── graphql.rs         # GraphQL schema & resolvers
+│   │   ├── hls.rs             # HLS transcoding (FFmpeg 3-variant) + video normalization (30s trim, progressive resolution)
 │   │   ├── websocket.rs       # WebSocket chat + call signaling
 │   │   └── vision/            # Face recognition, liveness, emotion, NSFW
 │   ├── k8s/                   # Kubernetes manifests

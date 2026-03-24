@@ -103,7 +103,7 @@ pub async fn security_headers_middleware(
 // Request Size Limit Middleware
 // -----------------------------------------------------------------------------
 
-const MAX_BODY_SIZE: u64 = 10 * 1024 * 1024; // 10MB default
+const MAX_BODY_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2GB — accept any phone video, server normalizes
 
 /// Reject requests with bodies that are too large
 pub async fn body_size_limit_middleware(

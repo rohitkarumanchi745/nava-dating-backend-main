@@ -1,6 +1,10 @@
 //! HLS transcoding — converts an uploaded video into 3-variant adaptive-bitrate
 //! HLS using FFmpeg. Requires `ffmpeg` on PATH.
 //!
+//! Pipeline:
+//!   1. normalize_video()  — trim to 30s, cap at 1080p, compress to high-quality H.264
+//!   2. transcode_to_hls() — split normalized file into 360p/720p/1080p HLS variants
+//!
 //! Output layout under `{upload_dir}/reels/hls/{reel_id}/`:
 //!   master.m3u8      ← master playlist (returned as the stored hls_url)
 //!   360p/playlist.m3u8 + seg*.ts
@@ -11,6 +15,103 @@
 
 use tokio::fs;
 use tokio::process::Command;
+
+/// Max file size (50MB). Videos under this skip resolution reduction.
+const MAX_NORMALIZED_SIZE: u64 = 50 * 1024 * 1024;
+
+/// Normalize an uploaded video:
+/// - Always trim to 30s max
+/// - Only reduce resolution if the file exceeds MAX_NORMALIZED_SIZE
+/// - If a 4K video fits within the size limit, it stays 4K
+pub async fn normalize_video(input_path: &str) -> Result<String, String> {
+    let base = input_path.rsplit_once('.').map(|(b, _)| b).unwrap_or(input_path);
+    let normalized = format!("{}_normalized.mp4", base);
+
+    let file_size = fs::metadata(input_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    // Step 1: Always trim to 30s. If file is within size limit, keep original resolution.
+    if file_size <= MAX_NORMALIZED_SIZE {
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y", "-i", input_path,
+                "-t", "30",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                &normalized,
+            ])
+            .status()
+            .await
+            .map_err(|e| format!("FFmpeg normalize launch failed: {e}"))?;
+
+        if !status.success() {
+            return Err(format!("FFmpeg normalize exited with code {:?}", status.code()));
+        }
+
+        replace_original(&normalized, input_path).await?;
+        tracing::info!("Normalized video: {} (trimmed to 30s, kept original resolution)", input_path);
+        return Ok(input_path.to_string());
+    }
+
+    // Step 2: File is too large — progressively reduce resolution until it fits.
+    // Try each resolution cap from highest to lowest.
+    let caps = ["2160", "1440", "1080", "720", "480"];
+
+    for cap in &caps {
+        let vf = format!("scale=min({}\\,iw):-2", cap);
+
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y", "-i", input_path,
+                "-t", "30",
+                "-vf", &vf,
+                "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                &normalized,
+            ])
+            .status()
+            .await
+            .map_err(|e| format!("FFmpeg normalize launch failed: {e}"))?;
+
+        if !status.success() {
+            return Err(format!("FFmpeg normalize exited with code {:?} at {}p", status.code(), cap));
+        }
+
+        let out_size = fs::metadata(&normalized).await.map(|m| m.len()).unwrap_or(0);
+
+        if out_size <= MAX_NORMALIZED_SIZE {
+            replace_original(&normalized, input_path).await?;
+            tracing::info!(
+                "Normalized video: {} (trimmed to 30s, capped at {}p, {:.1}MB)",
+                input_path, cap, out_size as f64 / 1_048_576.0
+            );
+            return Ok(input_path.to_string());
+        }
+
+        tracing::info!("{}p still too large ({:.1}MB), trying lower", cap, out_size as f64 / 1_048_576.0);
+    }
+
+    // If even 480p is too large, use the last result anyway
+    replace_original(&normalized, input_path).await?;
+    tracing::warn!("Video {} still over limit at 480p, using it anyway", input_path);
+    Ok(input_path.to_string())
+}
+
+async fn replace_original(normalized: &str, original: &str) -> Result<(), String> {
+    if let Err(e) = fs::rename(normalized, original).await {
+        if let Err(e2) = fs::copy(normalized, original).await {
+            return Err(format!("Failed to replace original: rename={e}, copy={e2}"));
+        }
+        let _ = fs::remove_file(normalized).await;
+    }
+    Ok(())
+}
 
 /// Transcode `input_path` to 3-variant HLS.
 ///
