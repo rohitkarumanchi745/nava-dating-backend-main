@@ -4954,8 +4954,9 @@ pub struct CreateReelPayload {
     pub location_tag: Option<String>,
 }
 
-/// POST /reels/upload-video — accepts multipart video binary, stores to disk, returns video_url.
+/// POST /reels/upload-video — accepts multipart video binary, streams to disk, returns video_url.
 /// Called immediately when the user picks a video (pre-upload before tapping Post).
+/// Streams chunks directly to disk — never buffers the full video in RAM.
 pub async fn upload_reel_video(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4964,8 +4965,8 @@ pub async fn upload_reel_video(
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
 
-    let mut video_data: Option<Vec<u8>> = None;
     let mut mime_type: Option<String> = None;
+    let mut disk_path: Option<String> = None;
 
     while let Some(mut field) = multipart.next_field().await.map_err(|_| AppError::bad_request("Invalid multipart"))? {
         let name = field.name().unwrap_or("").to_string();
@@ -4974,40 +4975,50 @@ pub async fn upload_reel_video(
             if !ct.starts_with("video/") {
                 return Err(AppError::bad_request("Field 'video' must be a video file"));
             }
-            mime_type = Some(ct);
-            video_data = Some(read_binary_field(&mut field, state.config.max_video_bytes).await?);
+            mime_type = Some(ct.clone());
+
+            let ext = if ct.contains("quicktime") || ct.contains("mov") {
+                "mov"
+            } else if ct.contains("webm") {
+                "webm"
+            } else {
+                "mp4"
+            };
+
+            let upload_dir = &state.config.upload_dir;
+            fs::create_dir_all(format!("{}/reels", upload_dir))
+                .await
+                .map_err(|_| AppError::internal("Failed to create reels directory"))?;
+
+            let filename = format!("reels/{}_{}_{}.{}", user_id, Utc::now().timestamp(), Uuid::new_v4(), ext);
+            let path = format!("{}/{}", upload_dir, filename);
+
+            // Stream chunks directly to disk — no full RAM buffer
+            let mut file = fs::File::create(&path).await
+                .map_err(|_| AppError::internal("Failed to create video file"))?;
+            let mut total_bytes: usize = 0;
+            let max_bytes = state.config.max_video_bytes;
+
+            use tokio::io::AsyncWriteExt;
+            while let Some(chunk) = field.chunk().await.map_err(|_| AppError::bad_request("Read error"))? {
+                total_bytes += chunk.len();
+                if total_bytes > max_bytes {
+                    drop(file);
+                    let _ = fs::remove_file(&path).await;
+                    return Err(AppError::bad_request("Video file too large"));
+                }
+                file.write_all(&chunk).await
+                    .map_err(|_| AppError::internal("Failed to write video chunk"))?;
+            }
+            file.flush().await.map_err(|_| AppError::internal("Failed to flush video"))?;
+
+            disk_path = Some(filename);
         } else {
-            // drain unknown fields
             while field.chunk().await.map_err(|_| AppError::bad_request("Read error"))?.is_some() {}
         }
     }
 
-    let video_bytes = video_data.ok_or_else(|| AppError::bad_request("Missing 'video' field"))?;
-    let mime = mime_type.unwrap_or_else(|| "video/mp4".to_string());
-
-    let ext = if mime.contains("quicktime") || mime.contains("mov") {
-        "mov"
-    } else if mime.contains("mp4") || mime.contains("m4v") {
-        "mp4"
-    } else if mime.contains("webm") {
-        "webm"
-    } else if mime.contains("hevc") {
-        "hevc"
-    } else {
-        "mp4"
-    };
-
-    let upload_dir = &state.config.upload_dir;
-    fs::create_dir_all(format!("{}/reels", upload_dir))
-        .await
-        .map_err(|_| AppError::internal("Failed to create reels directory"))?;
-
-    let filename = format!("reels/{}_{}_{}.{}", user_id, Utc::now().timestamp(), Uuid::new_v4(), ext);
-    let disk_path = format!("{}/{}", upload_dir, filename);
-    fs::write(&disk_path, &video_bytes)
-        .await
-        .map_err(|_| AppError::internal("Failed to save video"))?;
-
+    let filename = disk_path.ok_or_else(|| AppError::bad_request("Missing 'video' field"))?;
     let video_url = format!("/uploads/{}", filename);
     Ok(Json(json!({ "video_url": video_url })))
 }
@@ -5084,6 +5095,9 @@ pub async fn create_reel(
         .await
         .map_err(|_| AppError::internal("Failed to save video"))?;
 
+    // Free the in-memory video buffer immediately after writing to disk
+    drop(video_data);
+
     let video_url = format!("/uploads/{}", filename);
 
     let tags_json = tags_str
@@ -5117,6 +5131,7 @@ pub async fn create_reel(
     .await?;
 
     // Spawn HLS transcoding in the background — doesn't block the upload response
+    // Uses single-pass pipeline: probe → skip normalize if short H.264 → direct HLS output
     {
         let db_clone = state.db.clone();
         let upload_dir_clone = upload_dir.clone();
@@ -5127,29 +5142,70 @@ pub async fn create_reel(
                 .execute(&db_clone)
                 .await;
 
-            // Step 1: Normalize — trim to 30s, cap at 1080p, compress
-            if let Err(e) = crate::hls::normalize_video(&disk_path_clone).await {
-                tracing::warn!("Video normalization failed for reel {} (proceeding with original): {}", reel_id, e);
-            }
+            let start = std::time::Instant::now();
 
-            // Step 2: HLS transcode the (now normalized) file
-            match crate::hls::transcode_to_hls(reel_id, &disk_path_clone, &upload_dir_clone).await {
-                Ok(hls_url) => {
-                    let _ = sqlx::query(
-                        "UPDATE reels SET hls_url = $1, hls_state = 'ready' WHERE id = $2",
-                    )
-                    .bind(&hls_url)
-                    .bind(reel_id)
-                    .execute(&db_clone)
-                    .await;
-                    tracing::info!("HLS ready for reel {}: {}", reel_id, hls_url);
+            // Probe video to decide pipeline
+            let probe = crate::hls::probe_video(&disk_path_clone).await;
+            let needs_normalize = match &probe {
+                Ok(p) => {
+                    // Skip separate normalize if ≤30s and already H.264 — single-pass handles it
+                    let dominated = p.duration_secs <= 31.0 && p.codec == "h264";
+                    tracing::info!(
+                        "Reel {} probe: {:.1}s, codec={}, {}px wide, skip_normalize={}",
+                        reel_id, p.duration_secs, p.codec, p.width, dominated
+                    );
+                    !dominated
                 }
                 Err(e) => {
-                    let _ = sqlx::query("UPDATE reels SET hls_state = 'failed' WHERE id = $1")
+                    tracing::warn!("ffprobe failed for reel {}: {} — will normalize", reel_id, e);
+                    true
+                }
+            };
+
+            if needs_normalize {
+                // Fallback two-step: normalize first, then HLS
+                if let Err(e) = crate::hls::normalize_video(&disk_path_clone).await {
+                    tracing::warn!("Normalization failed for reel {} (proceeding with original): {}", reel_id, e);
+                }
+                match crate::hls::transcode_to_hls(reel_id, &disk_path_clone, &upload_dir_clone).await {
+                    Ok(hls_url) => {
+                        let _ = sqlx::query(
+                            "UPDATE reels SET hls_url = $1, hls_state = 'ready' WHERE id = $2",
+                        )
+                        .bind(&hls_url)
                         .bind(reel_id)
                         .execute(&db_clone)
                         .await;
-                    tracing::warn!("HLS transcoding failed for reel {} (falling back to direct video): {}", reel_id, e);
+                        tracing::info!("HLS ready for reel {} in {:.1}s (two-pass): {}", reel_id, start.elapsed().as_secs_f64(), hls_url);
+                    }
+                    Err(e) => {
+                        let _ = sqlx::query("UPDATE reels SET hls_state = 'failed' WHERE id = $1")
+                            .bind(reel_id)
+                            .execute(&db_clone)
+                            .await;
+                        tracing::warn!("HLS failed for reel {}: {}", reel_id, e);
+                    }
+                }
+            } else {
+                // Fast path: single-pass normalize + HLS (no double encode)
+                match crate::hls::normalize_and_hls(reel_id, &disk_path_clone, &upload_dir_clone).await {
+                    Ok(hls_url) => {
+                        let _ = sqlx::query(
+                            "UPDATE reels SET hls_url = $1, hls_state = 'ready' WHERE id = $2",
+                        )
+                        .bind(&hls_url)
+                        .bind(reel_id)
+                        .execute(&db_clone)
+                        .await;
+                        tracing::info!("HLS ready for reel {} in {:.1}s (single-pass): {}", reel_id, start.elapsed().as_secs_f64(), hls_url);
+                    }
+                    Err(e) => {
+                        let _ = sqlx::query("UPDATE reels SET hls_state = 'failed' WHERE id = $1")
+                            .bind(reel_id)
+                            .execute(&db_clone)
+                            .await;
+                        tracing::warn!("HLS failed for reel {}: {}", reel_id, e);
+                    }
                 }
             }
         });

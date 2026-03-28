@@ -23,8 +23,11 @@ metadata:
     nginx.ingress.kubernetes.io/limit-rps: "50"
     nginx.ingress.kubernetes.io/limit-connections: "100"
 
-    # Request body size (for photo uploads)
-    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    # Request body size — video reels can be up to 100MB raw from iOS
+    nginx.ingress.kubernetes.io/proxy-body-size: "200m"
+    nginx.ingress.kubernetes.io/client-body-buffer-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
 
     # SSL/TLS with cert-manager
     cert-manager.io/cluster-issuer: "letsencrypt-prod"

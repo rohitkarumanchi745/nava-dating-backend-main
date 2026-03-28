@@ -23,20 +23,23 @@ RUN rm -rf src
 # Copy actual source
 COPY src ./src
 COPY migrations ./migrations
+COPY .sqlx ./.sqlx
 
 # Build release binary with optimizations
 # Touch a file to force rebuild with actual source
+ENV SQLX_OFFLINE=true
 RUN touch src/main.rs && cargo build --release && \
     strip target/release/telugu-dating-backend
 
 FROM debian:bookworm-slim AS runtime
 
-# Install runtime dependencies including curl for healthchecks
+# Install runtime dependencies including curl for healthchecks and ffmpeg for HLS transcoding
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ca-certificates \
        libssl3 \
        curl \
+       ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && adduser --disabled-password --gecos "" --uid 1000 appuser
 
@@ -57,8 +60,8 @@ ENV BIND_ADDR=0.0.0.0:8080 \
     UPLOAD_DIR=/app/uploads \
     VISION_MODEL_DIR=/app/models \
     ENVIRONMENT=production \
-    DB_MAX_CONNECTIONS=300 \
-    DB_MIN_CONNECTIONS=50 \
+    DB_MAX_CONNECTIONS=25 \
+    DB_MIN_CONNECTIONS=5 \
     DB_ACQUIRE_TIMEOUT_SECS=10 \
     PGBOUNCER_MODE=true \
     RATE_LIMIT_RPM=120 \
