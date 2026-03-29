@@ -102,7 +102,13 @@ use handlers::{
     // Calls
     create_call,
     // Spots
-    create_spot, get_spots,
+    create_spot, get_spots, get_spots_feed, get_spot_messages, send_spot_message, react_to_spot,
+    // Playgrounds
+    get_playgrounds, create_playground, get_playground_detail, join_playground, leave_playground, get_playground_members,
+    // Events
+    create_event, get_events_near_me, rsvp_event,
+    // Location Search History
+    save_search_history,
     // Vision
     verify_selfie, vision_analyze,
     // Admin
