@@ -12,7 +12,7 @@ use crate::config::Config;
 
 #[derive(Debug, FromRow)]
 pub struct UserAuthRow {
-    pub id: i32,
+    pub id: i64,
     pub is_profile_complete: Option<bool>,
 }
 

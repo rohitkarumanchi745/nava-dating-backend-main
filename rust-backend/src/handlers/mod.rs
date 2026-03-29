@@ -283,7 +283,7 @@ pub async fn verify_otp(
         Some(user) => (user.id, false, user.is_profile_complete.unwrap_or(false)),
         None => {
             // Create new user
-            let result = sqlx::query_scalar::<_, i32>(
+            let result = sqlx::query_scalar::<_, i64>(
                 r#"
                 INSERT INTO users (phone_number, is_active, is_profile_complete, created_at, updated_at)
                 VALUES ($1, TRUE, FALSE, NOW(), NOW())
