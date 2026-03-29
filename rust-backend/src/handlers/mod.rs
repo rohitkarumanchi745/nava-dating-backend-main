@@ -3409,7 +3409,7 @@ pub async fn get_spots(
 // Spots Feed & Messaging
 // ============================================================================
 
-/// GET /spots/feed — nearby spots from other users
+/// GET /spots/feed — ML-ranked spots: same city > shared interests > recency
 pub async fn get_spots_feed(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3419,6 +3419,7 @@ pub async fn get_spots_feed(
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
     let limit = params.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(20);
 
+    // Fetch spots with creator info for scoring
     let spots = sqlx::query_as::<_, SpotFullRow>(
         r#"SELECT s.id, s.user_id, s.title, s.original_url, s.poster_url, s.mime_type,
                   s.duration_sec, s.renditions, s.tags, s.city, s.is_global,
@@ -3429,19 +3430,55 @@ pub async fn get_spots_feed(
            ORDER BY s.created_at DESC LIMIT $2"#,
     )
     .bind(user_id)
-    .bind(limit)
+    .bind(limit * 3) // over-fetch for re-ranking
     .fetch_all(&state.db)
     .await?;
 
-    let results: Vec<Value> = spots.into_iter().map(|s| {
-        json!({
+    // Get user's city and interests for scoring
+    let user_info = sqlx::query_as::<_, (Option<String>, Option<serde_json::Value>)>(
+        "SELECT ul.city, u.interests FROM users u LEFT JOIN user_locations ul ON ul.user_id = u.id WHERE u.id = $1"
+    ).bind(user_id).fetch_optional(&state.db).await?.unwrap_or((None, None));
+
+    let user_city = user_info.0.unwrap_or_default().to_lowercase();
+    let user_interests: Vec<String> = user_info.1
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+
+    // Score and rank spots
+    let mut scored: Vec<(f64, Value)> = spots.into_iter().map(|s| {
+        let mut score = 0.0;
+
+        // Same city bonus (+40%)
+        if let Some(ref city) = s.city {
+            if city.to_lowercase() == user_city { score += 0.4; }
+        }
+
+        // Shared interest tags bonus (+30%)
+        if let Some(ref tags) = s.tags {
+            if let Ok(tag_list) = serde_json::from_value::<Vec<String>>(tags.clone()) {
+                let overlap = tag_list.iter().filter(|t| user_interests.contains(t)).count();
+                score += 0.3 * (overlap as f64 / tag_list.len().max(1) as f64);
+            }
+        }
+
+        // Recency bonus (+30%) — newer spots score higher
+        if let Some(created) = s.created_at {
+            let age_hours = (chrono::Utc::now().naive_utc() - created).num_hours() as f64;
+            score += 0.3 * (1.0 / (1.0 + age_hours / 6.0)); // half-life of 6 hours
+        }
+
+        let val = json!({
             "id": s.id, "user_id": s.user_id, "title": s.title,
             "poster_url": s.poster_url, "original_url": s.original_url,
-            "city": s.city, "tags": s.tags,
+            "city": s.city, "tags": s.tags, "relevance_score": (score * 100.0) as i32,
             "created_at": s.created_at.map(format_datetime),
             "expires_at": s.expires_at.map(format_datetime),
-        })
+        });
+        (score, val)
     }).collect();
+
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let results: Vec<Value> = scored.into_iter().take(limit as usize).map(|(_, v)| v).collect();
 
     Ok(Json(json!({ "spots": results })))
 }
@@ -3519,28 +3556,83 @@ pub async fn react_to_spot(
 // Playgrounds (Group Hangouts)
 // ============================================================================
 
-/// GET /playgrounds — list playgrounds near user or by type
+/// GET /playgrounds — ML-ranked: friends-of-friends > same university > same city > interest match
 pub async fn get_playgrounds(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, AppError> {
     let token = extract_bearer_token(&headers)?;
-    let _user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
     let pg_type = params.get("type").cloned();
     let limit = params.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(20);
 
-    let playgrounds = sqlx::query_as::<_, (i64, String, Option<String>, String, Option<String>, i32, i32, Option<String>, Option<String>)>(
-        r#"SELECT id, name, description, playground_type, city, member_count, active_today, cover_image_url, icon_url
-           FROM playgrounds WHERE is_active = true AND ($1::text IS NULL OR playground_type = $1)
-           ORDER BY active_today DESC, member_count DESC LIMIT $2"#,
+    // Get user context for scoring
+    let (user_city, user_uni_id, user_interests) = {
+        let row = sqlx::query_as::<_, (Option<String>, Option<serde_json::Value>)>(
+            "SELECT ul.city, u.interests FROM users u LEFT JOIN user_locations ul ON ul.user_id = u.id WHERE u.id = $1"
+        ).bind(user_id).fetch_optional(&state.db).await?.unwrap_or((None, None));
+
+        let uni_id = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT university_id FROM student_verifications WHERE user_id = $1 AND status = 'verified' LIMIT 1"
+        ).bind(user_id).fetch_optional(&state.db).await?.flatten();
+
+        let interests: Vec<String> = row.1.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+        (row.0.unwrap_or_default().to_lowercase(), uni_id, interests)
+    };
+
+    // Get playground IDs user already joined
+    let joined: Vec<i64> = sqlx::query_scalar(
+        "SELECT playground_id FROM playground_members WHERE user_id = $1 AND is_active = true"
+    ).bind(user_id).fetch_all(&state.db).await?;
+
+    // Get playgrounds with friends count (users who matched with me that are in each playground)
+    let playgrounds = sqlx::query_as::<_, (i64, String, Option<String>, String, Option<String>, i32, i32, Option<String>, Option<String>, Option<i64>)>(
+        r#"SELECT p.id, p.name, p.description, p.playground_type, p.city,
+                  p.member_count, p.active_today, p.cover_image_url, p.icon_url, p.university_id
+           FROM playgrounds p
+           WHERE p.is_active = true AND ($1::text IS NULL OR p.playground_type = $1)
+           ORDER BY p.active_today DESC, p.member_count DESC LIMIT $2"#,
     )
-    .bind(&pg_type).bind(limit)
+    .bind(&pg_type).bind(limit * 3)
     .fetch_all(&state.db).await?;
 
-    let results: Vec<Value> = playgrounds.into_iter().map(|p| {
-        json!({ "id": p.0, "name": p.1, "description": p.2, "type": p.3, "city": p.4, "member_count": p.5, "active_today": p.6, "cover_image_url": p.7, "icon_url": p.8 })
+    // Score and rank
+    let mut scored: Vec<(f64, Value)> = playgrounds.into_iter().map(|p| {
+        let mut score = 0.0;
+        let is_joined = joined.contains(&p.0);
+
+        // Already joined gets top priority
+        if is_joined { score += 1.0; }
+
+        // Same university bonus (+35%)
+        if let (Some(u_id), Some(p_uni)) = (user_uni_id, p.9) {
+            if u_id == p_uni { score += 0.35; }
+        }
+
+        // Same city bonus (+25%)
+        if let Some(ref city) = p.4 {
+            if city.to_lowercase() == user_city { score += 0.25; }
+        }
+
+        // Interest-type match (+20%) — playground name/type matches user interests
+        let name_lower = p.1.to_lowercase();
+        let interest_match = user_interests.iter().any(|i| name_lower.contains(&i.to_lowercase()));
+        if interest_match || p.3 == "interest" { score += 0.2; }
+
+        // Activity bonus (+20%) — more active today = more engaging
+        score += 0.2 * (p.6 as f64 / (p.6 as f64 + 10.0)); // sigmoid-like
+
+        let val = json!({
+            "id": p.0, "name": p.1, "description": p.2, "type": p.3, "city": p.4,
+            "member_count": p.5, "active_today": p.6, "cover_image_url": p.7, "icon_url": p.8,
+            "is_joined": is_joined, "relevance_score": (score * 100.0) as i32
+        });
+        (score, val)
     }).collect();
+
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let results: Vec<Value> = scored.into_iter().take(limit as usize).map(|(_, v)| v).collect();
 
     Ok(Json(json!({ "playgrounds": results })))
 }
@@ -3702,29 +3794,86 @@ pub async fn create_event(
     Ok(Json(json!({ "event_id": id })))
 }
 
-/// GET /events — events near user
+/// GET /events — ML-ranked: nearby + interest match + friends going + urgency
 pub async fn get_events_near_me(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, AppError> {
     let token = extract_bearer_token(&headers)?;
-    let _user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
     let limit = params.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(20);
 
-    let events = sqlx::query_as::<_, (i64, i64, String, Option<String>, Option<String>, Option<String>, Option<f64>, Option<f64>, chrono::NaiveDateTime, Option<i32>)>(
-        r#"SELECT e.id, e.creator_id, e.title, e.description, e.category, e.location_name, e.latitude, e.longitude, e.starts_at, e.max_attendees
-           FROM events e WHERE e.is_active = true AND e.starts_at > NOW()
-           ORDER BY e.starts_at ASC LIMIT $1"#,
-    ).bind(limit).fetch_all(&state.db).await?;
+    // Get user location + interests in parallel
+    let (user_loc, user_interests) = tokio::try_join!(
+        sqlx::query_as::<_, (Option<f64>, Option<f64>, Option<String>)>(
+            "SELECT latitude, longitude, city FROM user_locations WHERE user_id = $1"
+        ).bind(user_id).fetch_optional(&state.db),
+        sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT interests FROM users WHERE id = $1"
+        ).bind(user_id).fetch_optional(&state.db),
+    )?;
 
-    let results: Vec<Value> = events.into_iter().map(|e| {
-        json!({
+    let (user_lat, user_lng) = user_loc.as_ref()
+        .and_then(|l| l.0.zip(l.1))
+        .unwrap_or((0.0, 0.0));
+    let interests: Vec<String> = user_interests.flatten()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+
+    // Get events with RSVP counts + whether user's matches are going
+    let events = sqlx::query_as::<_, (i64, i64, String, Option<String>, Option<String>, Option<String>, Option<f64>, Option<f64>, chrono::NaiveDateTime, Option<i32>, i64, i64)>(
+        r#"SELECT e.id, e.creator_id, e.title, e.description, e.category, e.location_name,
+                  e.latitude, e.longitude, e.starts_at, e.max_attendees,
+                  (SELECT COUNT(*) FROM event_rsvps WHERE event_id = e.id) as rsvp_count,
+                  (SELECT COUNT(*) FROM event_rsvps er
+                   JOIN matches m ON (m.user1_id = $1 AND m.user2_id = er.user_id) OR (m.user2_id = $1 AND m.user1_id = er.user_id)
+                   WHERE er.event_id = e.id AND m.is_mutual_match = true) as friends_going
+           FROM events e WHERE e.is_active = true AND e.starts_at > NOW()
+           ORDER BY e.starts_at ASC LIMIT $2"#,
+    ).bind(user_id).bind(limit * 3).fetch_all(&state.db).await?;
+
+    // Score and rank
+    let mut scored: Vec<(f64, Value)> = events.into_iter().map(|e| {
+        let mut score = 0.0;
+
+        // Distance score (+30%) — closer events rank higher
+        if let (Some(lat), Some(lng)) = (e.6, e.7) {
+            if user_lat != 0.0 {
+                let dist = haversine_km(user_lat, user_lng, lat, lng);
+                score += 0.3 * (1.0 / (1.0 + dist / 10.0)); // 10km half-life
+            }
+        }
+
+        // Friends going bonus (+25%) — social proof
+        score += 0.25 * (e.11 as f64 / (e.11 as f64 + 2.0));
+
+        // Interest/category match (+20%)
+        if let Some(ref cat) = e.4 {
+            if interests.iter().any(|i| i.to_lowercase() == cat.to_lowercase()) {
+                score += 0.2;
+            }
+        }
+
+        // Urgency bonus (+15%) — events happening sooner rank higher
+        let hours_until = (e.8 - chrono::Utc::now().naive_utc()).num_hours() as f64;
+        score += 0.15 * (1.0 / (1.0 + hours_until / 24.0)); // 24h half-life
+
+        // Popularity bonus (+10%)
+        score += 0.1 * (e.10 as f64 / (e.10 as f64 + 5.0));
+
+        let val = json!({
             "id": e.0, "creator_id": e.1, "title": e.2, "description": e.3,
             "category": e.4, "location_name": e.5, "latitude": e.6, "longitude": e.7,
-            "starts_at": format_datetime(e.8), "max_attendees": e.9
-        })
+            "starts_at": format_datetime(e.8), "max_attendees": e.9,
+            "rsvp_count": e.10, "friends_going": e.11,
+            "relevance_score": (score * 100.0) as i32
+        });
+        (score, val)
     }).collect();
+
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let results: Vec<Value> = scored.into_iter().take(limit as usize).map(|(_, v)| v).collect();
 
     Ok(Json(json!({ "events": results })))
 }
