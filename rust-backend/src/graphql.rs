@@ -556,7 +556,6 @@ impl QueryRoot {
         let user_id = get_user_id_from_context(ctx)?;
         let loader = ctx.data::<DataLoader<UserLoader>>()?;
 
-        let user_id_i32 = user_id as i32;
         let rows = sqlx::query_as::<_, MatchRow>(
             r#"
             SELECT m.id, m.user1_id, m.user2_id, m.is_mutual_match, m.status,
@@ -574,14 +573,13 @@ impl QueryRoot {
             ORDER BY m.created_at DESC
             "#,
         )
-        .bind(user_id_i32)
+        .bind(user_id)
         .fetch_all(&state.db)
         .await?;
 
         let mut matches = Vec::new();
         for row in rows {
-            let partner_id_i32 = if row.user1_id == user_id_i32 { row.user2_id } else { row.user1_id };
-            let partner_id = i64::from(partner_id_i32);
+            let partner_id = if row.user1_id == user_id { row.user2_id } else { row.user1_id };
             let partner = loader.load_one(partner_id).await?;
 
             matches.push(Match {
@@ -604,7 +602,7 @@ impl QueryRoot {
     #[graphql(name = "sentLikes")]
     async fn sent_likes(&self, ctx: &Context<'_>) -> Result<Vec<LikedProfile>> {
         let state = ctx.data::<AppState>()?;
-        let user_id = get_user_id_from_context(ctx)? as i32;
+        let user_id = get_user_id_from_context(ctx)?;
 
         let rows = sqlx::query_as::<_, LikedProfileRow>(r#"
             SELECT u.id, u.name, u.dob, u.profile_photo_1, u.profile_photo_url,
@@ -634,7 +632,7 @@ impl QueryRoot {
     #[graphql(name = "receivedLikes")]
     async fn received_likes(&self, ctx: &Context<'_>) -> Result<Vec<LikedProfile>> {
         let state = ctx.data::<AppState>()?;
-        let user_id = get_user_id_from_context(ctx)? as i32;
+        let user_id = get_user_id_from_context(ctx)?;
 
         let rows = sqlx::query_as::<_, LikedProfileRow>(r#"
             SELECT u.id, u.name, u.dob, u.profile_photo_1, u.profile_photo_url,
@@ -673,14 +671,12 @@ impl QueryRoot {
     ) -> Result<Vec<Message>> {
         let state = ctx.data::<AppState>()?;
         let user_id = get_user_id_from_context(ctx)?;
-        let user_id_i32 = user_id as i32;
-
         // Verify user is part of this match (match_id is VARCHAR, not UUID)
         let match_count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM matches WHERE id = $1 AND (user1_id = $2 OR user2_id = $2)",
         )
         .bind(&match_id)
-        .bind(user_id_i32)
+        .bind(user_id)
         .fetch_one(&state.db)
         .await?;
 
@@ -1551,19 +1547,17 @@ impl MutationRoot {
     ) -> Result<Message> {
         let state = ctx.data::<AppState>()?;
         let user_id = get_user_id_from_context(ctx)?;
-        let user_id_i32 = user_id as i32;
-
         // Verify user is part of this match and get receiver (match_id is VARCHAR)
         let match_row = sqlx::query_as::<_, MatchRow>(
             "SELECT id, user1_id, user2_id, is_mutual_match, status, created_at as matched_at FROM matches WHERE id = $1 AND (user1_id = $2 OR user2_id = $2)",
         )
         .bind(&match_id)
-        .bind(user_id_i32)
+        .bind(user_id)
         .fetch_optional(&state.db)
         .await?
         .ok_or_else(|| Error::new("Match not found"))?;
 
-        let receiver_id_i32 = if match_row.user1_id == user_id_i32 {
+        let receiver_id = if match_row.user1_id == user_id {
             match_row.user2_id
         } else {
             match_row.user1_id
@@ -1578,17 +1572,17 @@ impl MutationRoot {
             "#,
         )
         .bind(&match_id)
-        .bind(user_id_i32)
-        .bind(receiver_id_i32)
+        .bind(user_id)
+        .bind(receiver_id)
         .bind(&content)
         .fetch_one(&state.db)
         .await?;
 
         Ok(Message {
-            id: i64::from(msg.id),
+            id: msg.id,
             match_id: msg.match_id,
-            sender_id: i64::from(msg.sender_id),
-            receiver_id: i64::from(msg.receiver_id),
+            sender_id: msg.sender_id,
+            receiver_id: msg.receiver_id,
             content: msg.content,
             created_at: msg.created_at.map(|dt| dt.to_string()),
             is_read: msg.is_read.unwrap_or(false),
@@ -1654,7 +1648,7 @@ impl MutationRoot {
     #[graphql(name = "likeUser")]
     async fn like_user_v2(&self, ctx: &Context<'_>, target_user_id: i32) -> Result<LikeResult> {
         let state = ctx.data::<AppState>()?;
-        let user_id = get_user_id_from_context(ctx)? as i32;
+        let user_id = get_user_id_from_context(ctx)?;
 
         if user_id == target_user_id {
             return Err(Error::new("Cannot like yourself"));
@@ -1752,7 +1746,7 @@ impl MutationRoot {
     #[graphql(name = "passUser")]
     async fn pass_user_v2(&self, ctx: &Context<'_>, target_user_id: i32) -> Result<bool> {
         let state = ctx.data::<AppState>()?;
-        let user_id = get_user_id_from_context(ctx)? as i32;
+        let user_id = get_user_id_from_context(ctx)?;
 
         // Determine user order
         let (user1_id, user2_id, is_user1) = if user_id < target_user_id {
@@ -1825,7 +1819,7 @@ impl MutationRoot {
         #[graphql(name = "play_duration_seconds")] play_duration: Option<i32>,
     ) -> Result<bool> {
         let state = ctx.data::<AppState>()?;
-        let user_id = get_user_id_from_context(ctx)? as i32;
+        let user_id = get_user_id_from_context(ctx)?;
 
         // Log the voice play event for ML training
         let _ = sqlx::query(
