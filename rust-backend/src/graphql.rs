@@ -1646,7 +1646,7 @@ impl MutationRoot {
 
     /// Like a user with detailed result
     #[graphql(name = "likeUser")]
-    async fn like_user_v2(&self, ctx: &Context<'_>, target_user_id: i32) -> Result<LikeResult> {
+    async fn like_user_v2(&self, ctx: &Context<'_>, target_user_id: i64) -> Result<LikeResult> {
         let state = ctx.data::<AppState>()?;
         let user_id = get_user_id_from_context(ctx)?;
 
@@ -1744,7 +1744,7 @@ impl MutationRoot {
 
     /// Pass on a user
     #[graphql(name = "passUser")]
-    async fn pass_user_v2(&self, ctx: &Context<'_>, target_user_id: i32) -> Result<bool> {
+    async fn pass_user_v2(&self, ctx: &Context<'_>, target_user_id: i64) -> Result<bool> {
         let state = ctx.data::<AppState>()?;
         let user_id = get_user_id_from_context(ctx)?;
 
@@ -1815,7 +1815,7 @@ impl MutationRoot {
     async fn track_voice_play(
         &self,
         ctx: &Context<'_>,
-        target_user_id: i32,
+        target_user_id: i64,
         #[graphql(name = "play_duration_seconds")] play_duration: Option<i32>,
     ) -> Result<bool> {
         let state = ctx.data::<AppState>()?;
