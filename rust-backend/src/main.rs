@@ -109,8 +109,11 @@ use handlers::{
     create_event, get_events_near_me, rsvp_event,
     // Location Search History
     save_search_history,
-    // Music Taste
+    // Music Taste & Listening
     sync_music_taste, get_music_taste, get_music_compatibility,
+    track_now_playing, get_music_engagement, get_deep_music_compatibility,
+    // Connected Accounts
+    connect_account, get_connected_accounts,
     // Contacts
     sync_contacts,
     // Privacy
@@ -857,6 +860,13 @@ async fn main() {
         .route("/music/sync", post(sync_music_taste))
         .route("/music/taste", get(get_music_taste))
         .route("/music/compatibility/{target_id}", get(get_music_compatibility))
+        // Now Playing / Listening Engagement
+        .route("/music/now-playing", post(track_now_playing))
+        .route("/music/engagement", get(get_music_engagement))
+        .route("/music/deep-compatibility/{target_id}", get(get_deep_music_compatibility))
+        // Connected Accounts
+        .route("/accounts/connect", post(connect_account))
+        .route("/accounts/connected", get(get_connected_accounts))
         // Contacts
         .route("/contacts/sync", post(sync_contacts))
         // Privacy

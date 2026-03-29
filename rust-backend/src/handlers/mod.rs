@@ -4005,6 +4005,216 @@ pub async fn get_music_compatibility(
 }
 
 // ============================================================================
+// ============================================================================
+// Now Playing / Listening History — captures music from ANY app
+// ============================================================================
+
+/// POST /music/now-playing — iOS sends currently playing track (from any app)
+pub async fn track_now_playing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let track_name = payload["track"].as_str().unwrap_or("").to_string();
+    let artist = payload["artist"].as_str().unwrap_or("").to_string();
+    if track_name.is_empty() || artist.is_empty() { return Ok(Json(json!({ "ok": false }))); }
+
+    let album = payload["album"].as_str().map(|s| s.to_string());
+    let genre = payload["genre"].as_str().map(|s| s.to_string());
+    let source = payload["source"].as_str().unwrap_or("now_playing");
+    let duration = payload["duration_sec"].as_i64().map(|v| v as i32);
+    let session_dur = payload["session_duration_sec"].as_i64().map(|v| v as i32);
+    let completed = payload["completed"].as_bool().unwrap_or(false);
+
+    // Save to listening history
+    sqlx::query(
+        r#"INSERT INTO user_listening_history (user_id, source, track_name, artist_name, album_name, genre, duration_sec, session_duration_sec, completed)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+    )
+    .bind(user_id).bind(source).bind(&track_name).bind(&artist)
+    .bind(&album).bind(&genre).bind(duration).bind(session_dur).bind(completed)
+    .execute(&state.db).await?;
+
+    // Update engagement profile (weighted by completion + listen time)
+    let listen_sec = session_dur.unwrap_or(duration.unwrap_or(0));
+    let engagement = if completed { 1.0 } else { (listen_sec as f64 / duration.unwrap_or(200) as f64).min(1.0) };
+
+    sqlx::query(
+        r#"INSERT INTO user_music_engagement (user_id, artist_name, genre, listen_count, total_listen_sec, completion_rate, engagement_score, last_listened_at)
+           VALUES ($1, $2, $3, 1, $4, $5, $5, NOW())
+           ON CONFLICT (user_id, artist_name) DO UPDATE SET
+               listen_count = user_music_engagement.listen_count + 1,
+               total_listen_sec = user_music_engagement.total_listen_sec + $4,
+               skip_count = CASE WHEN $6 THEN user_music_engagement.skip_count ELSE user_music_engagement.skip_count + 1 END,
+               completion_rate = (user_music_engagement.completion_rate * user_music_engagement.listen_count + $5) / (user_music_engagement.listen_count + 1),
+               engagement_score = (user_music_engagement.engagement_score * 0.9) + ($5 * 0.1),
+               genre = COALESCE($3, user_music_engagement.genre),
+               last_listened_at = NOW()"#,
+    )
+    .bind(user_id).bind(&artist).bind(&genre).bind(listen_sec)
+    .bind(engagement).bind(completed)
+    .execute(&state.db).await?;
+
+    // Also update genre profile
+    if let Some(ref g) = genre {
+        sqlx::query(
+            r#"INSERT INTO user_genre_profile (user_id, genre, weight, track_count, updated_at)
+               VALUES ($1, $2, $3, 1, NOW())
+               ON CONFLICT (user_id, genre) DO UPDATE SET
+                   weight = user_genre_profile.weight + $3, track_count = user_genre_profile.track_count + 1, updated_at = NOW()"#,
+        ).bind(user_id).bind(g).bind(engagement).execute(&state.db).await?;
+    }
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// GET /music/engagement — user's actual listening behavior (not just library)
+pub async fn get_music_engagement(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Top artists by engagement (listen time + completion rate)
+    let artists = sqlx::query_as::<_, (String, Option<String>, i32, i32, f64, f64)>(
+        r#"SELECT artist_name, genre, listen_count, total_listen_sec, completion_rate, engagement_score
+           FROM user_music_engagement WHERE user_id = $1
+           ORDER BY engagement_score DESC LIMIT 20"#,
+    ).bind(user_id).fetch_all(&state.db).await?;
+
+    let results: Vec<Value> = artists.into_iter().map(|a| json!({
+        "artist": a.0, "genre": a.1, "listens": a.2,
+        "total_minutes": a.3 / 60, "completion_rate": (a.4 * 100.0) as i32,
+        "engagement_score": (a.5 * 100.0) as i32
+    })).collect();
+
+    // Recent listening (last 24h)
+    let recent = sqlx::query_as::<_, (String, String, Option<String>, String)>(
+        r#"SELECT track_name, artist_name, genre, source FROM user_listening_history
+           WHERE user_id = $1 AND listened_at > NOW() - INTERVAL '24 hours'
+           ORDER BY listened_at DESC LIMIT 10"#,
+    ).bind(user_id).fetch_all(&state.db).await?;
+
+    let recent_list: Vec<Value> = recent.into_iter().map(|r| json!({
+        "track": r.0, "artist": r.1, "genre": r.2, "source": r.3
+    })).collect();
+
+    Ok(Json(json!({ "top_artists": results, "recently_played": recent_list })))
+}
+
+/// GET /music/compatibility-deep/:target_id — engagement-weighted music compatibility
+pub async fn get_deep_music_compatibility(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(target_id): AxumPath<i64>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Shared artists weighted by engagement (not just library overlap)
+    let shared = sqlx::query_as::<_, (String, Option<String>, f64, f64)>(
+        r#"SELECT a.artist_name, a.genre,
+                  a.engagement_score as my_score, b.engagement_score as their_score
+           FROM user_music_engagement a
+           JOIN user_music_engagement b ON a.artist_name = b.artist_name
+           WHERE a.user_id = $1 AND b.user_id = $2
+           ORDER BY (a.engagement_score + b.engagement_score) DESC LIMIT 15"#,
+    ).bind(user_id).bind(target_id).fetch_all(&state.db).await?;
+
+    // Genre overlap weighted by listening time
+    let genre_overlap = sqlx::query_as::<_, (String, f64, f64)>(
+        r#"SELECT a.genre, a.weight as my_weight, b.weight as their_weight
+           FROM user_genre_profile a
+           JOIN user_genre_profile b ON a.genre = b.genre
+           WHERE a.user_id = $1 AND b.user_id = $2
+           ORDER BY (a.weight + b.weight) DESC LIMIT 10"#,
+    ).bind(user_id).bind(target_id).fetch_all(&state.db).await?;
+
+    // Calculate weighted score
+    let artist_score: f64 = shared.iter()
+        .map(|s| (s.2.min(1.0) + s.3.min(1.0)) / 2.0)
+        .sum::<f64>() / shared.len().max(1) as f64;
+
+    let genre_score: f64 = genre_overlap.iter()
+        .map(|g| (g.1.min(100.0) + g.2.min(100.0)) / 200.0)
+        .sum::<f64>() / genre_overlap.len().max(1) as f64;
+
+    // 60% artist engagement + 40% genre overlap
+    let compatibility = ((0.6 * artist_score + 0.4 * genre_score) * 100.0) as i32;
+
+    let shared_list: Vec<Value> = shared.into_iter().map(|s| json!({
+        "artist": s.0, "genre": s.1,
+        "my_engagement": (s.2 * 100.0) as i32,
+        "their_engagement": (s.3 * 100.0) as i32
+    })).collect();
+
+    let genre_list: Vec<Value> = genre_overlap.into_iter().map(|g| json!({
+        "genre": g.0, "my_weight": g.1 as i32, "their_weight": g.2 as i32
+    })).collect();
+
+    Ok(Json(json!({
+        "deep_compatibility": compatibility,
+        "shared_artists": shared_list,
+        "shared_genres": genre_list,
+        "data_source": "engagement_weighted"
+    })))
+}
+
+/// POST /accounts/connect — link Spotify/Instagram/YouTube account
+pub async fn connect_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let platform = payload["platform"].as_str().unwrap_or("").to_string();
+    if platform.is_empty() { return Err(AppError::bad_request("Missing 'platform'")); }
+    let platform_user_id = payload["platform_user_id"].as_str().map(|s| s.to_string());
+    let access_token = payload["access_token"].as_str().map(|s| s.to_string());
+    let refresh_token = payload["refresh_token"].as_str().map(|s| s.to_string());
+
+    sqlx::query(
+        r#"INSERT INTO user_connected_accounts (user_id, platform, platform_user_id, access_token, refresh_token)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (user_id, platform) DO UPDATE SET
+               platform_user_id = COALESCE(EXCLUDED.platform_user_id, user_connected_accounts.platform_user_id),
+               access_token = COALESCE(EXCLUDED.access_token, user_connected_accounts.access_token),
+               refresh_token = COALESCE(EXCLUDED.refresh_token, user_connected_accounts.refresh_token),
+               is_active = true, connected_at = NOW()"#,
+    )
+    .bind(user_id).bind(&platform).bind(&platform_user_id)
+    .bind(&access_token).bind(&refresh_token)
+    .execute(&state.db).await?;
+
+    Ok(Json(json!({ "connected": true, "platform": platform })))
+}
+
+/// GET /accounts/connected — list user's connected accounts
+pub async fn get_connected_accounts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let accounts = sqlx::query_as::<_, (String, Option<String>, bool)>(
+        "SELECT platform, platform_user_id, is_active FROM user_connected_accounts WHERE user_id = $1"
+    ).bind(user_id).fetch_all(&state.db).await?;
+
+    let results: Vec<Value> = accounts.into_iter().map(|a| json!({
+        "platform": a.0, "platform_user_id": a.1, "is_active": a.2
+    })).collect();
+
+    Ok(Json(json!({ "accounts": results })))
+}
+
+// ============================================================================
 // Contact Matching
 // ============================================================================
 
