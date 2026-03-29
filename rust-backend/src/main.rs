@@ -109,6 +109,12 @@ use handlers::{
     create_event, get_events_near_me, rsvp_event,
     // Location Search History
     save_search_history,
+    // Music Taste
+    sync_music_taste, get_music_taste, get_music_compatibility,
+    // Contacts
+    sync_contacts,
+    // Privacy
+    update_privacy_settings, get_privacy_settings,
     // Vision
     verify_selfie, vision_analyze,
     // Admin
@@ -847,6 +853,15 @@ async fn main() {
         .route("/events", post(create_event))
         .route("/events", get(get_events_near_me))
         .route("/events/:id/rsvp", post(rsvp_event))
+        // Music Taste
+        .route("/music/sync", post(sync_music_taste))
+        .route("/music/taste", get(get_music_taste))
+        .route("/music/compatibility/:target_id", get(get_music_compatibility))
+        // Contacts
+        .route("/contacts/sync", post(sync_contacts))
+        // Privacy
+        .route("/privacy/settings", post(update_privacy_settings))
+        .route("/privacy/settings", get(get_privacy_settings))
         // Vision/Verification
         .route("/verify/selfie", post(verify_selfie))
         .route("/vision/analyze", post(vision_analyze))

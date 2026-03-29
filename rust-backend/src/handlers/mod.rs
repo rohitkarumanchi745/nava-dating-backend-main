@@ -3896,6 +3896,212 @@ pub async fn rsvp_event(
 }
 
 // ============================================================================
+// Music Taste Sync & Matching
+// ============================================================================
+
+/// POST /music/sync — sync user's music library (Apple Music / Spotify)
+pub async fn sync_music_taste(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let source = payload["source"].as_str().unwrap_or("apple_music");
+    let tracks = payload["tracks"].as_array()
+        .ok_or_else(|| AppError::bad_request("Missing 'tracks' array"))?;
+
+    let mut synced = 0i64;
+    for track in tracks {
+        let track_id = track["id"].as_str().unwrap_or("").to_string();
+        let track_name = track["name"].as_str().map(|s| s.to_string());
+        let artist = track["artist"].as_str().map(|s| s.to_string());
+        let album = track["album"].as_str().map(|s| s.to_string());
+        let genre = track["genre"].as_str().map(|s| s.to_string());
+        let play_count = track["play_count"].as_i64().unwrap_or(1) as i32;
+
+        if track_id.is_empty() { continue; }
+
+        let _ = sqlx::query(
+            r#"INSERT INTO user_music_taste (user_id, source, track_id, track_name, artist_name, album_name, genre, play_count, synced_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+               ON CONFLICT (user_id, source, track_id) DO UPDATE SET
+                   play_count = EXCLUDED.play_count, track_name = COALESCE(EXCLUDED.track_name, user_music_taste.track_name),
+                   artist_name = COALESCE(EXCLUDED.artist_name, user_music_taste.artist_name), synced_at = NOW()"#,
+        )
+        .bind(user_id).bind(source).bind(&track_id).bind(&track_name)
+        .bind(&artist).bind(&album).bind(&genre).bind(play_count)
+        .execute(&state.db).await?;
+
+        // Update genre profile
+        if let Some(ref g) = genre {
+            let _ = sqlx::query(
+                r#"INSERT INTO user_genre_profile (user_id, genre, weight, track_count, updated_at)
+                   VALUES ($1, $2, $3, 1, NOW())
+                   ON CONFLICT (user_id, genre) DO UPDATE SET
+                       weight = user_genre_profile.weight + $3, track_count = user_genre_profile.track_count + 1, updated_at = NOW()"#,
+            ).bind(user_id).bind(g).bind(play_count as f64).execute(&state.db).await?;
+        }
+        synced += 1;
+    }
+
+    Ok(Json(json!({ "synced": synced })))
+}
+
+/// GET /music/taste — get user's top genres and artists
+pub async fn get_music_taste(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let genres = sqlx::query_as::<_, (String, f64, i32)>(
+        "SELECT genre, weight, track_count FROM user_genre_profile WHERE user_id = $1 ORDER BY weight DESC LIMIT 10"
+    ).bind(user_id).fetch_all(&state.db).await?;
+
+    let top_artists = sqlx::query_as::<_, (String, i64)>(
+        "SELECT artist_name, SUM(play_count) as total FROM user_music_taste WHERE user_id = $1 AND artist_name IS NOT NULL GROUP BY artist_name ORDER BY total DESC LIMIT 10"
+    ).bind(user_id).fetch_all(&state.db).await?;
+
+    let genre_list: Vec<Value> = genres.into_iter().map(|g| json!({ "genre": g.0, "weight": g.1, "tracks": g.2 })).collect();
+    let artist_list: Vec<Value> = top_artists.into_iter().map(|a| json!({ "artist": a.0, "plays": a.1 })).collect();
+
+    Ok(Json(json!({ "genres": genre_list, "top_artists": artist_list })))
+}
+
+/// GET /music/compatibility/:target_id — music taste overlap with another user
+pub async fn get_music_compatibility(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(target_id): AxumPath<i64>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Genre overlap (Jaccard-like)
+    let overlap = sqlx::query_as::<_, (i64, i64, i64)>(
+        r#"WITH my_genres AS (SELECT genre FROM user_genre_profile WHERE user_id = $1),
+              their_genres AS (SELECT genre FROM user_genre_profile WHERE user_id = $2),
+              shared AS (SELECT genre FROM my_genres INTERSECT SELECT genre FROM their_genres)
+           SELECT (SELECT COUNT(*) FROM shared), (SELECT COUNT(*) FROM my_genres), (SELECT COUNT(*) FROM their_genres)"#,
+    ).bind(user_id).bind(target_id).fetch_one(&state.db).await?;
+
+    let shared = overlap.0 as f64;
+    let total = (overlap.1 + overlap.2) as f64 - shared;
+    let score = if total > 0.0 { (shared / total * 100.0) as i32 } else { 0 };
+
+    // Shared artists
+    let shared_artists = sqlx::query_as::<_, (String,)>(
+        r#"SELECT DISTINCT a.artist_name FROM user_music_taste a
+           JOIN user_music_taste b ON a.artist_name = b.artist_name
+           WHERE a.user_id = $1 AND b.user_id = $2 AND a.artist_name IS NOT NULL LIMIT 10"#,
+    ).bind(user_id).bind(target_id).fetch_all(&state.db).await?;
+
+    let artists: Vec<String> = shared_artists.into_iter().map(|a| a.0).collect();
+
+    Ok(Json(json!({ "music_compatibility": score, "shared_artists": artists })))
+}
+
+// ============================================================================
+// Contact Matching
+// ============================================================================
+
+/// POST /contacts/sync — sync hashed phone numbers to find friends on app
+pub async fn sync_contacts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let hashes = payload["hashes"].as_array()
+        .ok_or_else(|| AppError::bad_request("Missing 'hashes' array"))?;
+
+    // Store contact hashes
+    for h in hashes {
+        let phone_hash = h["hash"].as_str().unwrap_or("").to_string();
+        let name = h["name"].as_str().map(|s| s.to_string());
+        if phone_hash.is_empty() { continue; }
+
+        let _ = sqlx::query(
+            "INSERT INTO user_contact_hashes (user_id, phone_hash, contact_name) VALUES ($1, $2, $3) ON CONFLICT (user_id, phone_hash) DO NOTHING"
+        ).bind(user_id).bind(&phone_hash).bind(&name).execute(&state.db).await;
+    }
+
+    // Find matches: contacts whose phone_hash matches a user's phone number hash
+    // Only return users who have discoverable_by_contacts = true
+    let hash_list: Vec<String> = hashes.iter()
+        .filter_map(|h| h["hash"].as_str().map(|s| s.to_string()))
+        .collect();
+
+    let matches = sqlx::query_as::<_, (i64, Option<String>, Option<String>)>(
+        r#"SELECT u.id, u.name, u.profile_photo_1
+           FROM users u
+           WHERE u.id != $1
+             AND u.is_active = true
+             AND u.discoverable_by_contacts = true
+             AND encode(sha256(u.phone_number::bytea), 'hex') = ANY($2)"#,
+    )
+    .bind(user_id)
+    .bind(&hash_list)
+    .fetch_all(&state.db)
+    .await?;
+
+    let results: Vec<Value> = matches.into_iter().map(|m| {
+        json!({ "user_id": m.0, "name": m.1, "photo": m.2 })
+    }).collect();
+
+    Ok(Json(json!({ "contacts_on_app": results, "count": results.len() })))
+}
+
+// ============================================================================
+// Privacy Controls
+// ============================================================================
+
+/// POST /privacy/settings — update privacy preferences
+pub async fn update_privacy_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    if let Some(discoverable) = payload["discoverable_by_contacts"].as_bool() {
+        sqlx::query("UPDATE users SET discoverable_by_contacts = $1 WHERE id = $2")
+            .bind(discoverable).bind(user_id).execute(&state.db).await?;
+    }
+
+    if let Some(share_music) = payload["share_music_taste"].as_bool() {
+        sqlx::query("UPDATE users SET share_music_taste = $1 WHERE id = $2")
+            .bind(share_music).bind(user_id).execute(&state.db).await?;
+    }
+
+    Ok(Json(json!({ "updated": true })))
+}
+
+/// GET /privacy/settings
+pub async fn get_privacy_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let row = sqlx::query_as::<_, (Option<bool>, Option<bool>)>(
+        "SELECT discoverable_by_contacts, share_music_taste FROM users WHERE id = $1"
+    ).bind(user_id).fetch_one(&state.db).await?;
+
+    Ok(Json(json!({
+        "discoverable_by_contacts": row.0.unwrap_or(true),
+        "share_music_taste": row.1.unwrap_or(true)
+    })))
+}
+
+// ============================================================================
 // Vision Analysis
 // ============================================================================
 
