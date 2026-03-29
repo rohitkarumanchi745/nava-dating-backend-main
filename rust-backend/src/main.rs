@@ -22,7 +22,7 @@ mod websocket;
 use async_graphql::http::GraphiQLSource;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::{
-    extract::Request,
+    extract::{DefaultBodyLimit, Request},
     http::HeaderMap,
     middleware as axum_middleware,
     response::{Html, IntoResponse, Response},
@@ -919,6 +919,8 @@ async fn main() {
                     );
                 })
         )
+        // Allow large uploads (videos up to 200MB)
+        .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
         // Request timeout
         .layer(TimeoutLayer::new(Duration::from_secs(request_timeout))) // TODO: migrate to with_status_code when tower-http is upgraded
         // Compression for responses
