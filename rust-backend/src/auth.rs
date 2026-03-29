@@ -119,7 +119,7 @@ impl FromRequestParts<AppState> for AdminClaims {
 }
 
 /// Create a standard access token for user authentication
-pub fn create_access_token(user_id: i32, secret: &str, expires_minutes: i64) -> Result<String, AppError> {
+pub fn create_access_token(user_id: i64, secret: &str, expires_minutes: i64) -> Result<String, AppError> {
     let exp = Utc::now()
         .checked_add_signed(Duration::minutes(expires_minutes))
         .ok_or_else(|| AppError::internal("Invalid token expiry"))?

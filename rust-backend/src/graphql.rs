@@ -127,7 +127,7 @@ pub struct Message {
 #[derive(SimpleObject, Clone, Debug)]
 pub struct AuthPayload {
     pub access_token: String,
-    pub user_id: i32,
+    pub user_id: i64,
     pub is_new_user: bool,
     pub is_profile_complete: bool,
 }
@@ -1055,7 +1055,7 @@ impl MutationRoot {
         }
 
         // Check if user exists
-        let existing = sqlx::query_scalar::<_, i32>(
+        let existing = sqlx::query_scalar::<_, i64>(
             "SELECT id FROM users WHERE phone_number = $1",
         )
         .bind(&phone_number)
@@ -1075,7 +1075,7 @@ impl MutationRoot {
                 (id, false, complete)
             }
             None => {
-                let id = sqlx::query_scalar::<_, i32>(
+                let id = sqlx::query_scalar::<_, i64>(
                     r#"
                     INSERT INTO users (phone_number, is_active, is_profile_complete, created_at, updated_at)
                     VALUES ($1, TRUE, FALSE, NOW(), NOW())
