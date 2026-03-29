@@ -341,11 +341,18 @@ async fn main() {
         pool_options = pool_options.test_before_acquire(true);
     }
 
+    // Log which DB host we're connecting to (mask password)
+    let masked_url = config.database_url
+        .find('@')
+        .map(|i| format!("postgresql://***@{}", &config.database_url[i+1..]))
+        .unwrap_or_else(|| "invalid url".into());
+    info!("Connecting to database: {}", masked_url);
+
     let db = pool_options
         .connect(&config.database_url)
         .await
         .unwrap_or_else(|err| {
-            error!("Failed to connect to database: {err}");
+            error!("Failed to connect to database: {err:#}");
             std::process::exit(1);
         });
 
