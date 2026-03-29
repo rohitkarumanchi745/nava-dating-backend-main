@@ -5660,6 +5660,27 @@ pub async fn create_reel(
     .fetch_one(&state.db)
     .await?;
 
+    // Graph: user created reel
+    {
+        let db = state.db.clone();
+        let uid = user_id.to_string();
+        let rid = reel_id.to_string();
+        tokio::spawn(async move {
+            let _ = sqlx::query(
+                "INSERT INTO graph_nodes (node_type, node_id, properties) VALUES ('user', $1, '{}') ON CONFLICT DO NOTHING"
+            ).bind(&uid).execute(&db).await;
+            let _ = sqlx::query(
+                "INSERT INTO graph_nodes (node_type, node_id, properties) VALUES ('reel', $1, '{}') ON CONFLICT DO NOTHING"
+            ).bind(&rid).execute(&db).await;
+            let _ = sqlx::query(
+                "INSERT INTO graph_edge_links_fwd (from_type, from_id, edge_type, to_type, to_id) VALUES ('user', $1, 'created', 'reel', $2) ON CONFLICT DO NOTHING"
+            ).bind(&uid).bind(&rid).execute(&db).await;
+            let _ = sqlx::query(
+                "INSERT INTO graph_edge_links_rev (to_type, to_id, edge_type, from_type, from_id) VALUES ('reel', $2, 'created', 'user', $1) ON CONFLICT DO NOTHING"
+            ).bind(&uid).bind(&rid).execute(&db).await;
+        });
+    }
+
     // Spawn HLS transcoding in the background — doesn't block the upload response
     // Uses single-pass pipeline: probe → skip normalize if short H.264 → direct HLS output
     {
@@ -6195,6 +6216,21 @@ pub async fn track_reel_view(
 
     if payload.watch_percent > 50.0 {
         update_content_prefs(&state.db, user_id, payload.reel_id, interest_score).await?;
+    }
+
+    // Graph: user viewed reel
+    {
+        let db = state.db.clone();
+        let uid = user_id.to_string();
+        let rid = payload.reel_id.to_string();
+        tokio::spawn(async move {
+            let _ = sqlx::query(
+                "INSERT INTO graph_edge_links_fwd (from_type, from_id, edge_type, to_type, to_id) VALUES ('user', $1, 'viewed', 'reel', $2) ON CONFLICT DO NOTHING"
+            ).bind(&uid).bind(&rid).execute(&db).await;
+            let _ = sqlx::query(
+                "INSERT INTO graph_edge_links_rev (to_type, to_id, edge_type, from_type, from_id) VALUES ('reel', $2, 'viewed', 'user', $1) ON CONFLICT DO NOTHING"
+            ).bind(&uid).bind(&rid).execute(&db).await;
+        });
     }
 
     Ok(Json(json!({

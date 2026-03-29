@@ -1571,6 +1571,21 @@ impl MutationRoot {
         .fetch_one(&state.db)
         .await?;
 
+        // Graph: user messaged receiver
+        {
+            let db = state.db.clone();
+            let sid = user_id.to_string();
+            let rid = receiver_id.to_string();
+            tokio::spawn(async move {
+                let _ = sqlx::query(
+                    "INSERT INTO graph_edge_links_fwd (from_type, from_id, edge_type, to_type, to_id) VALUES ('user', $1, 'messaged', 'user', $2) ON CONFLICT DO NOTHING"
+                ).bind(&sid).bind(&rid).execute(&db).await;
+                let _ = sqlx::query(
+                    "INSERT INTO graph_edge_links_rev (to_type, to_id, edge_type, from_type, from_id) VALUES ('user', $2, 'messaged', 'user', $1) ON CONFLICT DO NOTHING"
+                ).bind(&sid).bind(&rid).execute(&db).await;
+            });
+        }
+
         Ok(Message {
             id: msg.id,
             match_id: msg.match_id,
@@ -1727,6 +1742,39 @@ impl MutationRoot {
         .execute(&state.db)
         .await;
 
+        // Populate graph (Netflix-style: every interaction becomes an edge)
+        {
+            let db = state.db.clone();
+            let uid = user_id.to_string();
+            let tid = target_user_id.to_string();
+            let mutual = is_mutual;
+            tokio::spawn(async move {
+                // Forward + reverse edge: user liked target
+                let _ = sqlx::query(
+                    "INSERT INTO graph_edge_links_fwd (from_type, from_id, edge_type, to_type, to_id) VALUES ('user', $1, 'liked', 'user', $2) ON CONFLICT DO NOTHING"
+                ).bind(&uid).bind(&tid).execute(&db).await;
+                let _ = sqlx::query(
+                    "INSERT INTO graph_edge_links_rev (to_type, to_id, edge_type, from_type, from_id) VALUES ('user', $2, 'liked', 'user', $1) ON CONFLICT DO NOTHING"
+                ).bind(&uid).bind(&tid).execute(&db).await;
+                // Upsert user nodes
+                let _ = sqlx::query(
+                    "INSERT INTO graph_nodes (node_type, node_id, properties) VALUES ('user', $1, '{}') ON CONFLICT DO NOTHING"
+                ).bind(&uid).execute(&db).await;
+                let _ = sqlx::query(
+                    "INSERT INTO graph_nodes (node_type, node_id, properties) VALUES ('user', $1, '{}') ON CONFLICT DO NOTHING"
+                ).bind(&tid).execute(&db).await;
+                // If mutual match, add matched_with edges
+                if mutual {
+                    let _ = sqlx::query(
+                        "INSERT INTO graph_edge_links_fwd (from_type, from_id, edge_type, to_type, to_id) VALUES ('user', $1, 'matched_with', 'user', $2) ON CONFLICT DO NOTHING"
+                    ).bind(&uid).bind(&tid).execute(&db).await;
+                    let _ = sqlx::query(
+                        "INSERT INTO graph_edge_links_rev (to_type, to_id, edge_type, from_type, from_id) VALUES ('user', $2, 'matched_with', 'user', $1) ON CONFLICT DO NOTHING"
+                    ).bind(&uid).bind(&tid).execute(&db).await;
+                }
+            });
+        }
+
         Ok(LikeResult {
             success: true,
             is_mutual,
@@ -1799,6 +1847,21 @@ impl MutationRoot {
         .bind(target_user_id)
         .execute(&state.db)
         .await;
+
+        // Graph: user passed target
+        {
+            let db = state.db.clone();
+            let uid = user_id.to_string();
+            let tid = target_user_id.to_string();
+            tokio::spawn(async move {
+                let _ = sqlx::query(
+                    "INSERT INTO graph_edge_links_fwd (from_type, from_id, edge_type, to_type, to_id) VALUES ('user', $1, 'passed', 'user', $2) ON CONFLICT DO NOTHING"
+                ).bind(&uid).bind(&tid).execute(&db).await;
+                let _ = sqlx::query(
+                    "INSERT INTO graph_edge_links_rev (to_type, to_id, edge_type, from_type, from_id) VALUES ('user', $2, 'passed', 'user', $1) ON CONFLICT DO NOTHING"
+                ).bind(&uid).bind(&tid).execute(&db).await;
+            });
+        }
 
         Ok(true)
     }
