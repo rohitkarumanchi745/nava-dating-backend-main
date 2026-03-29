@@ -5044,6 +5044,9 @@ pub async fn create_reel(
     let mut music_duration_ms: Option<i32> = None;
     let mut music_start_ms: Option<i32> = None;
     let mut music_genre: Option<String> = None;
+    let mut location: Option<String> = None;
+    let mut latitude: Option<f64> = None;
+    let mut longitude: Option<f64> = None;
 
     while let Some(mut field) = multipart
         .next_field()
@@ -5066,6 +5069,9 @@ pub async fn create_reel(
             "music_duration_ms" => { music_duration_ms = field.text().await.ok().and_then(|v| v.parse().ok()); }
             "music_start_ms" => { music_start_ms = field.text().await.ok().and_then(|v| v.parse().ok()); }
             "music_genre" => { music_genre = field.text().await.ok(); }
+            "location" => { location = field.text().await.ok(); }
+            "latitude" => { latitude = field.text().await.ok().and_then(|v| v.parse().ok()); }
+            "longitude" => { longitude = field.text().await.ok().and_then(|v| v.parse().ok()); }
             _ => {
                 while field.chunk().await.map_err(|_| AppError::bad_request("Read error"))?.is_some() {}
             }
@@ -5109,8 +5115,9 @@ pub async fn create_reel(
         INSERT INTO reels (user_id, video_url, caption, category, tags,
                            music_id, music_title, music_artist, music_artwork_url,
                            music_preview_url, music_duration_ms, music_start_ms, music_genre,
+                           location_tag, latitude, longitude, creator_city,
                            created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW())
         RETURNING id
         "#,
     )
@@ -5127,6 +5134,10 @@ pub async fn create_reel(
     .bind(&music_duration_ms)
     .bind(&music_start_ms)
     .bind(&music_genre)
+    .bind(&location)
+    .bind(&latitude)
+    .bind(&longitude)
+    .bind(&location) // creator_city = location name
     .fetch_one(&state.db)
     .await?;
 
