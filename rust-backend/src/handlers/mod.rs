@@ -4215,6 +4215,180 @@ pub async fn get_connected_accounts(
 }
 
 // ============================================================================
+// ============================================================================
+// Fitness Tracking (HealthKit / Whoop / Garmin via HealthKit)
+// ============================================================================
+
+/// POST /fitness/sync — sync workouts from HealthKit
+pub async fn sync_fitness(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let activities = payload["activities"].as_array()
+        .ok_or_else(|| AppError::bad_request("Missing 'activities' array"))?;
+
+    let mut synced = 0i64;
+    let mut total_cal = 0.0f64;
+    let mut total_min = 0.0f64;
+    let mut total_dist = 0.0f64;
+
+    for a in activities {
+        let activity_type = a["type"].as_str().unwrap_or("workout").to_string();
+        let calories = a["calories"].as_f64();
+        let duration = a["duration_min"].as_f64();
+        let distance = a["distance_km"].as_f64();
+        let elevation = a["elevation_gain_m"].as_f64();
+        let heart_rate = a["avg_heart_rate"].as_i64().map(|v| v as i32);
+        let location_name = a["location_name"].as_str().map(|s| s.to_string());
+        let latitude = a["latitude"].as_f64();
+        let longitude = a["longitude"].as_f64();
+        let started_at = a["started_at"].as_str()
+            .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok())
+            .unwrap_or_else(|| chrono::Utc::now().naive_utc());
+        let source = a["source"].as_str().unwrap_or("healthkit");
+
+        sqlx::query(
+            r#"INSERT INTO user_fitness_activities
+               (user_id, activity_type, calories_burned, duration_min, distance_km, elevation_gain_m,
+                avg_heart_rate, location_name, latitude, longitude, started_at, source)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"#,
+        )
+        .bind(user_id).bind(&activity_type).bind(calories).bind(duration)
+        .bind(distance).bind(elevation).bind(heart_rate).bind(&location_name)
+        .bind(latitude).bind(longitude).bind(started_at).bind(source)
+        .execute(&state.db).await?;
+
+        total_cal += calories.unwrap_or(0.0);
+        total_min += duration.unwrap_or(0.0);
+        total_dist += distance.unwrap_or(0.0);
+        synced += 1;
+    }
+
+    // Update aggregated fitness profile
+    sqlx::query(
+        r#"INSERT INTO user_fitness_profile (user_id, weekly_active_minutes, weekly_calories, weekly_workouts, total_distance_km, last_workout_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+           ON CONFLICT (user_id) DO UPDATE SET
+               weekly_active_minutes = (SELECT COALESCE(SUM(duration_min), 0)::int FROM user_fitness_activities WHERE user_id = $1 AND started_at > NOW() - INTERVAL '7 days'),
+               weekly_calories = (SELECT COALESCE(SUM(calories_burned), 0)::int FROM user_fitness_activities WHERE user_id = $1 AND started_at > NOW() - INTERVAL '7 days'),
+               weekly_workouts = (SELECT COUNT(*) FROM user_fitness_activities WHERE user_id = $1 AND started_at > NOW() - INTERVAL '7 days'),
+               total_distance_km = user_fitness_profile.total_distance_km + $5,
+               favorite_activity = (SELECT activity_type FROM user_fitness_activities WHERE user_id = $1 GROUP BY activity_type ORDER BY COUNT(*) DESC LIMIT 1),
+               last_workout_at = NOW(), updated_at = NOW()"#,
+    )
+    .bind(user_id).bind(total_min as i32).bind(total_cal as i32)
+    .bind(synced as i32).bind(total_dist)
+    .execute(&state.db).await?;
+
+    Ok(Json(json!({ "synced": synced, "total_calories": total_cal as i32, "total_minutes": total_min as i32 })))
+}
+
+/// GET /fitness/profile — user's fitness summary for dating profile
+pub async fn get_fitness_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let _user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let target_id: i64 = params.get("user_id").and_then(|v| v.parse().ok()).unwrap_or(_user_id);
+
+    // Check privacy
+    let share = sqlx::query_scalar::<_, Option<bool>>(
+        "SELECT share_fitness FROM users WHERE id = $1"
+    ).bind(target_id).fetch_one(&state.db).await?;
+
+    if target_id != _user_id && !share.unwrap_or(false) {
+        return Ok(Json(json!({ "fitness": null, "private": true })));
+    }
+
+    let profile = sqlx::query_as::<_, (i32, i32, i32, f64, Option<String>, Option<String>, i32)>(
+        r#"SELECT weekly_active_minutes, weekly_calories, weekly_workouts, total_distance_km,
+                  favorite_activity, fitness_level, streak_days
+           FROM user_fitness_profile WHERE user_id = $1"#,
+    ).bind(target_id).fetch_optional(&state.db).await?;
+
+    let recent = sqlx::query_as::<_, (String, Option<f64>, Option<f64>, Option<f64>, Option<String>, chrono::NaiveDateTime)>(
+        r#"SELECT activity_type, calories_burned, duration_min, distance_km, location_name, started_at
+           FROM user_fitness_activities WHERE user_id = $1
+           ORDER BY started_at DESC LIMIT 5"#,
+    ).bind(target_id).fetch_all(&state.db).await?;
+
+    let recent_list: Vec<Value> = recent.into_iter().map(|r| json!({
+        "type": r.0, "calories": r.1.map(|v| v as i32), "duration_min": r.2.map(|v| v as i32),
+        "distance_km": r.3.map(|v| format!("{:.1}", v)), "location": r.4, "date": format_datetime(r.5)
+    })).collect();
+
+    match profile {
+        Some(p) => Ok(Json(json!({
+            "weekly_active_minutes": p.0, "weekly_calories": p.1, "weekly_workouts": p.2,
+            "total_distance_km": format!("{:.1}", p.3), "favorite_activity": p.4,
+            "fitness_level": p.5, "streak_days": p.6, "recent_activities": recent_list
+        }))),
+        None => Ok(Json(json!({ "fitness": null, "no_data": true })))
+    }
+}
+
+/// POST /fitness/challenge — create a fitness challenge with a match
+pub async fn create_fitness_challenge(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let partner_id = payload["partner_id"].as_i64().ok_or_else(|| AppError::bad_request("Missing 'partner_id'"))?;
+    let challenge_type = payload["type"].as_str().unwrap_or("steps").to_string();
+    let target = payload["target"].as_f64().ok_or_else(|| AppError::bad_request("Missing 'target'"))?;
+    let unit = payload["unit"].as_str().unwrap_or("calories").to_string();
+    let days = payload["days"].as_i64().unwrap_or(7);
+
+    let id = sqlx::query_scalar::<_, i64>(
+        r#"INSERT INTO fitness_challenges (creator_id, partner_id, challenge_type, target_value, target_unit, ends_at)
+           VALUES ($1, $2, $3, $4, $5, NOW() + ($6 || ' days')::interval) RETURNING id"#,
+    )
+    .bind(user_id).bind(partner_id).bind(&challenge_type).bind(target).bind(&unit).bind(days.to_string())
+    .fetch_one(&state.db).await?;
+
+    Ok(Json(json!({ "challenge_id": id, "type": challenge_type, "target": target, "unit": unit, "days": days })))
+}
+
+/// GET /fitness/challenges — active challenges
+pub async fn get_fitness_challenges(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let challenges = sqlx::query_as::<_, (i64, i64, Option<i64>, String, f64, String, f64, f64, Option<chrono::NaiveDateTime>, String)>(
+        r#"SELECT id, creator_id, partner_id, challenge_type, target_value, target_unit,
+                  creator_progress, partner_progress, ends_at, status
+           FROM fitness_challenges
+           WHERE (creator_id = $1 OR partner_id = $1) AND status = 'active'
+           ORDER BY created_at DESC"#,
+    ).bind(user_id).fetch_all(&state.db).await?;
+
+    let results: Vec<Value> = challenges.into_iter().map(|c| {
+        let (my_progress, their_progress) = if c.1 == user_id { (c.6, c.7) } else { (c.7, c.6) };
+        json!({
+            "id": c.0, "type": c.3, "target": c.4, "unit": c.5,
+            "my_progress": my_progress, "their_progress": their_progress,
+            "ends_at": c.8.map(format_datetime), "status": c.9,
+            "my_percent": (my_progress / c.4 * 100.0) as i32,
+            "their_percent": (their_progress / c.4 * 100.0) as i32
+        })
+    }).collect();
+
+    Ok(Json(json!({ "challenges": results })))
+}
+
+// ============================================================================
 // Contact Matching
 // ============================================================================
 

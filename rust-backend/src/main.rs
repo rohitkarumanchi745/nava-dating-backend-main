@@ -114,6 +114,8 @@ use handlers::{
     track_now_playing, get_music_engagement, get_deep_music_compatibility,
     // Connected Accounts
     connect_account, get_connected_accounts,
+    // Fitness
+    sync_fitness, get_fitness_profile, create_fitness_challenge, get_fitness_challenges,
     // Contacts
     sync_contacts,
     // Privacy
@@ -867,6 +869,11 @@ async fn main() {
         // Connected Accounts
         .route("/accounts/connect", post(connect_account))
         .route("/accounts/connected", get(get_connected_accounts))
+        // Fitness
+        .route("/fitness/sync", post(sync_fitness))
+        .route("/fitness/profile", get(get_fitness_profile))
+        .route("/fitness/challenge", post(create_fitness_challenge))
+        .route("/fitness/challenges", get(get_fitness_challenges))
         // Contacts
         .route("/contacts/sync", post(sync_contacts))
         // Privacy
