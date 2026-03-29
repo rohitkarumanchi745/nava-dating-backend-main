@@ -415,7 +415,7 @@ pub async fn ambassador_login(
 
     // Generate JWT tokens
     let (access_token, refresh_token) = create_token_pair(
-        credentials.user_id,
+        credentials.user_id.into(),
         &state.config.secret_key,
     )?;
 
