@@ -243,8 +243,7 @@ impl Loader<i64> for UserLoader {
     type Error = Arc<sqlx::Error>;
 
     async fn load(&self, keys: &[i64]) -> Result<HashMap<i64, Self::Value>, Self::Error> {
-        // Convert i64 keys to i32 for database query
-        let int_keys: Vec<i32> = keys.iter().map(|&k| k as i32).collect();
+        let int_keys: Vec<i64> = keys.to_vec();
         let rows = sqlx::query_as::<_, UserRow>(
             r#"
             SELECT id, phone_number, email, name, dob, gender, bio, location_text,
@@ -259,14 +258,13 @@ impl Loader<i64> for UserLoader {
         .await
         .map_err(Arc::new)?;
 
-        // Convert i32 ids back to i64 for return
-        Ok(rows.into_iter().map(|r| (i64::from(r.id), r.into())).collect())
+        Ok(rows.into_iter().map(|r| (r.id, r.into())).collect())
     }
 }
 
 #[derive(sqlx::FromRow)]
 struct UserRow {
-    id: i32,
+    id: i64,
     phone_number: Option<String>,
     email: Option<String>,
     name: Option<String>,
@@ -320,7 +318,7 @@ impl From<UserRow> for User {
         });
 
         User {
-            id: i64::from(r.id),
+            id: r.id,
             phone_number: r.phone_number,
             email: r.email,
             name: r.name,
@@ -530,7 +528,7 @@ impl QueryRoot {
             let has_voice = r.voice_intro_url.is_some();
 
             DiscoverProfile {
-                id: i64::from(r.id),
+                id: r.id,
                 name: r.name,
                 age,
                 gender: r.gender,
@@ -706,7 +704,7 @@ impl QueryRoot {
         .await?;
 
         Ok(rows.into_iter().map(|r| Message {
-            id: i64::from(r.id),
+            id: r.id,
             match_id: r.match_id,
             sender_id: i64::from(r.sender_id),
             receiver_id: i64::from(r.receiver_id),
@@ -1863,7 +1861,7 @@ struct PreferencesRow {
 
 #[derive(sqlx::FromRow)]
 struct DiscoverRow {
-    id: i32,
+    id: i64,
     name: Option<String>,
     dob: Option<chrono::NaiveDate>,
     gender: Option<String>,
@@ -1890,8 +1888,8 @@ struct DiscoverRow {
 #[derive(sqlx::FromRow)]
 struct MatchRow {
     id: String,
-    user1_id: i32,
-    user2_id: i32,
+    user1_id: i64,
+    user2_id: i64,
     is_mutual_match: Option<bool>,
     status: Option<String>,
     matched_at: Option<NaiveDateTime>,
@@ -1908,7 +1906,7 @@ struct MatchCheckRow {
 
 #[derive(sqlx::FromRow)]
 struct LikedProfileRow {
-    id: i32,
+    id: i64,
     name: Option<String>,
     dob: Option<chrono::NaiveDate>,
     profile_photo_1: Option<String>,
@@ -1953,10 +1951,10 @@ fn liked_profile_row_to_type(row: LikedProfileRow) -> LikedProfile {
 
 #[derive(sqlx::FromRow)]
 struct MessageRow {
-    id: i32,
+    id: i64,
     match_id: String,
-    sender_id: i32,
-    receiver_id: i32,
+    sender_id: i64,
+    receiver_id: i64,
     content: String,
     created_at: Option<NaiveDateTime>,
     is_read: Option<bool>,
