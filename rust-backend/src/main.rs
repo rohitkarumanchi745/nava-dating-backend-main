@@ -747,6 +747,7 @@ async fn main() {
         .route("/location/update", post(update_location))
         .route("/location/search", get(search_locations))
         .route("/location/nearby", get(get_nearby))
+        .route("/location/search-history", post(save_search_history))
         .route("/location/purchase-pass", post(purchase_pass))
         .route("/me/location", get(get_my_location))
         // Subscriptions (RevenueCat)

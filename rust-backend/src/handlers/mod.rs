@@ -1965,6 +1965,35 @@ pub async fn get_nearby(
     })))
 }
 
+/// POST /location/search-history — saves location search for proprietary hotspot data
+pub async fn save_search_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let name = payload["name"].as_str().unwrap_or("").to_string();
+    if name.is_empty() {
+        return Err(AppError::bad_request("Missing 'name' field"));
+    }
+    let latitude = payload["latitude"].as_f64();
+    let longitude = payload["longitude"].as_f64();
+
+    sqlx::query(
+        "INSERT INTO location_search_history (user_id, name, latitude, longitude) VALUES ($1, $2, $3, $4)"
+    )
+    .bind(user_id)
+    .bind(&name)
+    .bind(latitude)
+    .bind(longitude)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
 pub async fn purchase_pass(
     State(state): State<AppState>,
     headers: HeaderMap,
