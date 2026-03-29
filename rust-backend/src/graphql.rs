@@ -415,49 +415,48 @@ impl QueryRoot {
 
         let limit = f.limit.unwrap_or(20).min(50);
 
-        // Get current user's profile for compatibility calculation
-        let current_user = sqlx::query_as::<_, UserCompatibilityRow>(
-            "SELECT interests, languages, looking_for, gender FROM users WHERE id = $1"
-        )
-        .bind(user_id)
-        .fetch_optional(&state.db)
-        .await?;
+        // Run all 3 DB queries in parallel
+        let (current_user, rows, preferred_professions) = tokio::try_join!(
+            // Query 1: Current user's profile for compatibility
+            sqlx::query_as::<_, UserCompatibilityRow>(
+                "SELECT interests, languages, looking_for, gender FROM users WHERE id = $1"
+            )
+            .bind(user_id)
+            .fetch_optional(&state.db),
 
-        // Get profiles excluding already interacted users with enhanced fields
-        let rows = sqlx::query_as::<_, DiscoverRow>(
-            r#"
-            SELECT u.id, u.name, u.dob, u.gender, u.bio, u.location_text,
-                   u.profile_photo_1, u.profile_photo_2, u.profile_photo_3, u.profile_photos,
-                   u.interests, u.languages, u.is_verified, u.attractiveness_score,
-                   u.voice_intro_url, u.voice_intro_duration,
-                   u.profession_title, u.profession_category, u.looking_for, u.height_cm
-            FROM users u
-            WHERE u.id != $1
-              AND u.is_profile_complete = true
-              AND u.is_active = true
-              AND u.id NOT IN (
-                  SELECT to_user_id FROM swipes WHERE from_user_id = $1
-              )
-              AND u.id NOT IN (
-                  SELECT CASE WHEN user1_id = $1 THEN user2_id ELSE user1_id END
-                  FROM matches WHERE (user1_id = $1 OR user2_id = $1)
-                    AND ((user1_id = $1 AND user1_liked IS NOT NULL) OR (user2_id = $1 AND user2_liked IS NOT NULL))
-              )
-            ORDER BY
-                -- Prioritize profiles with voice intros
-                CASE WHEN u.voice_intro_url IS NOT NULL THEN 0 ELSE 1 END,
-                -- Then by attractiveness/quality score
-                u.attractiveness_score DESC NULLS LAST,
-                -- Then by recent activity
-                u.last_active DESC NULLS LAST,
-                u.created_at DESC
-            LIMIT $2
-            "#,
-        )
-        .bind(user_id)
-        .bind(limit)
-        .fetch_all(&state.db)
-        .await?;
+            // Query 2: Discover profiles — uses LEFT JOIN instead of NOT IN for speed
+            sqlx::query_as::<_, DiscoverRow>(
+                r#"
+                SELECT u.id, u.name, u.dob, u.gender, u.bio, u.location_text,
+                       u.profile_photo_1, u.profile_photo_2, u.profile_photo_3, u.profile_photos,
+                       u.interests, u.languages, u.is_verified, u.attractiveness_score,
+                       u.voice_intro_url, u.voice_intro_duration,
+                       u.profession_title, u.profession_category, u.looking_for, u.height_cm
+                FROM users u
+                LEFT JOIN swipes s ON s.from_user_id = $1 AND s.to_user_id = u.id
+                WHERE u.id != $1
+                  AND u.is_profile_complete = true
+                  AND u.is_active = true
+                  AND s.from_user_id IS NULL
+                ORDER BY
+                    CASE WHEN u.voice_intro_url IS NOT NULL THEN 0 ELSE 1 END,
+                    u.attractiveness_score DESC NULLS LAST,
+                    u.last_active DESC NULLS LAST,
+                    u.created_at DESC
+                LIMIT $2
+                "#,
+            )
+            .bind(user_id)
+            .bind(limit)
+            .fetch_all(&state.db),
+
+            // Query 3: User preferences
+            sqlx::query_scalar::<_, Option<serde_json::Value>>(
+                "SELECT preferred_professions FROM user_preferences WHERE user_id = $1"
+            )
+            .bind(user_id)
+            .fetch_optional(&state.db),
+        )?;
 
         // Calculate compatibility scores
         let current_interests: Vec<String> = current_user.as_ref()
@@ -473,16 +472,10 @@ impl QueryRoot {
         let current_looking_for = current_user.as_ref()
             .and_then(|u| u.looking_for.clone());
 
-        // Load user's preferred professions for scoring boost
-        let preferred_professions: Vec<String> = sqlx::query_scalar::<_, Option<serde_json::Value>>(
-            "SELECT preferred_professions FROM user_preferences WHERE user_id = $1"
-        )
-        .bind(user_id)
-        .fetch_optional(&state.db)
-        .await?
-        .flatten()
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default();
+        let preferred_professions: Vec<String> = preferred_professions
+            .flatten()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
 
         Ok(rows.into_iter().map(|r| {
             let age = r.dob.map(|dob| {
