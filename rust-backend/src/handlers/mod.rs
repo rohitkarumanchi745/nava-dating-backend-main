@@ -3406,6 +3406,347 @@ pub async fn get_spots(
 }
 
 // ============================================================================
+// Spots Feed & Messaging
+// ============================================================================
+
+/// GET /spots/feed — nearby spots from other users
+pub async fn get_spots_feed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let limit = params.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(20);
+
+    let spots = sqlx::query_as::<_, SpotFullRow>(
+        r#"SELECT s.id, s.user_id, s.title, s.original_url, s.poster_url, s.mime_type,
+                  s.duration_sec, s.renditions, s.tags, s.city, s.is_global,
+                  s.expires_at, s.created_at, s.updated_at
+           FROM spots s
+           WHERE s.user_id != $1
+             AND (s.expires_at IS NULL OR s.expires_at > NOW())
+           ORDER BY s.created_at DESC LIMIT $2"#,
+    )
+    .bind(user_id)
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await?;
+
+    let results: Vec<Value> = spots.into_iter().map(|s| {
+        json!({
+            "id": s.id, "user_id": s.user_id, "title": s.title,
+            "poster_url": s.poster_url, "original_url": s.original_url,
+            "city": s.city, "tags": s.tags,
+            "created_at": s.created_at.map(format_datetime),
+            "expires_at": s.expires_at.map(format_datetime),
+        })
+    }).collect();
+
+    Ok(Json(json!({ "spots": results })))
+}
+
+/// GET /spots/:id/messages
+pub async fn get_spot_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(spot_id): AxumPath<i64>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let _user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let msgs = sqlx::query_as::<_, SpotMessageRow>(
+        "SELECT id, spot_id, sender_id, text, created_at FROM spot_messages WHERE spot_id = $1 ORDER BY created_at ASC LIMIT 100"
+    )
+    .bind(spot_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let results: Vec<Value> = msgs.into_iter().map(|m| {
+        json!({ "id": m.id, "spot_id": m.spot_id, "sender_id": m.sender_id, "text": m.text, "created_at": m.created_at.map(format_datetime) })
+    }).collect();
+
+    Ok(Json(json!({ "messages": results })))
+}
+
+/// POST /spots/:id/messages
+pub async fn send_spot_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(spot_id): AxumPath<i64>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let text = payload["text"].as_str().unwrap_or("").to_string();
+    if text.is_empty() { return Err(AppError::bad_request("Missing 'text'")); }
+
+    let id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO spot_messages (spot_id, sender_id, text) VALUES ($1, $2, $3) RETURNING id"
+    )
+    .bind(spot_id).bind(user_id).bind(&text)
+    .fetch_one(&state.db).await?;
+
+    // Update pair status for matching
+    let _ = sqlx::query(
+        r#"INSERT INTO spot_pair_status (spot_id, user_a, user_b, a_count)
+           SELECT $1, $2, s.user_id, 1 FROM spots s WHERE s.id = $1 AND s.user_id != $2
+           ON CONFLICT (spot_id, user_a, user_b) DO UPDATE SET a_count = spot_pair_status.a_count + 1, updated_at = NOW()"#
+    ).bind(spot_id).bind(user_id).execute(&state.db).await;
+
+    Ok(Json(json!({ "message_id": id })))
+}
+
+/// POST /spots/:id/react — react to a spot (tracks engagement for pair matching)
+pub async fn react_to_spot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(spot_id): AxumPath<i64>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let _ = sqlx::query(
+        r#"INSERT INTO spot_pair_status (spot_id, user_a, user_b, a_count)
+           SELECT $1, $2, s.user_id, 1 FROM spots s WHERE s.id = $1 AND s.user_id != $2
+           ON CONFLICT (spot_id, user_a, user_b) DO UPDATE SET a_count = spot_pair_status.a_count + 1, updated_at = NOW()"#
+    ).bind(spot_id).bind(user_id).execute(&state.db).await;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ============================================================================
+// Playgrounds (Group Hangouts)
+// ============================================================================
+
+/// GET /playgrounds — list playgrounds near user or by type
+pub async fn get_playgrounds(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let _user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let pg_type = params.get("type").cloned();
+    let limit = params.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(20);
+
+    let playgrounds = sqlx::query_as::<_, (i64, String, Option<String>, String, Option<String>, i32, i32, Option<String>, Option<String>)>(
+        r#"SELECT id, name, description, playground_type, city, member_count, active_today, cover_image_url, icon_url
+           FROM playgrounds WHERE is_active = true AND ($1::text IS NULL OR playground_type = $1)
+           ORDER BY active_today DESC, member_count DESC LIMIT $2"#,
+    )
+    .bind(&pg_type).bind(limit)
+    .fetch_all(&state.db).await?;
+
+    let results: Vec<Value> = playgrounds.into_iter().map(|p| {
+        json!({ "id": p.0, "name": p.1, "description": p.2, "type": p.3, "city": p.4, "member_count": p.5, "active_today": p.6, "cover_image_url": p.7, "icon_url": p.8 })
+    }).collect();
+
+    Ok(Json(json!({ "playgrounds": results })))
+}
+
+/// POST /playgrounds — create a new playground
+pub async fn create_playground(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let name = payload["name"].as_str().unwrap_or("").to_string();
+    if name.is_empty() { return Err(AppError::bad_request("Missing 'name'")); }
+    let description = payload["description"].as_str().map(|s| s.to_string());
+    let pg_type = payload["type"].as_str().unwrap_or("interest").to_string();
+    let city = payload["city"].as_str().map(|s| s.to_string());
+    let max_members = payload["max_members"].as_i64().unwrap_or(50) as i32;
+
+    let id = sqlx::query_scalar::<_, i64>(
+        r#"INSERT INTO playgrounds (name, description, playground_type, city, max_members, is_public, is_active)
+           VALUES ($1, $2, $3, $4, $5, true, true) RETURNING id"#,
+    )
+    .bind(&name).bind(&description).bind(&pg_type).bind(&city).bind(max_members)
+    .fetch_one(&state.db).await?;
+
+    // Creator auto-joins as admin
+    sqlx::query("INSERT INTO playground_members (playground_id, user_id, role) VALUES ($1, $2, 'admin')")
+        .bind(id).bind(user_id).execute(&state.db).await?;
+
+    sqlx::query("UPDATE playgrounds SET member_count = 1 WHERE id = $1")
+        .bind(id).execute(&state.db).await?;
+
+    Ok(Json(json!({ "playground_id": id })))
+}
+
+/// GET /playgrounds/:id
+pub async fn get_playground_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(pg_id): AxumPath<i64>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let pg = sqlx::query_as::<_, (i64, String, Option<String>, String, Option<String>, i32, i32, bool)>(
+        "SELECT id, name, description, playground_type, city, member_count, active_today, is_public FROM playgrounds WHERE id = $1"
+    ).bind(pg_id).fetch_optional(&state.db).await?
+    .ok_or_else(|| AppError::not_found("Playground not found"))?;
+
+    let is_member = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM playground_members WHERE playground_id = $1 AND user_id = $2 AND is_active = true)"
+    ).bind(pg_id).bind(user_id).fetch_one(&state.db).await.unwrap_or(false);
+
+    Ok(Json(json!({
+        "id": pg.0, "name": pg.1, "description": pg.2, "type": pg.3, "city": pg.4,
+        "member_count": pg.5, "active_today": pg.6, "is_public": pg.7, "is_member": is_member
+    })))
+}
+
+/// POST /playgrounds/:id/join
+pub async fn join_playground(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(pg_id): AxumPath<i64>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    sqlx::query(
+        "INSERT INTO playground_members (playground_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT (playground_id, user_id) DO UPDATE SET is_active = true, last_active_at = NOW()"
+    ).bind(pg_id).bind(user_id).execute(&state.db).await?;
+
+    sqlx::query("UPDATE playgrounds SET member_count = (SELECT COUNT(*) FROM playground_members WHERE playground_id = $1 AND is_active = true) WHERE id = $1")
+        .bind(pg_id).execute(&state.db).await?;
+
+    Ok(Json(json!({ "joined": true })))
+}
+
+/// POST /playgrounds/:id/leave
+pub async fn leave_playground(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(pg_id): AxumPath<i64>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    sqlx::query("UPDATE playground_members SET is_active = false WHERE playground_id = $1 AND user_id = $2")
+        .bind(pg_id).bind(user_id).execute(&state.db).await?;
+
+    sqlx::query("UPDATE playgrounds SET member_count = (SELECT COUNT(*) FROM playground_members WHERE playground_id = $1 AND is_active = true) WHERE id = $1")
+        .bind(pg_id).execute(&state.db).await?;
+
+    Ok(Json(json!({ "left": true })))
+}
+
+/// GET /playgrounds/:id/members
+pub async fn get_playground_members(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(pg_id): AxumPath<i64>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let _user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let members = sqlx::query_as::<_, (i64, Option<String>, Option<String>, String, Option<chrono::NaiveDateTime>)>(
+        r#"SELECT u.id, u.name, u.profile_photo_1, pm.role, pm.last_active_at
+           FROM playground_members pm JOIN users u ON u.id = pm.user_id
+           WHERE pm.playground_id = $1 AND pm.is_active = true
+           ORDER BY pm.role DESC, pm.joined_at ASC LIMIT 100"#,
+    ).bind(pg_id).fetch_all(&state.db).await?;
+
+    let results: Vec<Value> = members.into_iter().map(|m| {
+        json!({ "user_id": m.0, "name": m.1, "photo": m.2, "role": m.3, "last_active": m.4.map(format_datetime) })
+    }).collect();
+
+    Ok(Json(json!({ "members": results })))
+}
+
+// ============================================================================
+// Events (Real-World Meetups)
+// ============================================================================
+
+/// POST /events — create a new event
+pub async fn create_event(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let title = payload["title"].as_str().unwrap_or("").to_string();
+    if title.is_empty() { return Err(AppError::bad_request("Missing 'title'")); }
+    let description = payload["description"].as_str().map(|s| s.to_string());
+    let category = payload["category"].as_str().map(|s| s.to_string());
+    let location_name = payload["location_name"].as_str().map(|s| s.to_string());
+    let latitude = payload["latitude"].as_f64();
+    let longitude = payload["longitude"].as_f64();
+    let starts_at = payload["starts_at"].as_str()
+        .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok())
+        .ok_or_else(|| AppError::bad_request("Missing or invalid 'starts_at' (format: YYYY-MM-DDTHH:MM:SS)"))?;
+    let max_attendees = payload["max_attendees"].as_i64().map(|v| v as i32);
+
+    let id = sqlx::query_scalar::<_, i64>(
+        r#"INSERT INTO events (creator_id, title, description, category, location_name, latitude, longitude, starts_at, max_attendees)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id"#,
+    )
+    .bind(user_id).bind(&title).bind(&description).bind(&category)
+    .bind(&location_name).bind(latitude).bind(longitude).bind(starts_at).bind(max_attendees)
+    .fetch_one(&state.db).await?;
+
+    // Creator auto-RSVPs
+    sqlx::query("INSERT INTO event_rsvps (event_id, user_id, status) VALUES ($1, $2, 'going')")
+        .bind(id).bind(user_id).execute(&state.db).await?;
+
+    Ok(Json(json!({ "event_id": id })))
+}
+
+/// GET /events — events near user
+pub async fn get_events_near_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let _user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let limit = params.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(20);
+
+    let events = sqlx::query_as::<_, (i64, i64, String, Option<String>, Option<String>, Option<String>, Option<f64>, Option<f64>, chrono::NaiveDateTime, Option<i32>)>(
+        r#"SELECT e.id, e.creator_id, e.title, e.description, e.category, e.location_name, e.latitude, e.longitude, e.starts_at, e.max_attendees
+           FROM events e WHERE e.is_active = true AND e.starts_at > NOW()
+           ORDER BY e.starts_at ASC LIMIT $1"#,
+    ).bind(limit).fetch_all(&state.db).await?;
+
+    let results: Vec<Value> = events.into_iter().map(|e| {
+        json!({
+            "id": e.0, "creator_id": e.1, "title": e.2, "description": e.3,
+            "category": e.4, "location_name": e.5, "latitude": e.6, "longitude": e.7,
+            "starts_at": format_datetime(e.8), "max_attendees": e.9
+        })
+    }).collect();
+
+    Ok(Json(json!({ "events": results })))
+}
+
+/// POST /events/:id/rsvp
+pub async fn rsvp_event(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(event_id): AxumPath<i64>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let status = "going";
+    sqlx::query(
+        "INSERT INTO event_rsvps (event_id, user_id, status) VALUES ($1, $2, $3) ON CONFLICT (event_id, user_id) DO UPDATE SET status = $3"
+    ).bind(event_id).bind(user_id).bind(status).execute(&state.db).await?;
+
+    Ok(Json(json!({ "rsvp": status })))
+}
+
+// ============================================================================
 // Vision Analysis
 // ============================================================================
 

@@ -826,6 +826,21 @@ async fn main() {
         // Spots
         .route("/spots", post(create_spot))
         .route("/spots", get(get_spots))
+        .route("/spots/feed", get(get_spots_feed))
+        .route("/spots/:id/messages", get(get_spot_messages))
+        .route("/spots/:id/messages", post(send_spot_message))
+        .route("/spots/:id/react", post(react_to_spot))
+        // Playgrounds
+        .route("/playgrounds", get(get_playgrounds))
+        .route("/playgrounds", post(create_playground))
+        .route("/playgrounds/:id", get(get_playground_detail))
+        .route("/playgrounds/:id/join", post(join_playground))
+        .route("/playgrounds/:id/leave", post(leave_playground))
+        .route("/playgrounds/:id/members", get(get_playground_members))
+        // Events
+        .route("/events", post(create_event))
+        .route("/events", get(get_events_near_me))
+        .route("/events/:id/rsvp", post(rsvp_event))
         // Vision/Verification
         .route("/verify/selfie", post(verify_selfie))
         .route("/vision/analyze", post(vision_analyze))
