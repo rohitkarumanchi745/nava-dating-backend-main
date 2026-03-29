@@ -503,7 +503,7 @@ pub struct VerifyOtpRequest {
 pub struct VerifyOtpResponse {
     pub access_token: String,
     pub token_type: &'static str,
-    pub user_id: i32,
+    pub user_id: i64,
     pub is_new_user: bool,
     pub is_profile_complete: bool,
 }

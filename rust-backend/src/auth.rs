@@ -191,7 +191,7 @@ pub fn create_call_token(
 }
 
 /// Create a pair of access and refresh tokens for ambassador login
-pub fn create_token_pair(user_id: i32, secret: &str) -> Result<(String, String), AppError> {
+pub fn create_token_pair(user_id: i64, secret: &str) -> Result<(String, String), AppError> {
     // Access token: 15 minutes
     let access_token = create_access_token(user_id, secret, 15)?;
 
