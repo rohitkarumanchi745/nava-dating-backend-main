@@ -4722,6 +4722,81 @@ pub async fn get_seasonal_guide(
     })))
 }
 
+/// GET /outdoor/location-activity — who posted content at a location + weather/time patterns
+pub async fn get_location_activity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let lat: f64 = params.get("lat").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let lng: f64 = params.get("lng").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+
+    // Who posted content here (reels, spots) with time/weather context
+    let creators = sqlx::query_as::<_, (i64, String, Option<String>, i32, i32, Option<String>, chrono::NaiveDateTime)>(
+        r#"SELECT cl.user_id, cl.content_type, cl.location_name, cl.hour_of_day, cl.month,
+                  cl.season, cl.posted_at
+           FROM location_content_log cl
+           WHERE cl.user_id != $1
+             AND ABS(cl.latitude - $2) < 0.05 AND ABS(cl.longitude - $3) < 0.05
+           ORDER BY cl.posted_at DESC LIMIT 20"#,
+    ).bind(user_id).bind(lat).bind(lng).fetch_all(&state.db).await?;
+
+    let creator_list: Vec<Value> = creators.into_iter().map(|c| json!({
+        "user_id": c.0, "content_type": c.1, "location_name": c.2,
+        "hour": c.3, "month": c.4, "season": c.5, "posted_at": format_datetime(c.6)
+    })).collect();
+
+    // Best time patterns for this location (when do people post most)
+    let time_patterns = sqlx::query_as::<_, (i32, i64)>(
+        r#"SELECT hour_of_day, COUNT(*) as post_count
+           FROM location_content_log
+           WHERE ABS(latitude - $1) < 0.05 AND ABS(longitude - $2) < 0.05
+           GROUP BY hour_of_day ORDER BY post_count DESC LIMIT 5"#,
+    ).bind(lat).bind(lng).fetch_all(&state.db).await?;
+
+    let peak_hours: Vec<Value> = time_patterns.into_iter().map(|t| json!({
+        "hour": t.0, "posts": t.1,
+        "label": match t.0 { 5..=7 => "sunrise", 8..=11 => "morning", 12..=15 => "afternoon", 16..=19 => "golden hour", _ => "night" }
+    })).collect();
+
+    // Best season patterns
+    let season_patterns = sqlx::query_as::<_, (Option<String>, i64)>(
+        r#"SELECT season, COUNT(*) as post_count
+           FROM location_content_log
+           WHERE ABS(latitude - $1) < 0.05 AND ABS(longitude - $2) < 0.05
+           GROUP BY season ORDER BY post_count DESC"#,
+    ).bind(lat).bind(lng).fetch_all(&state.db).await?;
+
+    let seasons: Vec<Value> = season_patterns.into_iter().map(|s| json!({
+        "season": s.0, "posts": s.1
+    })).collect();
+
+    // Who interacted with content at this location
+    let interactions = sqlx::query_as::<_, (i64, i64, String, Option<String>, chrono::NaiveDateTime)>(
+        r#"SELECT user_id, target_user_id, interaction_type, content_type, created_at
+           FROM location_interactions
+           WHERE (user_id = $1 OR target_user_id = $1)
+             AND ABS(latitude - $2) < 0.05 AND ABS(longitude - $3) < 0.05
+           ORDER BY created_at DESC LIMIT 20"#,
+    ).bind(user_id).bind(lat).bind(lng).fetch_all(&state.db).await?;
+
+    let interaction_list: Vec<Value> = interactions.into_iter().map(|i| json!({
+        "user_id": i.0, "target_user_id": i.1, "type": i.2,
+        "content_type": i.3, "at": format_datetime(i.4)
+    })).collect();
+
+    Ok(Json(json!({
+        "creators": creator_list,
+        "peak_hours": peak_hours,
+        "best_seasons": seasons,
+        "your_interactions": interaction_list,
+        "total_posts_here": creator_list.len()
+    })))
+}
+
 // ============================================================================
 // Contact Matching
 // ============================================================================
@@ -6605,6 +6680,30 @@ pub async fn create_reel(
         });
     }
 
+    // Log location content with weather/time context (iOS sends weather data in multipart)
+    if latitude.is_some() || location.is_some() {
+        let db2 = state.db.clone();
+        let loc = location.clone();
+        let lat2 = latitude;
+        let lng2 = longitude;
+        let now = chrono::Utc::now();
+        tokio::spawn(async move {
+            let _ = sqlx::query(
+                r#"INSERT INTO location_content_log (user_id, content_type, content_id, latitude, longitude,
+                      location_name, hour_of_day, day_of_week, month, season, posted_at)
+                   VALUES ($1, 'reel', $2, $3, $4, $5, $6, $7, $8, $9, NOW())"#,
+            )
+            .bind(user_id).bind(reel_id).bind(lat2).bind(lng2).bind(&loc)
+            .bind(now.format("%H").to_string().parse::<i32>().unwrap_or(0))
+            .bind(now.format("%u").to_string().parse::<i32>().unwrap_or(1))
+            .bind(now.format("%m").to_string().parse::<i32>().unwrap_or(1))
+            .bind(match now.format("%m").to_string().parse::<i32>().unwrap_or(1) {
+                1..=2 | 12 => "winter", 3..=5 => "spring", 6..=9 => "monsoon", _ => "autumn"
+            })
+            .execute(&db2).await;
+        });
+    }
+
     // Spawn HLS transcoding in the background — doesn't block the upload response
     // Uses single-pass pipeline: probe → skip normalize if short H.264 → direct HLS output
     {
@@ -7142,11 +7241,13 @@ pub async fn track_reel_view(
         update_content_prefs(&state.db, user_id, payload.reel_id, interest_score).await?;
     }
 
-    // Graph: user viewed reel
+    // Graph: user viewed reel + log location interaction
     {
         let db = state.db.clone();
         let uid = user_id.to_string();
         let rid = payload.reel_id.to_string();
+        let reel_owner_id = meta.user_id;
+        let reel_id = payload.reel_id;
         tokio::spawn(async move {
             let _ = sqlx::query(
                 "INSERT INTO graph_edge_links_fwd (from_type, from_id, edge_type, to_type, to_id) VALUES ('user', $1, 'viewed', 'reel', $2) ON CONFLICT DO NOTHING"
@@ -7154,6 +7255,13 @@ pub async fn track_reel_view(
             let _ = sqlx::query(
                 "INSERT INTO graph_edge_links_rev (to_type, to_id, edge_type, from_type, from_id) VALUES ('reel', $2, 'viewed', 'user', $1) ON CONFLICT DO NOTHING"
             ).bind(&uid).bind(&rid).execute(&db).await;
+
+            // Log interaction with reel creator at reel's location
+            let _ = sqlx::query(
+                r#"INSERT INTO location_interactions (user_id, target_user_id, interaction_type, content_type, content_id, latitude, longitude, location_name)
+                   SELECT $1, $2, 'viewed', 'reel', $3, r.latitude, r.longitude, r.location_tag
+                   FROM reels r WHERE r.id = $3 AND r.latitude IS NOT NULL"#,
+            ).bind(user_id).bind(reel_owner_id).bind(reel_id as i64).execute(&db).await;
         });
     }
 
