@@ -4880,7 +4880,7 @@ pub async fn get_map_user_interests(
     Ok(Json(json!({
         "top_categories": cat_list,
         "favorite_places": place_list,
-        "avg_search_distance_km": avg_dist.flatten().map(|d| format!("{:.1}", d)),
+        "avg_search_distance_km": avg_dist.map(|d| format!("{:.1}", d)),
         "explorer_type": explorer_type,
         "search_time_patterns": time_list
     })))
