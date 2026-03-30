@@ -4389,6 +4389,308 @@ pub async fn get_fitness_challenges(
 }
 
 // ============================================================================
+// Outdoor Spots + Weather + Memories
+// ============================================================================
+
+/// GET /outdoor/spots — nearby outdoor spots ranked by weather, season, time of day, user history
+pub async fn get_outdoor_spots(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let lat: f64 = params.get("lat").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let lng: f64 = params.get("lng").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let category = params.get("category").cloned();
+    let limit = params.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(20);
+
+    // Current month + hour for seasonal/time scoring
+    let now = chrono::Utc::now();
+    let current_month = now.format("%m").to_string().parse::<i32>().unwrap_or(1);
+    let current_hour = now.format("%H").to_string().parse::<i32>().unwrap_or(12);
+
+    let spots = sqlx::query_as::<_, (i64, String, Option<String>, String, f64, f64, Option<String>, Option<i32>, Option<String>, Option<f64>, Option<serde_json::Value>, Option<String>, bool, bool, bool, f64, i32)>(
+        r#"SELECT id, name, description, category, latitude, longitude, city, elevation_m, difficulty,
+                  distance_km, best_months, best_time_of_day, photo_golden_hour, sunset_viewpoint,
+                  sunrise_viewpoint, avg_rating, visit_count
+           FROM outdoor_spots
+           WHERE ($1::text IS NULL OR category = $1)
+           ORDER BY visit_count DESC LIMIT $2"#,
+    ).bind(&category).bind(limit * 3).fetch_all(&state.db).await?;
+
+    // Get user's past visits for memory matching
+    let past_visits = sqlx::query_as::<_, (Option<i64>, Option<String>, Option<f64>, Option<f64>, Option<chrono::NaiveDateTime>, Option<f64>)>(
+        r#"SELECT spot_id, spot_name, calories_burned, duration_min, visited_at, latitude
+           FROM spot_visits WHERE user_id = $1 ORDER BY visited_at DESC"#,
+    ).bind(user_id).fetch_all(&state.db).await?;
+
+    let mut scored: Vec<(f64, Value)> = spots.into_iter().map(|s| {
+        let mut score = 0.0;
+
+        // Distance score (+25%)
+        if lat != 0.0 {
+            let dist = haversine_km(lat, lng, s.4, s.5);
+            score += 0.25 * (1.0 / (1.0 + dist / 20.0));
+        }
+
+        // Seasonal match (+25%) — is current month in best_months?
+        if let Some(ref months) = s.10 {
+            if let Ok(month_list) = serde_json::from_value::<Vec<i32>>(months.clone()) {
+                if month_list.contains(&current_month) { score += 0.25; }
+            }
+        }
+
+        // Time of day match (+20%)
+        let time_match = match s.11.as_deref() {
+            Some("sunrise") => current_hour >= 5 && current_hour <= 8,
+            Some("sunset") => current_hour >= 16 && current_hour <= 19,
+            Some("morning") => current_hour >= 6 && current_hour <= 11,
+            Some("evening") => current_hour >= 15 && current_hour <= 20,
+            _ => true,
+        };
+        if time_match { score += 0.20; }
+
+        // Golden hour photo spot bonus
+        let is_golden = (current_hour >= 6 && current_hour <= 8) || (current_hour >= 17 && current_hour <= 19);
+        if s.12 && is_golden { score += 0.10; }
+
+        // Rating (+10%)
+        score += 0.10 * (s.15 / 5.0);
+
+        // Popularity (+10%)
+        score += 0.10 * (s.16 as f64 / (s.16 as f64 + 50.0));
+
+        // Check for memories (user visited before)
+        let memory = past_visits.iter().find(|v| {
+            v.0 == Some(s.0) || (v.5.is_some() && (v.5.unwrap() - s.4).abs() < 0.01)
+        });
+
+        let memory_data = memory.map(|m| json!({
+            "visited_at": m.4.map(format_datetime),
+            "calories_burned": m.2.map(|v| v as i32),
+            "duration_min": m.3.map(|v| v as i32),
+            "has_memory": true
+        }));
+
+        if memory.is_some() { score += 0.05; } // revisit bonus
+
+        let val = json!({
+            "id": s.0, "name": s.1, "description": s.2, "category": s.3,
+            "latitude": s.4, "longitude": s.5, "city": s.6,
+            "elevation_m": s.7, "difficulty": s.8, "distance_km": s.9,
+            "best_time": s.11, "photo_golden_hour": s.12,
+            "sunset_viewpoint": s.13, "sunrise_viewpoint": s.14,
+            "rating": s.15, "visits": s.16,
+            "relevance_score": (score * 100.0) as i32,
+            "is_golden_hour_now": is_golden,
+            "is_best_season": score > 0.2,
+            "memory": memory_data
+        });
+        (score, val)
+    }).collect();
+
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let results: Vec<Value> = scored.into_iter().take(limit as usize).map(|(_, v)| v).collect();
+
+    Ok(Json(json!({ "spots": results, "current_month": current_month, "current_hour": current_hour })))
+}
+
+/// POST /outdoor/spots — user adds a new outdoor spot
+pub async fn create_outdoor_spot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let name = payload["name"].as_str().unwrap_or("").to_string();
+    if name.is_empty() { return Err(AppError::bad_request("Missing 'name'")); }
+
+    let id = sqlx::query_scalar::<_, i64>(
+        r#"INSERT INTO outdoor_spots (name, description, category, latitude, longitude, city, elevation_m,
+                  difficulty, distance_km, best_months, best_time_of_day, photo_golden_hour,
+                  sunset_viewpoint, sunrise_viewpoint, created_by)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id"#,
+    )
+    .bind(&name)
+    .bind(payload["description"].as_str())
+    .bind(payload["category"].as_str().unwrap_or("trek"))
+    .bind(payload["latitude"].as_f64().unwrap_or(0.0))
+    .bind(payload["longitude"].as_f64().unwrap_or(0.0))
+    .bind(payload["city"].as_str())
+    .bind(payload["elevation_m"].as_i64().map(|v| v as i32))
+    .bind(payload["difficulty"].as_str())
+    .bind(payload["distance_km"].as_f64())
+    .bind(payload["best_months"].as_array().map(|a| serde_json::Value::Array(a.clone())))
+    .bind(payload["best_time_of_day"].as_str())
+    .bind(payload["photo_golden_hour"].as_bool().unwrap_or(false))
+    .bind(payload["sunset_viewpoint"].as_bool().unwrap_or(false))
+    .bind(payload["sunrise_viewpoint"].as_bool().unwrap_or(false))
+    .bind(user_id)
+    .fetch_one(&state.db).await?;
+
+    Ok(Json(json!({ "spot_id": id })))
+}
+
+/// POST /outdoor/visit — log a visit with weather + fitness data + memories
+pub async fn log_spot_visit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let spot_id = payload["spot_id"].as_i64();
+    let spot_name = payload["spot_name"].as_str().map(|s| s.to_string());
+
+    let id = sqlx::query_scalar::<_, i64>(
+        r#"INSERT INTO spot_visits (user_id, spot_id, spot_name, latitude, longitude,
+                  weather_temp_c, weather_condition, weather_humidity, weather_wind_kmh,
+                  uv_index, visibility_km, sunrise_time, sunset_time,
+                  calories_burned, duration_min, rating, notes, photo_url)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+           RETURNING id"#,
+    )
+    .bind(user_id).bind(spot_id).bind(&spot_name)
+    .bind(payload["latitude"].as_f64()).bind(payload["longitude"].as_f64())
+    .bind(payload["weather_temp_c"].as_f64())
+    .bind(payload["weather_condition"].as_str())
+    .bind(payload["weather_humidity"].as_i64().map(|v| v as i32))
+    .bind(payload["weather_wind_kmh"].as_f64())
+    .bind(payload["uv_index"].as_i64().map(|v| v as i32))
+    .bind(payload["visibility_km"].as_f64())
+    .bind(payload["sunrise_time"].as_str())
+    .bind(payload["sunset_time"].as_str())
+    .bind(payload["calories_burned"].as_f64())
+    .bind(payload["duration_min"].as_f64())
+    .bind(payload["rating"].as_i64().map(|v| v as i32))
+    .bind(payload["notes"].as_str())
+    .bind(payload["photo_url"].as_str())
+    .fetch_one(&state.db).await?;
+
+    // Update spot stats
+    if let Some(sid) = spot_id {
+        sqlx::query("UPDATE outdoor_spots SET visit_count = visit_count + 1 WHERE id = $1")
+            .bind(sid).execute(&state.db).await?;
+        if let Some(rating) = payload["rating"].as_i64() {
+            sqlx::query(
+                "UPDATE outdoor_spots SET avg_rating = (avg_rating * visit_count + $1) / (visit_count + 1) WHERE id = $2"
+            ).bind(rating as f64).bind(sid).execute(&state.db).await?;
+        }
+    }
+
+    Ok(Json(json!({ "visit_id": id })))
+}
+
+/// GET /outdoor/memories — user's past visits, grouped by location (for revisit memories)
+pub async fn get_spot_memories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let lat = params.get("lat").and_then(|v| v.parse::<f64>().ok());
+    let lng = params.get("lng").and_then(|v| v.parse::<f64>().ok());
+
+    // If lat/lng provided, find memories near that location
+    let visits = if let (Some(lat), Some(lng)) = (lat, lng) {
+        sqlx::query_as::<_, (i64, Option<i64>, Option<String>, Option<f64>, Option<f64>, Option<f64>, Option<String>, Option<f64>, Option<f64>, chrono::NaiveDateTime, Option<String>, Option<i32>, Option<String>)>(
+            r#"SELECT id, spot_id, spot_name, latitude, longitude, weather_temp_c, weather_condition,
+                      calories_burned, duration_min, visited_at, photo_url, rating, notes
+               FROM spot_visits WHERE user_id = $1
+               AND latitude IS NOT NULL AND ABS(latitude - $2) < 0.05 AND ABS(longitude - $3) < 0.05
+               ORDER BY visited_at DESC"#,
+        ).bind(user_id).bind(lat).bind(lng).fetch_all(&state.db).await?
+    } else {
+        sqlx::query_as::<_, (i64, Option<i64>, Option<String>, Option<f64>, Option<f64>, Option<f64>, Option<String>, Option<f64>, Option<f64>, chrono::NaiveDateTime, Option<String>, Option<i32>, Option<String>)>(
+            r#"SELECT id, spot_id, spot_name, latitude, longitude, weather_temp_c, weather_condition,
+                      calories_burned, duration_min, visited_at, photo_url, rating, notes
+               FROM spot_visits WHERE user_id = $1
+               ORDER BY visited_at DESC LIMIT 50"#,
+        ).bind(user_id).fetch_all(&state.db).await?
+    };
+
+    let results: Vec<Value> = visits.into_iter().map(|v| {
+        let days_ago = (chrono::Utc::now().naive_utc() - v.9).num_days();
+        json!({
+            "id": v.0, "spot_id": v.1, "spot_name": v.2,
+            "latitude": v.3, "longitude": v.4,
+            "weather": { "temp_c": v.5, "condition": v.6 },
+            "calories_burned": v.7.map(|c| c as i32),
+            "duration_min": v.8.map(|d| d as i32),
+            "visited_at": format_datetime(v.9),
+            "days_ago": days_ago,
+            "photo_url": v.10, "rating": v.11, "notes": v.12,
+            "memory_label": if days_ago > 365 { format!("{}y ago", days_ago / 365) }
+                           else if days_ago > 30 { format!("{}mo ago", days_ago / 30) }
+                           else { format!("{}d ago", days_ago) }
+        })
+    }).collect();
+
+    Ok(Json(json!({ "memories": results, "total": results.len() })))
+}
+
+/// GET /outdoor/seasonal-guide — best activities for current location + season
+pub async fn get_seasonal_guide(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let _user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let city = params.get("city").cloned().unwrap_or_default();
+    let month = chrono::Utc::now().format("%m").to_string().parse::<i32>().unwrap_or(1);
+
+    // Get weather stats for this city/month
+    let stats = sqlx::query_as::<_, (Option<f64>, Option<i32>, Option<f64>, Option<String>, Option<String>)>(
+        "SELECT avg_temp_c, avg_humidity, avg_rainfall_mm, best_activity, weather_rating FROM location_weather_stats WHERE city = $1 AND month = $2"
+    ).bind(&city).bind(month).fetch_optional(&state.db).await?;
+
+    // Get top spots for this season
+    let seasonal_spots = sqlx::query_as::<_, (i64, String, String, Option<String>, f64, bool, bool)>(
+        r#"SELECT id, name, category, difficulty, avg_rating, sunset_viewpoint, sunrise_viewpoint
+           FROM outdoor_spots WHERE city = $1 AND best_months @> $2::jsonb
+           ORDER BY avg_rating DESC LIMIT 10"#,
+    ).bind(&city).bind(serde_json::json!([month])).fetch_all(&state.db).await?;
+
+    let spots: Vec<Value> = seasonal_spots.into_iter().map(|s| json!({
+        "id": s.0, "name": s.1, "category": s.2, "difficulty": s.3,
+        "rating": s.4, "sunset": s.5, "sunrise": s.6
+    })).collect();
+
+    let season = match month {
+        1..=2 | 12 => "winter",
+        3..=5 => "spring",
+        6..=9 => "monsoon",
+        10..=11 => "autumn",
+        _ => "unknown",
+    };
+
+    Ok(Json(json!({
+        "city": city, "month": month, "season": season,
+        "weather": stats.as_ref().map(|s| json!({
+            "avg_temp_c": s.0, "humidity": s.1, "rainfall_mm": s.2,
+            "best_activity": s.3, "rating": s.4
+        })),
+        "recommended_spots": spots,
+        "tips": match season {
+            "winter" => "Perfect for sunrise treks and long hikes. Cool temperatures, clear skies.",
+            "spring" => "Best season for outdoor photos. Wildflowers blooming, pleasant weather.",
+            "monsoon" => "Waterfalls are spectacular but trails may be slippery. Carry rain gear.",
+            "autumn" => "Golden hour photography is stunning. Cool evenings perfect for sunset spots.",
+            _ => "Check local conditions before heading out."
+        }
+    })))
+}
+
+// ============================================================================
 // Contact Matching
 // ============================================================================
 

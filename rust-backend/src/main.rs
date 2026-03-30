@@ -116,6 +116,8 @@ use handlers::{
     connect_account, get_connected_accounts,
     // Fitness
     sync_fitness, get_fitness_profile, create_fitness_challenge, get_fitness_challenges,
+    // Outdoor Spots + Weather + Memories
+    get_outdoor_spots, create_outdoor_spot, log_spot_visit, get_spot_memories, get_seasonal_guide,
     // Contacts
     sync_contacts,
     // Privacy
@@ -874,6 +876,12 @@ async fn main() {
         .route("/fitness/profile", get(get_fitness_profile))
         .route("/fitness/challenge", post(create_fitness_challenge))
         .route("/fitness/challenges", get(get_fitness_challenges))
+        // Outdoor Spots + Weather + Memories
+        .route("/outdoor/spots", get(get_outdoor_spots))
+        .route("/outdoor/spots", post(create_outdoor_spot))
+        .route("/outdoor/visit", post(log_spot_visit))
+        .route("/outdoor/memories", get(get_spot_memories))
+        .route("/outdoor/seasonal-guide", get(get_seasonal_guide))
         // Contacts
         .route("/contacts/sync", post(sync_contacts))
         // Privacy
