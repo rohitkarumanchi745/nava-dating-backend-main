@@ -4532,6 +4532,21 @@ pub async fn create_outdoor_spot(
     .bind(user_id)
     .fetch_one(&state.db).await?;
 
+    // Graph: user created outdoor_spot
+    {
+        let db = state.db.clone();
+        let uid = user_id.to_string();
+        let sid = id.to_string();
+        tokio::spawn(async move {
+            let _ = sqlx::query("INSERT INTO graph_nodes (node_type, node_id, properties) VALUES ('outdoor_spot', $1, '{}') ON CONFLICT DO NOTHING")
+                .bind(&sid).execute(&db).await;
+            let _ = sqlx::query("INSERT INTO graph_edge_links_fwd (from_type, from_id, edge_type, to_type, to_id) VALUES ('user', $1, 'created_spot', 'outdoor_spot', $2) ON CONFLICT DO NOTHING")
+                .bind(&uid).bind(&sid).execute(&db).await;
+            let _ = sqlx::query("INSERT INTO graph_edge_links_rev (to_type, to_id, edge_type, from_type, from_id) VALUES ('outdoor_spot', $2, 'created_spot', 'user', $1) ON CONFLICT DO NOTHING")
+                .bind(&uid).bind(&sid).execute(&db).await;
+        });
+    }
+
     Ok(Json(json!({ "spot_id": id })))
 }
 
@@ -4581,6 +4596,23 @@ pub async fn log_spot_visit(
                 "UPDATE outdoor_spots SET avg_rating = (avg_rating * visit_count + $1) / (visit_count + 1) WHERE id = $2"
             ).bind(rating as f64).bind(sid).execute(&state.db).await?;
         }
+    }
+
+    // Graph: user visited outdoor_spot
+    if let Some(sid) = spot_id {
+        let db = state.db.clone();
+        let uid = user_id.to_string();
+        let sid_str = sid.to_string();
+        tokio::spawn(async move {
+            let _ = sqlx::query("INSERT INTO graph_nodes (node_type, node_id, properties) VALUES ('user', $1, '{}') ON CONFLICT DO NOTHING")
+                .bind(&uid).execute(&db).await;
+            let _ = sqlx::query("INSERT INTO graph_nodes (node_type, node_id, properties) VALUES ('outdoor_spot', $1, '{}') ON CONFLICT DO NOTHING")
+                .bind(&sid_str).execute(&db).await;
+            let _ = sqlx::query("INSERT INTO graph_edge_links_fwd (from_type, from_id, edge_type, to_type, to_id) VALUES ('user', $1, 'visited_spot', 'outdoor_spot', $2) ON CONFLICT DO NOTHING")
+                .bind(&uid).bind(&sid_str).execute(&db).await;
+            let _ = sqlx::query("INSERT INTO graph_edge_links_rev (to_type, to_id, edge_type, from_type, from_id) VALUES ('outdoor_spot', $2, 'visited_spot', 'user', $1) ON CONFLICT DO NOTHING")
+                .bind(&uid).bind(&sid_str).execute(&db).await;
+        });
     }
 
     Ok(Json(json!({ "visit_id": id })))
