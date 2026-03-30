@@ -4883,6 +4883,222 @@ pub async fn get_map_user_interests(
     })))
 }
 
+// ============================================================================
+// Journey Tracking + Next-Place Recommendation
+// ============================================================================
+
+/// POST /journey/start — begin tracking a journey session
+pub async fn start_journey(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let session_id = payload["session_id"].as_str()
+        .unwrap_or(&Uuid::new_v4().to_string()).to_string();
+    let city = payload["city"].as_str().map(|s| s.to_string());
+    let weather = payload["weather_condition"].as_str().map(|s| s.to_string());
+
+    let id = sqlx::query_scalar::<_, i64>(
+        r#"INSERT INTO user_journeys (user_id, session_id, city, weather_condition)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (user_id, session_id) DO UPDATE SET started_at = NOW()
+           RETURNING id"#,
+    ).bind(user_id).bind(&session_id).bind(&city).bind(&weather)
+    .fetch_one(&state.db).await?;
+
+    Ok(Json(json!({ "journey_id": id, "session_id": session_id })))
+}
+
+/// POST /journey/stop — log arriving at a new place in the journey
+pub async fn log_journey_stop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let journey_id = payload["journey_id"].as_i64()
+        .ok_or_else(|| AppError::bad_request("Missing 'journey_id'"))?;
+    let place_name = payload["place_name"].as_str().map(|s| s.to_string());
+    let category = payload["category"].as_str().map(|s| s.to_string());
+    let lat = payload["latitude"].as_f64().unwrap_or(0.0);
+    let lng = payload["longitude"].as_f64().unwrap_or(0.0);
+    let weather_temp = payload["weather_temp_c"].as_f64();
+    let weather_cond = payload["weather_condition"].as_str().map(|s| s.to_string());
+    let calories = payload["calories"].as_f64();
+    let label = payload["activity_label"].as_str().map(|s| s.to_string());
+
+    // Get previous stop to calculate distance + transition time
+    let prev = sqlx::query_as::<_, (i32, f64, f64, Option<chrono::NaiveDateTime>, Option<String>)>(
+        r#"SELECT stop_order, latitude, longitude, arrived_at, place_category
+           FROM journey_stops WHERE journey_id = $1 ORDER BY stop_order DESC LIMIT 1"#,
+    ).bind(journey_id).fetch_optional(&state.db).await?;
+
+    let (stop_order, dist_from_prev, prev_category) = match &prev {
+        Some(p) => {
+            let dist = haversine_km(p.1, p.2, lat, lng);
+            (p.0 + 1, Some(dist), p.4.clone())
+        }
+        None => (1, None, None),
+    };
+
+    // Update previous stop's departure time
+    if prev.is_some() {
+        sqlx::query("UPDATE journey_stops SET departed_at = NOW(), dwell_time_min = EXTRACT(EPOCH FROM (NOW() - arrived_at)) / 60.0 WHERE journey_id = $1 AND stop_order = $2")
+            .bind(journey_id).bind(stop_order - 1).execute(&state.db).await?;
+    }
+
+    let stop_id = sqlx::query_scalar::<_, i64>(
+        r#"INSERT INTO journey_stops (journey_id, user_id, stop_order, place_name, place_category,
+                  latitude, longitude, distance_from_prev_km, calories_at_stop,
+                  weather_temp_c, weather_condition, labeled_activity)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id"#,
+    )
+    .bind(journey_id).bind(user_id).bind(stop_order).bind(&place_name).bind(&category)
+    .bind(lat).bind(lng).bind(dist_from_prev).bind(calories)
+    .bind(weather_temp).bind(&weather_cond).bind(&label)
+    .fetch_one(&state.db).await?;
+
+    // Update journey totals
+    sqlx::query(
+        r#"UPDATE user_journeys SET total_stops = $1,
+           total_distance_km = total_distance_km + COALESCE($2, 0),
+           ended_at = NOW() WHERE id = $3"#,
+    ).bind(stop_order).bind(dist_from_prev).bind(journey_id).execute(&state.db).await?;
+
+    // Update transition patterns (from_category → to_category)
+    if let (Some(from_cat), Some(ref to_cat)) = (prev_category, &category) {
+        let now = chrono::Utc::now();
+        let time_of_day = match now.format("%H").to_string().parse::<i32>().unwrap_or(12) {
+            5..=8 => "morning", 9..=12 => "midday", 13..=17 => "afternoon", 18..=21 => "evening", _ => "night"
+        };
+        let season = match now.format("%m").to_string().parse::<i32>().unwrap_or(1) {
+            1..=2 | 12 => "winter", 3..=5 => "spring", 6..=9 => "monsoon", _ => "autumn"
+        };
+
+        let db = state.db.clone();
+        let fc = from_cat.clone();
+        let tc = to_cat.clone();
+        let dist = dist_from_prev;
+        let tod = time_of_day.to_string();
+        let ssn = season.to_string();
+        tokio::spawn(async move {
+            let _ = sqlx::query(
+                r#"INSERT INTO journey_patterns (from_category, to_category, transition_count, avg_distance_km, city, time_of_day, season)
+                   VALUES ($1, $2, 1, $3, $4, $5, $6)
+                   ON CONFLICT DO NOTHING"#,
+            ).bind(&fc).bind(&tc).bind(dist).bind::<Option<String>>(None).bind(&tod).bind(&ssn)
+            .execute(&db).await;
+        });
+    }
+
+    Ok(Json(json!({ "stop_id": stop_id, "stop_order": stop_order, "distance_from_prev_km": dist_from_prev })))
+}
+
+/// GET /journey/recommend-next — "where should I go next?" based on patterns
+pub async fn recommend_next_place(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let current_category = params.get("category").cloned().unwrap_or_default();
+    let lat: f64 = params.get("lat").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let lng: f64 = params.get("lng").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+
+    // What do people usually do AFTER this category?
+    let patterns = sqlx::query_as::<_, (String, i32, Option<f64>)>(
+        r#"SELECT to_category, SUM(transition_count) as total, AVG(avg_distance_km) as avg_dist
+           FROM journey_patterns WHERE from_category = $1
+           GROUP BY to_category ORDER BY total DESC LIMIT 5"#,
+    ).bind(&current_category).fetch_all(&state.db).await?;
+
+    // What does THIS USER usually do after this category?
+    let personal = sqlx::query_as::<_, (Option<String>, i64)>(
+        r#"SELECT js2.place_category, COUNT(*) as cnt
+           FROM journey_stops js1
+           JOIN journey_stops js2 ON js1.journey_id = js2.journey_id AND js2.stop_order = js1.stop_order + 1
+           WHERE js1.user_id = $1 AND js1.place_category = $2 AND js2.place_category IS NOT NULL
+           GROUP BY js2.place_category ORDER BY cnt DESC LIMIT 3"#,
+    ).bind(user_id).bind(&current_category).fetch_all(&state.db).await?;
+
+    // Find actual places nearby matching the top next categories
+    let top_next = patterns.first().map(|p| p.0.clone()).unwrap_or("cafe".to_string());
+
+    let nearby_places = sqlx::query_as::<_, (i64, String, Option<String>, f64, f64, f64)>(
+        r#"SELECT id, name, category, latitude, longitude, avg_rating
+           FROM outdoor_spots
+           WHERE category = $1 AND ABS(latitude - $2) < 0.1 AND ABS(longitude - $3) < 0.1
+           ORDER BY avg_rating DESC LIMIT 5"#,
+    ).bind(&top_next).bind(lat).bind(lng).fetch_all(&state.db).await?;
+
+    let pattern_list: Vec<Value> = patterns.into_iter().map(|p| {
+        let total: i32 = p.1;
+        json!({
+            "next_category": p.0, "times_observed": total,
+            "avg_distance_km": p.2.map(|d| format!("{:.1}", d)),
+            "label": format!("{}% of people go to {} after {}",
+                (total as f64 / total.max(1) as f64 * 100.0) as i32, p.0, current_category)
+        })
+    }).collect();
+
+    let personal_list: Vec<Value> = personal.into_iter().map(|p| json!({
+        "category": p.0, "your_count": p.1
+    })).collect();
+
+    let place_list: Vec<Value> = nearby_places.into_iter().map(|p| json!({
+        "id": p.0, "name": p.1, "category": p.2, "latitude": p.3, "longitude": p.4, "rating": p.5
+    })).collect();
+
+    Ok(Json(json!({
+        "current": current_category,
+        "global_patterns": pattern_list,
+        "your_patterns": personal_list,
+        "recommended_places": place_list,
+        "suggestion": format!("After {}, people usually visit a {}. Here are some nearby:", current_category, top_next)
+    })))
+}
+
+/// GET /journey/history — user's past journeys
+pub async fn get_journey_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let journeys = sqlx::query_as::<_, (i64, String, Option<String>, i32, Option<f64>, chrono::NaiveDateTime)>(
+        r#"SELECT id, session_id, city, total_stops, total_distance_km, started_at
+           FROM user_journeys WHERE user_id = $1 ORDER BY started_at DESC LIMIT 20"#,
+    ).bind(user_id).fetch_all(&state.db).await?;
+
+    let mut results = Vec::new();
+    for j in journeys {
+        let stops = sqlx::query_as::<_, (i32, Option<String>, Option<String>, f64, f64, Option<f64>)>(
+            r#"SELECT stop_order, place_name, place_category, latitude, longitude, dwell_time_min
+               FROM journey_stops WHERE journey_id = $1 ORDER BY stop_order"#,
+        ).bind(j.0).fetch_all(&state.db).await?;
+
+        let stop_list: Vec<Value> = stops.into_iter().map(|s| json!({
+            "order": s.0, "name": s.1, "category": s.2,
+            "lat": s.3, "lng": s.4, "dwell_min": s.5.map(|d| d as i32)
+        })).collect();
+
+        results.push(json!({
+            "id": j.0, "city": j.2, "stops": j.3, "distance_km": j.4.map(|d| format!("{:.1}", d)),
+            "date": format_datetime(j.5), "route": stop_list
+        }));
+    }
+
+    Ok(Json(json!({ "journeys": results })))
+}
+
 /// GET /outdoor/location-activity — who posted content at a location + weather/time patterns
 pub async fn get_location_activity(
     State(state): State<AppState>,

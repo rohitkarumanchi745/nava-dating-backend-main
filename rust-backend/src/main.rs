@@ -119,6 +119,7 @@ use handlers::{
     // Outdoor Spots + Weather + Memories
     get_outdoor_spots, create_outdoor_spot, log_spot_visit, get_spot_memories, get_seasonal_guide, get_location_activity,
     track_map_search, get_map_trending, get_map_user_interests,
+    start_journey, log_journey_stop, recommend_next_place, get_journey_history,
     // Contacts
     sync_contacts,
     // Privacy
@@ -884,6 +885,11 @@ async fn main() {
         .route("/outdoor/memories", get(get_spot_memories))
         .route("/outdoor/seasonal-guide", get(get_seasonal_guide))
         .route("/outdoor/location-activity", get(get_location_activity))
+        // Journey Tracking
+        .route("/journey/start", post(start_journey))
+        .route("/journey/stop", post(log_journey_stop))
+        .route("/journey/recommend-next", get(recommend_next_place))
+        .route("/journey/history", get(get_journey_history))
         // Map Search Intelligence
         .route("/map/search", post(track_map_search))
         .route("/map/trending", get(get_map_trending))
