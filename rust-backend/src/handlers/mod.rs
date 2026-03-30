@@ -4722,6 +4722,167 @@ pub async fn get_seasonal_guide(
     })))
 }
 
+/// POST /map/search — track what user searches on map
+pub async fn track_map_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let query = payload["query"].as_str().map(|s| s.to_string());
+    let category = payload["category"].as_str().map(|s| s.to_string());
+    let result_name = payload["result_name"].as_str().map(|s| s.to_string());
+    let result_lat = payload["result_latitude"].as_f64();
+    let result_lng = payload["result_longitude"].as_f64();
+    let user_lat = payload["user_latitude"].as_f64();
+    let user_lng = payload["user_longitude"].as_f64();
+    let selected = payload["selected"].as_bool().unwrap_or(false);
+    let navigated = payload["navigated"].as_bool().unwrap_or(false);
+    let source = payload["source"].as_str().unwrap_or("map");
+
+    // Calculate distance if both positions available
+    let distance = match (user_lat, user_lng, result_lat, result_lng) {
+        (Some(ul), Some(uln), Some(rl), Some(rln)) => Some(haversine_km(ul, uln, rl, rln)),
+        _ => None,
+    };
+
+    let id = sqlx::query_scalar::<_, i64>(
+        r#"INSERT INTO user_map_searches (user_id, search_query, search_category, result_name,
+                  result_latitude, result_longitude, user_latitude, user_longitude,
+                  distance_from_user_km, selected, navigated, source)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id"#,
+    )
+    .bind(user_id).bind(&query).bind(&category).bind(&result_name)
+    .bind(result_lat).bind(result_lng).bind(user_lat).bind(user_lng)
+    .bind(distance).bind(selected).bind(navigated).bind(source)
+    .fetch_one(&state.db).await?;
+
+    Ok(Json(json!({ "tracked": true, "id": id })))
+}
+
+/// GET /map/trending — what people are searching for near a location
+pub async fn get_map_trending(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let _user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let lat: f64 = params.get("lat").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let lng: f64 = params.get("lng").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+
+    // Top searched places near this location
+    let trending_places = sqlx::query_as::<_, (Option<String>, f64, f64, i64, i64)>(
+        r#"SELECT result_name, AVG(result_latitude) as lat, AVG(result_longitude) as lng,
+                  COUNT(*) as search_count, COUNT(DISTINCT user_id) as unique_users
+           FROM user_map_searches
+           WHERE result_latitude IS NOT NULL
+             AND ABS(result_latitude - $1) < 0.2 AND ABS(result_longitude - $2) < 0.2
+             AND searched_at > NOW() - INTERVAL '30 days'
+             AND result_name IS NOT NULL
+           GROUP BY result_name
+           ORDER BY search_count DESC LIMIT 15"#,
+    ).bind(lat).bind(lng).fetch_all(&state.db).await?;
+
+    let places: Vec<Value> = trending_places.into_iter().map(|p| json!({
+        "name": p.0, "latitude": p.1, "longitude": p.2,
+        "searches": p.3, "unique_users": p.4
+    })).collect();
+
+    // Top search categories
+    let categories = sqlx::query_as::<_, (Option<String>, i64)>(
+        r#"SELECT search_category, COUNT(*) as cnt
+           FROM user_map_searches
+           WHERE user_latitude IS NOT NULL
+             AND ABS(user_latitude - $1) < 0.2 AND ABS(user_longitude - $2) < 0.2
+             AND searched_at > NOW() - INTERVAL '30 days'
+             AND search_category IS NOT NULL
+           GROUP BY search_category ORDER BY cnt DESC LIMIT 10"#,
+    ).bind(lat).bind(lng).fetch_all(&state.db).await?;
+
+    let cat_list: Vec<Value> = categories.into_iter().map(|c| json!({
+        "category": c.0, "searches": c.1
+    })).collect();
+
+    // Top search queries
+    let queries = sqlx::query_as::<_, (Option<String>, i64)>(
+        r#"SELECT search_query, COUNT(*) as cnt
+           FROM user_map_searches
+           WHERE user_latitude IS NOT NULL
+             AND ABS(user_latitude - $1) < 0.2 AND ABS(user_longitude - $2) < 0.2
+             AND searched_at > NOW() - INTERVAL '7 days'
+             AND search_query IS NOT NULL
+           GROUP BY search_query ORDER BY cnt DESC LIMIT 10"#,
+    ).bind(lat).bind(lng).fetch_all(&state.db).await?;
+
+    let query_list: Vec<Value> = queries.into_iter().map(|q| json!({
+        "query": q.0, "searches": q.1
+    })).collect();
+
+    Ok(Json(json!({
+        "trending_places": places,
+        "popular_categories": cat_list,
+        "recent_searches_nearby": query_list
+    })))
+}
+
+/// GET /map/user-interests — what THIS user typically searches for (ML personalization)
+pub async fn get_map_user_interests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // User's top search categories
+    let categories = sqlx::query_as::<_, (Option<String>, i64)>(
+        r#"SELECT search_category, COUNT(*) as cnt
+           FROM user_map_searches WHERE user_id = $1 AND search_category IS NOT NULL
+           GROUP BY search_category ORDER BY cnt DESC LIMIT 10"#,
+    ).bind(user_id).fetch_all(&state.db).await?;
+
+    // User's frequently searched places
+    let fav_places = sqlx::query_as::<_, (Option<String>, f64, f64, i64)>(
+        r#"SELECT result_name, AVG(result_latitude), AVG(result_longitude), COUNT(*) as visits
+           FROM user_map_searches WHERE user_id = $1 AND selected = true AND result_name IS NOT NULL
+           GROUP BY result_name ORDER BY visits DESC LIMIT 10"#,
+    ).bind(user_id).fetch_all(&state.db).await?;
+
+    // Average search distance (how far does user explore?)
+    let avg_dist = sqlx::query_scalar::<_, Option<f64>>(
+        "SELECT AVG(distance_from_user_km) FROM user_map_searches WHERE user_id = $1 AND distance_from_user_km IS NOT NULL"
+    ).bind(user_id).fetch_one(&state.db).await?;
+
+    // Search time patterns
+    let time_patterns = sqlx::query_as::<_, (i32, i64)>(
+        r#"SELECT EXTRACT(HOUR FROM searched_at)::int as hour, COUNT(*) as cnt
+           FROM user_map_searches WHERE user_id = $1
+           GROUP BY hour ORDER BY cnt DESC LIMIT 5"#,
+    ).bind(user_id).fetch_all(&state.db).await?;
+
+    let cat_list: Vec<Value> = categories.into_iter().map(|c| json!({ "category": c.0, "count": c.1 })).collect();
+    let place_list: Vec<Value> = fav_places.into_iter().map(|p| json!({ "name": p.0, "lat": p.1, "lng": p.2, "visits": p.3 })).collect();
+    let time_list: Vec<Value> = time_patterns.into_iter().map(|t| json!({ "hour": t.0, "searches": t.1 })).collect();
+
+    let explorer_type = match avg_dist.flatten().unwrap_or(5.0) {
+        d if d < 3.0 => "local",
+        d if d < 15.0 => "explorer",
+        d if d < 50.0 => "adventurer",
+        _ => "nomad",
+    };
+
+    Ok(Json(json!({
+        "top_categories": cat_list,
+        "favorite_places": place_list,
+        "avg_search_distance_km": avg_dist.flatten().map(|d| format!("{:.1}", d)),
+        "explorer_type": explorer_type,
+        "search_time_patterns": time_list
+    })))
+}
+
 /// GET /outdoor/location-activity — who posted content at a location + weather/time patterns
 pub async fn get_location_activity(
     State(state): State<AppState>,

@@ -118,6 +118,7 @@ use handlers::{
     sync_fitness, get_fitness_profile, create_fitness_challenge, get_fitness_challenges,
     // Outdoor Spots + Weather + Memories
     get_outdoor_spots, create_outdoor_spot, log_spot_visit, get_spot_memories, get_seasonal_guide, get_location_activity,
+    track_map_search, get_map_trending, get_map_user_interests,
     // Contacts
     sync_contacts,
     // Privacy
@@ -883,6 +884,10 @@ async fn main() {
         .route("/outdoor/memories", get(get_spot_memories))
         .route("/outdoor/seasonal-guide", get(get_seasonal_guide))
         .route("/outdoor/location-activity", get(get_location_activity))
+        // Map Search Intelligence
+        .route("/map/search", post(track_map_search))
+        .route("/map/trending", get(get_map_trending))
+        .route("/map/interests", get(get_map_user_interests))
         // Contacts
         .route("/contacts/sync", post(sync_contacts))
         // Privacy
