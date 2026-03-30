@@ -4294,7 +4294,7 @@ pub async fn get_fitness_profile(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, AppError> {
     let token = extract_bearer_token(&headers)?;
-    let _user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let _user_id = decode_access_token(&token, &state.config.secret_key)? as i64;
     let target_id: i64 = params.get("user_id").and_then(|v| v.parse().ok()).unwrap_or(_user_id);
 
     // Check privacy
@@ -4364,7 +4364,7 @@ pub async fn get_fitness_challenges(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let token = extract_bearer_token(&headers)?;
-    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)? as i64;
 
     let challenges = sqlx::query_as::<_, (i64, i64, Option<i64>, String, f64, String, f64, f64, Option<chrono::NaiveDateTime>, String)>(
         r#"SELECT id, creator_id, partner_id, challenge_type, target_value, target_unit,
@@ -4411,7 +4411,15 @@ pub async fn get_outdoor_spots(
     let current_month = now.format("%m").to_string().parse::<i32>().unwrap_or(1);
     let current_hour = now.format("%H").to_string().parse::<i32>().unwrap_or(12);
 
-    let spots = sqlx::query_as::<_, (i64, String, Option<String>, String, f64, f64, Option<String>, Option<i32>, Option<String>, Option<f64>, Option<serde_json::Value>, Option<String>, bool, bool, bool, f64, i32)>(
+    #[derive(sqlx::FromRow)]
+    struct OutdoorSpotRow {
+        id: i64, name: String, description: Option<String>, category: String,
+        latitude: f64, longitude: f64, city: Option<String>, elevation_m: Option<i32>,
+        difficulty: Option<String>, distance_km: Option<f64>, best_months: Option<serde_json::Value>,
+        best_time_of_day: Option<String>, photo_golden_hour: bool, sunset_viewpoint: bool,
+        sunrise_viewpoint: bool, avg_rating: f64, visit_count: i32,
+    }
+    let spots = sqlx::query_as::<_, OutdoorSpotRow>(
         r#"SELECT id, name, description, category, latitude, longitude, city, elevation_m, difficulty,
                   distance_km, best_months, best_time_of_day, photo_golden_hour, sunset_viewpoint,
                   sunrise_viewpoint, avg_rating, visit_count
@@ -4431,19 +4439,19 @@ pub async fn get_outdoor_spots(
 
         // Distance score (+25%)
         if lat != 0.0 {
-            let dist = haversine_km(lat, lng, s.4, s.5);
+            let dist = haversine_km(lat, lng, s.latitude, s.longitude);
             score += 0.25 * (1.0 / (1.0 + dist / 20.0));
         }
 
-        // Seasonal match (+25%) — is current month in best_months?
-        if let Some(ref months) = s.10 {
+        // Seasonal match (+25%)
+        if let Some(ref months) = s.best_months {
             if let Ok(month_list) = serde_json::from_value::<Vec<i32>>(months.clone()) {
                 if month_list.contains(&current_month) { score += 0.25; }
             }
         }
 
         // Time of day match (+20%)
-        let time_match = match s.11.as_deref() {
+        let time_match = match s.best_time_of_day.as_deref() {
             Some("sunrise") => current_hour >= 5 && current_hour <= 8,
             Some("sunset") => current_hour >= 16 && current_hour <= 19,
             Some("morning") => current_hour >= 6 && current_hour <= 11,
@@ -4454,35 +4462,30 @@ pub async fn get_outdoor_spots(
 
         // Golden hour photo spot bonus
         let is_golden = (current_hour >= 6 && current_hour <= 8) || (current_hour >= 17 && current_hour <= 19);
-        if s.12 && is_golden { score += 0.10; }
+        if s.photo_golden_hour && is_golden { score += 0.10; }
 
-        // Rating (+10%)
-        score += 0.10 * (s.15 / 5.0);
+        score += 0.10 * (s.avg_rating / 5.0);
+        score += 0.10 * (s.visit_count as f64 / (s.visit_count as f64 + 50.0));
 
-        // Popularity (+10%)
-        score += 0.10 * (s.16 as f64 / (s.16 as f64 + 50.0));
-
-        // Check for memories (user visited before)
+        // Check for memories
         let memory = past_visits.iter().find(|v| {
-            v.0 == Some(s.0) || (v.5.is_some() && (v.5.unwrap() - s.4).abs() < 0.01)
+            v.0 == Some(s.id) || (v.5.is_some() && (v.5.unwrap() - s.latitude).abs() < 0.01)
         });
-
         let memory_data = memory.map(|m| json!({
             "visited_at": m.4.map(format_datetime),
             "calories_burned": m.2.map(|v| v as i32),
             "duration_min": m.3.map(|v| v as i32),
             "has_memory": true
         }));
-
-        if memory.is_some() { score += 0.05; } // revisit bonus
+        if memory.is_some() { score += 0.05; }
 
         let val = json!({
-            "id": s.0, "name": s.1, "description": s.2, "category": s.3,
-            "latitude": s.4, "longitude": s.5, "city": s.6,
-            "elevation_m": s.7, "difficulty": s.8, "distance_km": s.9,
-            "best_time": s.11, "photo_golden_hour": s.12,
-            "sunset_viewpoint": s.13, "sunrise_viewpoint": s.14,
-            "rating": s.15, "visits": s.16,
+            "id": s.id, "name": s.name, "description": s.description, "category": s.category,
+            "latitude": s.latitude, "longitude": s.longitude, "city": s.city,
+            "elevation_m": s.elevation_m, "difficulty": s.difficulty, "distance_km": s.distance_km,
+            "best_time": s.best_time_of_day, "photo_golden_hour": s.photo_golden_hour,
+            "sunset_viewpoint": s.sunset_viewpoint, "sunrise_viewpoint": s.sunrise_viewpoint,
+            "rating": s.avg_rating, "visits": s.visit_count,
             "relevance_score": (score * 100.0) as i32,
             "is_golden_hour_now": is_golden,
             "is_best_season": score > 0.2,
@@ -4867,7 +4870,7 @@ pub async fn get_map_user_interests(
     let place_list: Vec<Value> = fav_places.into_iter().map(|p| json!({ "name": p.0, "lat": p.1, "lng": p.2, "visits": p.3 })).collect();
     let time_list: Vec<Value> = time_patterns.into_iter().map(|t| json!({ "hour": t.0, "searches": t.1 })).collect();
 
-    let explorer_type = match avg_dist.flatten().unwrap_or(5.0) {
+    let explorer_type = match avg_dist.unwrap_or(5.0) {
         d if d < 3.0 => "local",
         d if d < 15.0 => "explorer",
         d if d < 50.0 => "adventurer",
