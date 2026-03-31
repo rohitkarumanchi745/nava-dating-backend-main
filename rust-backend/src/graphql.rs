@@ -776,12 +776,14 @@ impl QueryRoot {
     }
 
     /// Get conversation messages for a match
+    /// Pass `since` (ISO 8601 timestamp) to get only messages after that time (for offline sync)
     async fn conversation(
         &self,
         ctx: &Context<'_>,
         match_id: String,
         limit: Option<i32>,
         offset: Option<i32>,
+        since: Option<String>,
     ) -> Result<Vec<Message>> {
         let state = ctx.data::<AppState>()?;
         let user_id = get_user_id_from_context(ctx)?;
@@ -798,20 +800,41 @@ impl QueryRoot {
             return Err(Error::new("Not authorized to view this conversation"));
         }
 
-        let rows = sqlx::query_as::<_, MessageRow>(
-            r#"
-            SELECT id, match_id, sender_id, receiver_id, content, created_at, is_read
-            FROM messages
-            WHERE match_id = $1
-            ORDER BY created_at ASC
-            LIMIT $2 OFFSET $3
-            "#,
-        )
-        .bind(&match_id)
-        .bind(limit.unwrap_or(100))
-        .bind(offset.unwrap_or(0))
-        .fetch_all(&state.db)
-        .await?;
+        let since_ts = since.as_deref()
+            .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok()
+                .or_else(|| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok()));
+
+        let rows = if let Some(ts) = since_ts {
+            sqlx::query_as::<_, MessageRow>(
+                r#"
+                SELECT id, match_id, sender_id, receiver_id, content, created_at, is_read
+                FROM messages
+                WHERE match_id = $1 AND created_at > $2
+                ORDER BY created_at ASC
+                LIMIT $3
+                "#,
+            )
+            .bind(&match_id)
+            .bind(ts)
+            .bind(limit.unwrap_or(500))
+            .fetch_all(&state.db)
+            .await?
+        } else {
+            sqlx::query_as::<_, MessageRow>(
+                r#"
+                SELECT id, match_id, sender_id, receiver_id, content, created_at, is_read
+                FROM messages
+                WHERE match_id = $1
+                ORDER BY created_at ASC
+                LIMIT $2 OFFSET $3
+                "#,
+            )
+            .bind(&match_id)
+            .bind(limit.unwrap_or(100))
+            .bind(offset.unwrap_or(0))
+            .fetch_all(&state.db)
+            .await?
+        };
 
         Ok(rows.into_iter().map(|r| Message {
             id: r.id,

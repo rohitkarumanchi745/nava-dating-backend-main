@@ -3490,21 +3490,36 @@ pub async fn get_spots_feed(
     Ok(Json(json!({ "spots": results })))
 }
 
-/// GET /spots/:id/messages
+/// GET /spots/:id/messages?since=2024-01-01T00:00:00
 pub async fn get_spot_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(spot_id): AxumPath<i64>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, AppError> {
     let token = extract_bearer_token(&headers)?;
     let _user_id = decode_access_token(&token, &state.config.secret_key)?;
 
-    let msgs = sqlx::query_as::<_, SpotMessageRow>(
-        "SELECT id, spot_id, sender_id, text, created_at FROM spot_messages WHERE spot_id = $1 ORDER BY created_at ASC LIMIT 100"
-    )
-    .bind(spot_id)
-    .fetch_all(&state.db)
-    .await?;
+    let since = params.get("since").and_then(|s|
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok()
+            .or_else(|| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok()));
+
+    let msgs = if let Some(since_ts) = since {
+        sqlx::query_as::<_, SpotMessageRow>(
+            "SELECT id, spot_id, sender_id, text, created_at FROM spot_messages WHERE spot_id = $1 AND created_at > $2 ORDER BY created_at ASC LIMIT 500"
+        )
+        .bind(spot_id)
+        .bind(since_ts)
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        sqlx::query_as::<_, SpotMessageRow>(
+            "SELECT id, spot_id, sender_id, text, created_at FROM spot_messages WHERE spot_id = $1 ORDER BY created_at ASC LIMIT 100"
+        )
+        .bind(spot_id)
+        .fetch_all(&state.db)
+        .await?
+    };
 
     let results: Vec<Value> = msgs.into_iter().map(|m| {
         json!({ "id": m.id, "spot_id": m.spot_id, "sender_id": m.sender_id, "text": m.text, "created_at": m.created_at.map(format_datetime) })
@@ -7845,6 +7860,9 @@ pub async fn get_reel_inbox(
 
     let limit: i32 = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
     let unread_only = params.get("unread_only").map(|v| v == "true").unwrap_or(false);
+    let since = params.get("since").and_then(|s|
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok()
+            .or_else(|| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok()));
 
     #[derive(sqlx::FromRow, Serialize)]
     struct InboxMsg {
@@ -7853,20 +7871,37 @@ pub async fn get_reel_inbox(
         sender_name: Option<String>, sender_photo: Option<String>, reel_thumbnail: Option<String>,
     }
 
-    let query = if unread_only {
-        r#"SELECT rm.id, rm.reel_id, rm.sender_id, rm.content, rm.message_type, rm.reaction_emoji, rm.is_read, rm.created_at,
-           u.name as sender_name, u.profile_photo_1 as sender_photo, r.thumbnail_url as reel_thumbnail
-           FROM reel_messages rm JOIN users u ON u.id = rm.sender_id JOIN reels r ON r.id = rm.reel_id
-           WHERE rm.receiver_id = $1 AND rm.is_read = FALSE ORDER BY rm.created_at DESC LIMIT $2"#
+    let read_db = state.read_pool();
+
+    let messages = if let Some(since_ts) = since {
+        // Delta sync: only messages after the given timestamp
+        let query = if unread_only {
+            r#"SELECT rm.id, rm.reel_id, rm.sender_id, rm.content, rm.message_type, rm.reaction_emoji, rm.is_read, rm.created_at,
+               u.name as sender_name, u.profile_photo_1 as sender_photo, r.thumbnail_url as reel_thumbnail
+               FROM reel_messages rm JOIN users u ON u.id = rm.sender_id JOIN reels r ON r.id = rm.reel_id
+               WHERE rm.receiver_id = $1 AND rm.is_read = FALSE AND rm.created_at > $3 ORDER BY rm.created_at DESC LIMIT $2"#
+        } else {
+            r#"SELECT rm.id, rm.reel_id, rm.sender_id, rm.content, rm.message_type, rm.reaction_emoji, rm.is_read, rm.created_at,
+               u.name as sender_name, u.profile_photo_1 as sender_photo, r.thumbnail_url as reel_thumbnail
+               FROM reel_messages rm JOIN users u ON u.id = rm.sender_id JOIN reels r ON r.id = rm.reel_id
+               WHERE rm.receiver_id = $1 AND rm.created_at > $3 ORDER BY rm.created_at DESC LIMIT $2"#
+        };
+        sqlx::query_as::<_, InboxMsg>(query).bind(user_id).bind(limit).bind(since_ts).fetch_all(read_db).await?
     } else {
-        r#"SELECT rm.id, rm.reel_id, rm.sender_id, rm.content, rm.message_type, rm.reaction_emoji, rm.is_read, rm.created_at,
-           u.name as sender_name, u.profile_photo_1 as sender_photo, r.thumbnail_url as reel_thumbnail
-           FROM reel_messages rm JOIN users u ON u.id = rm.sender_id JOIN reels r ON r.id = rm.reel_id
-           WHERE rm.receiver_id = $1 ORDER BY rm.created_at DESC LIMIT $2"#
+        let query = if unread_only {
+            r#"SELECT rm.id, rm.reel_id, rm.sender_id, rm.content, rm.message_type, rm.reaction_emoji, rm.is_read, rm.created_at,
+               u.name as sender_name, u.profile_photo_1 as sender_photo, r.thumbnail_url as reel_thumbnail
+               FROM reel_messages rm JOIN users u ON u.id = rm.sender_id JOIN reels r ON r.id = rm.reel_id
+               WHERE rm.receiver_id = $1 AND rm.is_read = FALSE ORDER BY rm.created_at DESC LIMIT $2"#
+        } else {
+            r#"SELECT rm.id, rm.reel_id, rm.sender_id, rm.content, rm.message_type, rm.reaction_emoji, rm.is_read, rm.created_at,
+               u.name as sender_name, u.profile_photo_1 as sender_photo, r.thumbnail_url as reel_thumbnail
+               FROM reel_messages rm JOIN users u ON u.id = rm.sender_id JOIN reels r ON r.id = rm.reel_id
+               WHERE rm.receiver_id = $1 ORDER BY rm.created_at DESC LIMIT $2"#
+        };
+        sqlx::query_as::<_, InboxMsg>(query).bind(user_id).bind(limit).fetch_all(read_db).await?
     };
 
-    let read_db = state.read_pool();
-    let messages = sqlx::query_as::<_, InboxMsg>(query).bind(user_id).bind(limit).fetch_all(read_db).await?;
     let unread_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM reel_messages WHERE receiver_id = $1 AND is_read = FALSE").bind(user_id).fetch_one(read_db).await.unwrap_or(0);
 
     Ok(Json(json!({ "messages": messages, "unread_count": unread_count })))
@@ -7979,14 +8014,23 @@ pub async fn get_reel_conversation(
 
     let reel_id: i32 = params.get("reel_id").and_then(|v| v.parse().ok()).ok_or_else(|| AppError::bad_request("reel_id required"))?;
     let other_user: i32 = params.get("other_user_id").and_then(|v| v.parse().ok()).ok_or_else(|| AppError::bad_request("other_user_id required"))?;
+    let since = params.get("since").and_then(|s|
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok()
+            .or_else(|| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok()));
 
     #[derive(sqlx::FromRow, Serialize)]
     struct ConvMsg { id: i32, sender_id: i32, content: String, message_type: Option<String>, is_read: Option<bool>, created_at: Option<NaiveDateTime> }
 
     let read_db = state.read_pool();
-    let messages = sqlx::query_as::<_, ConvMsg>(
-        "SELECT id, sender_id, content, message_type, is_read, created_at FROM reel_messages WHERE reel_id = $1 AND ((sender_id = $2 AND receiver_id = $3) OR (sender_id = $3 AND receiver_id = $2)) ORDER BY created_at ASC"
-    ).bind(reel_id).bind(user_id).bind(other_user).fetch_all(read_db).await?;
+    let messages = if let Some(since_ts) = since {
+        sqlx::query_as::<_, ConvMsg>(
+            "SELECT id, sender_id, content, message_type, is_read, created_at FROM reel_messages WHERE reel_id = $1 AND ((sender_id = $2 AND receiver_id = $3) OR (sender_id = $3 AND receiver_id = $2)) AND created_at > $4 ORDER BY created_at ASC"
+        ).bind(reel_id).bind(user_id).bind(other_user).bind(since_ts).fetch_all(read_db).await?
+    } else {
+        sqlx::query_as::<_, ConvMsg>(
+            "SELECT id, sender_id, content, message_type, is_read, created_at FROM reel_messages WHERE reel_id = $1 AND ((sender_id = $2 AND receiver_id = $3) OR (sender_id = $3 AND receiver_id = $2)) ORDER BY created_at ASC"
+        ).bind(reel_id).bind(user_id).bind(other_user).fetch_all(read_db).await?
+    };
 
     let (user_a, user_b) = if user_id < other_user { (user_id, other_user) } else { (other_user, user_id) };
 
