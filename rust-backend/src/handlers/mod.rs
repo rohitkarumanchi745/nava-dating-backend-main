@@ -7331,15 +7331,56 @@ pub async fn get_reel_feed(
     let now = chrono::Utc::now().naive_utc();
     let mut rng_seed = (user_id as u64).wrapping_mul(now.and_utc().timestamp() as u64);
 
+    // ── Graph signals: which creators did users-like-me also watch? ──
+    let uid_str = (user_id as i64).to_string();
+    let creator_id_strs: Vec<String> = candidates.iter().map(|r| (r.user_id as i64).to_string()).collect();
+    let graph_creator_scores: std::collections::HashMap<i32, f64> = if !creator_id_strs.is_empty() {
+        sqlx::query_as::<_, (String, i64)>(
+            r#"SELECT f2.from_id, COUNT(*) as shared
+               FROM graph_edge_links_fwd f1
+               JOIN graph_edge_links_fwd f2 ON f1.to_id = f2.to_id AND f1.edge_type = f2.edge_type
+               WHERE f1.from_type = 'user' AND f1.from_id = $1
+                 AND f1.edge_type = 'liked' AND f2.from_type = 'user'
+                 AND f2.from_id = ANY($2) AND f2.from_id != $1
+               GROUP BY f2.from_id"#,
+        )
+        .bind(&uid_str).bind(&creator_id_strs)
+        .fetch_all(read_db).await.unwrap_or_default()
+        .into_iter()
+        .filter_map(|(id, count)| id.parse::<i32>().ok().map(|i| (i, (count as f64 / 5.0).min(1.0))))
+        .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // ── Music signals: does reel creator share music taste? ──
+    let creator_i64s: Vec<i64> = candidates.iter().map(|r| r.user_id as i64).collect();
+    let music_creator_scores: std::collections::HashMap<i32, f64> = if !creator_i64s.is_empty() {
+        sqlx::query_as::<_, (i64, i64)>(
+            r#"SELECT b.user_id, COUNT(*) as shared
+               FROM user_genre_profile a
+               JOIN user_genre_profile b ON a.genre = b.genre
+               WHERE a.user_id = $1 AND b.user_id = ANY($2)
+               GROUP BY b.user_id"#,
+        )
+        .bind(user_id as i64).bind(&creator_i64s)
+        .fetch_all(read_db).await.unwrap_or_default()
+        .into_iter()
+        .map(|(cid, shared)| (cid as i32, (shared as f64 / 5.0).min(1.0)))
+        .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let mut scored: Vec<(f64, usize)> = candidates.iter().enumerate().map(|(idx, r)| {
-        // ── Category affinity (35%) ──
+        // ── Category affinity (25%) ──
         let cat_score = r.category.as_ref()
             .and_then(|c| category_prefs.get(c))
             .copied()
             .unwrap_or(0.0)
             .min(1.0);
 
-        // ── Engagement quality (20%) — normalized watch% + like rate ──
+        // ── Engagement quality (15%) — normalized watch% + like rate ──
         let watch_quality = r.avg_watch_percent.unwrap_or(0.0) / 100.0;
         let like_rate = if r.view_count.unwrap_or(0) > 0 {
             (r.like_count.unwrap_or(0) as f64) / (r.view_count.unwrap_or(1) as f64)
@@ -7348,15 +7389,20 @@ pub async fn get_reel_feed(
         };
         let engagement = (watch_quality * 0.6 + like_rate.min(1.0) * 0.4).min(1.0);
 
-        // ── Freshness (15%) — exponential decay, half-life = 24h ──
+        // ── Freshness (10%) — exponential decay, half-life = 24h ──
         let age_hours = r.created_at
             .map(|t| (now - t).num_hours() as f64)
-            .unwrap_or(168.0); // Default 7 days old
-        let freshness = (-0.693 * age_hours / 24.0).exp(); // ln(2)/24h
+            .unwrap_or(168.0);
+        let freshness = (-0.693 * age_hours / 24.0).exp();
 
-        // ── Creator compatibility (10%) ──
+        // ── Graph: creator liked by users-like-me (15%) ──
+        let graph_score = graph_creator_scores.get(&r.user_id).copied().unwrap_or(0.0);
+
+        // ── Music taste match with creator (10%) ──
+        let music_score = music_creator_scores.get(&r.user_id).copied().unwrap_or(0.0);
+
+        // ── Creator compatibility (5%) ──
         let attractiveness = r.creator_attractiveness.unwrap_or(0.0).min(1.0);
-        let creator_score = attractiveness;
 
         // ── Location boost (10%) — same city = strong boost ──
         let location_score = match (&viewer_city, &r.creator_city) {
@@ -7370,14 +7416,15 @@ pub async fn get_reel_feed(
         let explore = if random_val < exploration_rate { 0.5 + random_val } else { 0.0 };
 
         // ── Weighted combination ──
-        // Location replaces 5% from creator + 5% from noise — local content surfaces first
-        let score = cat_score * 0.35
-            + engagement * 0.20
-            + freshness * 0.15
-            + creator_score * 0.10
+        let score = cat_score * 0.25
+            + engagement * 0.15
+            + freshness * 0.10
+            + graph_score * 0.15
+            + music_score * 0.10
+            + attractiveness * 0.05
             + location_score * 0.10
             + explore * 0.05
-            + random_val * 0.05; // 5% noise for diversity
+            + random_val * 0.05;
 
         (score, idx)
     }).collect();
