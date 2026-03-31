@@ -493,17 +493,102 @@ impl QueryRoot {
             }
         };
 
-        // Re-sort by ML score if available, otherwise keep DB order
+        // Graph features: shared likes + shared reel views per candidate (batch query)
+        let uid_str = user_id.to_string();
+        let graph_scores: std::collections::HashMap<i64, f64> = {
+            let candidate_id_strs: Vec<String> = rows.iter().map(|r| r.id.to_string()).collect();
+            if candidate_id_strs.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                // Count shared "liked" edges (users we both liked)
+                let shared_likes = sqlx::query_as::<_, (String, i64)>(
+                    r#"SELECT f2.from_id, COUNT(*) as shared
+                       FROM graph_edge_links_fwd f1
+                       JOIN graph_edge_links_fwd f2 ON f1.to_id = f2.to_id AND f1.edge_type = f2.edge_type
+                       WHERE f1.from_type = 'user' AND f1.from_id = $1
+                         AND f1.edge_type = 'liked' AND f2.from_type = 'user'
+                         AND f2.from_id = ANY($2) AND f2.from_id != $1
+                       GROUP BY f2.from_id"#,
+                )
+                .bind(&uid_str)
+                .bind(&candidate_id_strs)
+                .fetch_all(&state.db)
+                .await
+                .unwrap_or_default();
+
+                // Count shared reel views
+                let shared_views = sqlx::query_as::<_, (String, i64)>(
+                    r#"SELECT f2.from_id, COUNT(*) as shared
+                       FROM graph_edge_links_fwd f1
+                       JOIN graph_edge_links_fwd f2 ON f1.to_id = f2.to_id AND f1.edge_type = f2.edge_type
+                       WHERE f1.from_type = 'user' AND f1.from_id = $1
+                         AND f1.edge_type = 'viewed' AND f2.from_type = 'user'
+                         AND f2.from_id = ANY($2) AND f2.from_id != $1
+                       GROUP BY f2.from_id"#,
+                )
+                .bind(&uid_str)
+                .bind(&candidate_id_strs)
+                .fetch_all(&state.db)
+                .await
+                .unwrap_or_default();
+
+                let mut scores = std::collections::HashMap::new();
+                for (cid, count) in shared_likes {
+                    if let Ok(id) = cid.parse::<i64>() {
+                        *scores.entry(id).or_insert(0.0) += count as f64 * 0.15; // 15% weight per shared like
+                    }
+                }
+                for (cid, count) in shared_views {
+                    if let Ok(id) = cid.parse::<i64>() {
+                        *scores.entry(id).or_insert(0.0) += count as f64 * 0.05; // 5% weight per shared view
+                    }
+                }
+                // Normalize to 0-1 range
+                let max_val = scores.values().cloned().fold(0.0f64, f64::max).max(1.0);
+                for v in scores.values_mut() { *v /= max_val; }
+                scores
+            }
+        };
+
+        // Music compatibility: genre overlap per candidate (batch query)
+        let music_scores: std::collections::HashMap<i64, f64> = {
+            let candidate_i64s: Vec<i64> = rows.iter().map(|r| r.id).collect();
+            let shared_genres = sqlx::query_as::<_, (i64, i64)>(
+                r#"SELECT b.user_id, COUNT(*) as shared
+                   FROM user_genre_profile a
+                   JOIN user_genre_profile b ON a.genre = b.genre
+                   WHERE a.user_id = $1 AND b.user_id = ANY($2)
+                   GROUP BY b.user_id"#,
+            )
+            .bind(user_id)
+            .bind(&candidate_i64s)
+            .fetch_all(&state.db)
+            .await
+            .unwrap_or_default();
+
+            // Get user's total genres for Jaccard denominator
+            let my_genre_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM user_genre_profile WHERE user_id = $1"
+            ).bind(user_id).fetch_one(&state.db).await.unwrap_or(1);
+
+            shared_genres.into_iter().map(|(cid, shared)| {
+                let score = (shared as f64 / my_genre_count.max(1) as f64).min(1.0);
+                (cid, score)
+            }).collect()
+        };
+
+        // Combine: ML (55%) + graph (15%) + music (10%) + basic (20%)
         let mut ranked_rows: Vec<_> = rows.into_iter().map(|r| {
             let ml_score = ml_scores.get(&(r.id as i32)).copied().unwrap_or(0.0);
-            (ml_score, r)
+            let graph_score = graph_scores.get(&r.id).copied().unwrap_or(0.0);
+            let music_score = music_scores.get(&r.id).copied().unwrap_or(0.0);
+            let combined = 0.55 * ml_score + 0.15 * graph_score + 0.10 * music_score + 0.20 * ml_score.max(0.5);
+            (combined, ml_score, graph_score, music_score, r)
         }).collect();
 
-        if !ml_scores.is_empty() {
-            ranked_rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        }
+        ranked_rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        Ok(ranked_rows.into_iter().map(|(ml_score, r)| {
+        Ok(ranked_rows.into_iter().map(|(combined_score, ml_score, graph_score, music_score, r)| {
             let age = r.dob.map(|dob| {
                 let today = chrono::Utc::now().date_naive();
                 let mut age = today.year() - dob.year();
@@ -530,7 +615,7 @@ impl QueryRoot {
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default();
 
-            // Calculate compatibility: blend ML score (55%) + basic compatibility (45%)
+            // Calculate compatibility: ML (55%) + graph (15%) + music (10%) + basic (20%)
             let basic_score = calculate_compatibility(
                 &current_interests,
                 &current_languages,
@@ -543,8 +628,12 @@ impl QueryRoot {
                 r.voice_intro_url.is_some(),
                 r.is_verified.unwrap_or(false),
             );
-            let compatibility_score = if ml_score > 0.0 {
-                (0.55 * ml_score * 100.0 + 0.45 * basic_score as f64) as i32
+            let compatibility_score = if combined_score > 0.0 {
+                let blended = 0.55 * ml_score * 100.0
+                    + 0.15 * graph_score * 100.0
+                    + 0.10 * music_score * 100.0
+                    + 0.20 * basic_score as f64;
+                (blended.min(100.0)) as i32
             } else {
                 basic_score
             };
