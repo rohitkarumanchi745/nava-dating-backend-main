@@ -632,8 +632,8 @@ impl QueryRoot {
                 let blended = 0.55 * ml_score * 100.0
                     + 0.15 * graph_score * 100.0
                     + 0.10 * music_score * 100.0
-                    + 0.20 * basic_score as f64;
-                (blended.min(100.0)) as i32
+                    + 0.20 * basic_score;
+                blended.min(100.0)
             } else {
                 basic_score
             };
