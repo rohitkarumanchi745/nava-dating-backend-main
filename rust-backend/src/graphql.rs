@@ -477,7 +477,33 @@ impl QueryRoot {
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
 
-        Ok(rows.into_iter().map(|r| {
+        // RL-based ranking: score candidates and re-sort (with 2s timeout + graceful fallback)
+        let candidate_ids: Vec<i32> = rows.iter().map(|r| r.id as i32).collect();
+        let ml_scores: std::collections::HashMap<i32, f64> = match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            async {
+                let mut ml = state.ml.write().await;
+                ml.rank_candidates(&state.db, user_id as i32, &candidate_ids).await
+            },
+        ).await {
+            Ok(scores) => scores.into_iter().collect(),
+            Err(_) => {
+                tracing::warn!(user_id, "ML ranking timed out in GraphQL discover, using basic scoring");
+                std::collections::HashMap::new()
+            }
+        };
+
+        // Re-sort by ML score if available, otherwise keep DB order
+        let mut ranked_rows: Vec<_> = rows.into_iter().map(|r| {
+            let ml_score = ml_scores.get(&(r.id as i32)).copied().unwrap_or(0.0);
+            (ml_score, r)
+        }).collect();
+
+        if !ml_scores.is_empty() {
+            ranked_rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        Ok(ranked_rows.into_iter().map(|(ml_score, r)| {
             let age = r.dob.map(|dob| {
                 let today = chrono::Utc::now().date_naive();
                 let mut age = today.year() - dob.year();
@@ -504,8 +530,8 @@ impl QueryRoot {
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default();
 
-            // Calculate compatibility score (0-100)
-            let compatibility_score = calculate_compatibility(
+            // Calculate compatibility: blend ML score (55%) + basic compatibility (45%)
+            let basic_score = calculate_compatibility(
                 &current_interests,
                 &current_languages,
                 &current_looking_for,
@@ -517,6 +543,11 @@ impl QueryRoot {
                 r.voice_intro_url.is_some(),
                 r.is_verified.unwrap_or(false),
             );
+            let compatibility_score = if ml_score > 0.0 {
+                (0.55 * ml_score * 100.0 + 0.45 * basic_score as f64) as i32
+            } else {
+                basic_score
+            };
 
             let has_voice = r.voice_intro_url.is_some();
 
