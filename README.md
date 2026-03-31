@@ -352,6 +352,100 @@ Call states: `idle → connecting → ringing → active → idle`
 | `/location/update` | POST | Update GPS coordinates, city, state, country, accuracy |
 | `/me/location` | GET | Get stored user location |
 | `/location/purchase-pass` | POST | Purchase location-based pass (`boost_1hr`, `daily_pass`, etc.) |
+| `/location/search-history` | POST | Track location searches for hotspot data |
+
+### Social Platform (Spots, Playgrounds, Events)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/spots` | POST | Create an ephemeral spot (stories-style) |
+| `/spots` | GET | Get user's own spots |
+| `/spots/feed` | GET | ML-ranked spots feed (city + interests + recency) |
+| `/spots/{id}/messages` | GET/POST | Read/send messages on a spot |
+| `/spots/{id}/react` | POST | React to a spot (tracks pair matching) |
+| `/playgrounds` | GET | ML-ranked playgrounds (university + city + interests) |
+| `/playgrounds` | POST | Create a playground (group hangout) |
+| `/playgrounds/{id}` | GET | Playground detail with membership check |
+| `/playgrounds/{id}/join` | POST | Join a playground |
+| `/playgrounds/{id}/leave` | POST | Leave a playground |
+| `/playgrounds/{id}/members` | GET | List playground members |
+| `/events` | POST | Create event with location + datetime |
+| `/events` | GET | ML-ranked events (distance + friends going + interest + urgency) |
+| `/events/{id}/rsvp` | POST | RSVP to an event |
+
+### Music Taste & Listening Intelligence
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/music/sync` | POST | Sync music library (Apple Music + Spotify) |
+| `/music/taste` | GET | User's top genres and artists |
+| `/music/compatibility/{id}` | GET | Genre overlap with another user |
+| `/music/now-playing` | POST | Track currently playing song from any app |
+| `/music/engagement` | GET | Engagement-weighted listening profile |
+| `/music/deep-compatibility/{id}` | GET | Deep compatibility using listening behavior |
+| `/accounts/connect` | POST | Link Spotify/Strava/Instagram account |
+| `/accounts/connected` | GET | List connected accounts |
+
+### Fitness & HealthKit Integration
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/fitness/sync` | POST | Sync workouts from HealthKit (Apple Watch, Whoop, Garmin, Fitbit) |
+| `/fitness/profile` | GET | Fitness summary for dating profile (respects privacy) |
+| `/fitness/challenge` | POST | Create fitness challenge with a match |
+| `/fitness/challenges` | GET | Active challenges with progress |
+
+### Outdoor Spots, Weather & Memories
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/outdoor/spots` | GET | ML-ranked outdoor spots (season + time + weather + memories) |
+| `/outdoor/spots` | POST | Add a new trail/viewpoint |
+| `/outdoor/visit` | POST | Log visit with weather snapshot + fitness data |
+| `/outdoor/memories` | GET | Past visits at a location (revisit memories) |
+| `/outdoor/seasonal-guide` | GET | Best activities for city + current season |
+| `/outdoor/location-activity` | GET | Who posted content at a location + time/weather patterns |
+
+### Journey Tracking & Recommendations
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/journey/start` | POST | Begin a journey session |
+| `/journey/stop` | POST | Log each stop (auto-calculates distance, dwell time, transitions) |
+| `/journey/recommend-next` | GET | "After hiking, 70% go to a cafe" — recommend nearby places |
+| `/journey/history` | GET | Past journeys with full route |
+
+### Map Search Intelligence
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/map/search` | POST | Track map searches for proprietary location data |
+| `/map/trending` | GET | Trending places + categories near a location |
+| `/map/interests` | GET | User's search patterns + explorer type |
+
+### Contact Matching & Privacy
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/contacts/sync` | POST | SHA256-hashed phone numbers → find friends on app |
+| `/privacy/settings` | GET/POST | Toggle: discoverable by contacts, share music taste, share fitness |
+
+### Netflix-Style Real-Time Graph
+
+Every user interaction automatically populates the graph:
+
+| Action | Graph Edge |
+|--------|-----------|
+| Like someone | `user → liked → user` |
+| Pass someone | `user → passed → user` |
+| Mutual match | `user → matched_with → user` |
+| Send message | `user → messaged → user` |
+| Upload reel | `user → created → reel` |
+| View reel | `user → viewed → reel` |
+| Visit outdoor spot | `user → visited_spot → outdoor_spot` |
+| Create outdoor spot | `user → created_spot → outdoor_spot` |
+
+Graph powers: collaborative filtering, friend-of-friend discovery, fraud detection, community clustering.
 
 ## Tech Stack
 
