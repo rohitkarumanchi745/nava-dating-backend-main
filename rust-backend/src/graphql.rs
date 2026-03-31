@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::auth::create_access_token;
+use crate::handlers::auto_queue_for_labeling;
 use crate::state::AppState;
 
 // ============================================================================
@@ -1705,6 +1706,9 @@ impl MutationRoot {
                 ).bind(&sid).bind(&rid).execute(&db).await;
             });
         }
+
+        // Auto-queue message for LLM labeling (toxicity, intent)
+        auto_queue_for_labeling(state.db.clone(), state.config.llm_enabled, "message", msg.id as i64, 3);
 
         Ok(Message {
             id: msg.id,

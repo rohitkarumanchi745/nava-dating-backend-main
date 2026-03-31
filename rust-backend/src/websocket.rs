@@ -6,6 +6,7 @@ use serde_json::json;
 
 use crate::{
     auth::decode_access_token,
+    handlers::auto_queue_for_labeling,
     state::{AppState, ChatMessage, CallSignal},
 };
 
@@ -117,6 +118,11 @@ pub async fn handle_chat(socket: WebSocket, state: AppState, match_id: String, t
                             .bind(&match_id)
                             .execute(&state.db)
                             .await;
+
+                            // Auto-queue for LLM labeling (toxicity check)
+                            if let Some(mid) = message_id {
+                                auto_queue_for_labeling(state.db.clone(), state.config.llm_enabled, "message", mid as i64, 3);
+                            }
 
                             // Broadcast to room
                             let chat_msg = ChatMessage {

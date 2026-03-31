@@ -1286,17 +1286,24 @@ pub async fn like_user(
         .map(|m| &m[..m.len().min(300)]);
 
     if let Some(msg) = message_text {
-        let _ = sqlx::query(
+        let like_msg_id = sqlx::query_scalar::<_, i64>(
             r#"INSERT INTO messages (match_id, sender_id, receiver_id, content, message_type, created_at)
                VALUES ($1, $2, $3, $4, 'like_message', NOW())
-               ON CONFLICT DO NOTHING"#,
+               ON CONFLICT DO NOTHING
+               RETURNING id"#,
         )
         .bind(&match_id)
         .bind(user_id)
         .bind(target_id)
         .bind(msg)
-        .execute(&state.db)
-        .await;
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(mid) = like_msg_id {
+            auto_queue_for_labeling(state.db.clone(), state.config.llm_enabled, "message", mid, 5);
+        }
     }
 
     // Log like event
@@ -3523,6 +3530,9 @@ pub async fn send_spot_message(
     )
     .bind(spot_id).bind(user_id).bind(&text)
     .fetch_one(&state.db).await?;
+
+    // Auto-queue spot message for LLM labeling
+    auto_queue_for_labeling(state.db.clone(), state.config.llm_enabled, "spot_message", id, 4);
 
     // Update pair status for matching
     let _ = sqlx::query(
@@ -7782,6 +7792,9 @@ pub async fn send_reel_message(
     .bind(payload.reel_id).bind(sender_id).bind(receiver_id).bind(&payload.content).bind(msg_type).bind(&payload.reaction_emoji)
     .fetch_one(&state.db).await?;
 
+    // Auto-queue reel message for LLM labeling
+    auto_queue_for_labeling(state.db.clone(), state.config.llm_enabled, "reel_message", message_id, 4);
+
     sqlx::query("UPDATE reels SET message_count = message_count + 1, updated_at = NOW() WHERE id = $1").bind(payload.reel_id).execute(&state.db).await?;
 
     // Update conversation thread
@@ -7889,6 +7902,9 @@ pub async fn reply_reel_message(
 
     let reply_id = sqlx::query_scalar::<_, i64>("INSERT INTO reel_messages (reel_id, sender_id, receiver_id, content, message_type, created_at) VALUES ($1, $2, $3, $4, 'text', NOW()) RETURNING id")
         .bind(orig_reel_id).bind(user_id).bind(orig_sender_id).bind(&payload.content).fetch_one(&state.db).await?;
+
+    // Auto-queue reply for LLM labeling
+    auto_queue_for_labeling(state.db.clone(), state.config.llm_enabled, "reel_message", reply_id, 4);
 
     // Mark original as replied
     sqlx::query("UPDATE reel_messages SET replied = TRUE, reply_delay_sec = $2 WHERE id = $1").bind(payload.original_message_id).bind(response_time_sec).execute(&state.db).await?;
@@ -8397,6 +8413,25 @@ async fn check_reel_match_eligibility(db: &PgPool, reel_id: i32, user_a: i32, us
 // LLM AUTO-LABELING SYSTEM
 // Labels reels, messages, and user interactions for ML training
 // ============================================================================
+
+/// Auto-queue content for LLM labeling (fire-and-forget, never fails the caller)
+pub fn auto_queue_for_labeling(db: sqlx::PgPool, config_enabled: bool, content_type: &str, content_id: i64, priority: i32) {
+    if !config_enabled { return; }
+    let ct = content_type.to_string();
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            r#"INSERT INTO llm_labeling_queue (content_type, content_id, priority, status, created_at)
+               VALUES ($1, $2, $3, 'pending', NOW())
+               ON CONFLICT (content_type, content_id) WHERE status = 'pending'
+               DO UPDATE SET priority = LEAST(llm_labeling_queue.priority, $3)"#,
+        )
+        .bind(&ct)
+        .bind(content_id)
+        .bind(priority)
+        .execute(&db)
+        .await;
+    });
+}
 
 /// Queue a reel for LLM labeling
 pub async fn queue_reel_labeling(
@@ -11812,19 +11847,21 @@ pub async fn direct_message_from_search(
     };
 
     // Send the message
-    let message_id = Uuid::new_v4().to_string();
-    sqlx::query(
+    let message_id = sqlx::query_scalar::<_, i32>(
         r#"
-        INSERT INTO messages (id, match_id, sender_id, content, message_type, created_at)
-        VALUES ($1, $2, $3, $4, 'direct_search', NOW())
+        INSERT INTO messages (match_id, sender_id, content, message_type, created_at)
+        VALUES ($1, $2, $3, 'direct_search', NOW())
+        RETURNING id
         "#
     )
-    .bind(&message_id)
     .bind(&match_id)
     .bind(user_id)
     .bind(message)
-    .execute(&state.db)
+    .fetch_one(&state.db)
     .await?;
+
+    // Auto-queue for LLM labeling
+    auto_queue_for_labeling(state.db.clone(), state.config.llm_enabled, "message", message_id as i64, 5);
 
     Ok(Json(json!({
         "sent": true,
@@ -12578,16 +12615,19 @@ pub async fn reply_message_request(
     let thread_id = format!("req_{}_{}", a, b);
 
     // Store the reply as like_message_reply — no match record created
-    sqlx::query(
+    let reply_msg_id = sqlx::query_scalar::<_, i64>(
         r#"INSERT INTO messages (match_id, sender_id, receiver_id, content, message_type, is_read, created_at)
-           VALUES ($1, $2, $3, $4, 'like_message_reply', FALSE, NOW())"#,
+           VALUES ($1, $2, $3, $4, 'like_message_reply', FALSE, NOW()) RETURNING id"#,
     )
     .bind(&thread_id)
     .bind(user_id)
     .bind(from_user_id)
     .bind(reply_text)
-    .execute(&state.db)
+    .fetch_one(&state.db)
     .await?;
+
+    // Auto-queue reply for LLM labeling
+    auto_queue_for_labeling(state.db.clone(), state.config.llm_enabled, "message", reply_msg_id, 5);
 
     // Mark original like_message as replied so it shows differently in inbox
     sqlx::query(
