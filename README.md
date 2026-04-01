@@ -151,6 +151,17 @@ All endpoints require `Authorization: Bearer <jwt>` header unless noted.
 | `/llm/failed` | POST | Mark labeling job as failed |
 | `/llm/export` | GET | Export training snapshot for offline analysis |
 
+**Auto-Queuing:** All chat messages are automatically queued for LLM labeling on send (gated behind `LLM_ENABLED`):
+
+| Message Path | Content Type | Priority |
+|---|---|---|
+| WebSocket chat | `message` | 3 (highest) |
+| GraphQL sendMessage | `message` | 3 |
+| Reel messages & replies | `reel_message` | 4 |
+| Spot messages | `spot_message` | 4 |
+| Like messages & replies | `message` | 5 |
+| Direct search messages | `message` | 5 |
+
 ### Super Like
 
 | Endpoint | Method | Description |
@@ -237,8 +248,19 @@ Super-likers appear higher in discover feed (+0.15 ML score boost) and are tagge
 
 | Operation | Type | Description |
 |-----------|------|-------------|
-| `conversation(matchId, limit, offset)` | GraphQL Query | Load message history with `isRead` status |
+| `conversation(matchId, limit, offset, since)` | GraphQL Query | Load message history with `isRead` status. Pass `since` (ISO 8601) for delta sync — returns only messages after that timestamp |
 | `sendChatMessage(matchId, content)` | GraphQL Mutation | Persist message to DB |
+
+**Offline Sync:** All message endpoints support a `since` parameter for delta sync:
+
+| Endpoint | Parameter | Description |
+|----------|-----------|-------------|
+| `conversation()` | `since` (GraphQL arg) | Delta sync for match chats |
+| `GET /reels/inbox` | `?since=<ISO>` | Only new reel messages after timestamp |
+| `GET /reels/conversation` | `?since=<ISO>` | Delta sync for reel threads |
+| `GET /spots/:id/messages` | `?since=<ISO>` | Delta sync for spot chats |
+
+The iOS app caches messages locally (AES-GCM encrypted per-conversation), shows cached messages instantly, then fetches only new messages via `since`. Pending sends are queued to disk and flushed on foreground.
 
 ### Audio/Video Calling (WebSocket Signaling)
 
@@ -701,6 +723,7 @@ SQL candidates → Multi-signal scoring → Re-rank by blended score → Return 
 
 ### LLM Integration (LLaMA 3)
 - **Content Labeling** — Automated profile/bio moderation and tagging
+- **Auto-Queue on Send** — All chat messages (WebSocket, GraphQL, reel, spot, like) auto-queued for toxicity/intent labeling with priority-based processing
 - **Batch Inference** — Configurable batch size (10) with retry logic (max 3)
 - **Config:** `LLM_ENABLED`, `LLM_API_URL`, `LLM_MODEL_NAME=llama3`, `LLM_BATCH_SIZE`
 
@@ -1095,19 +1118,39 @@ minAge, maxAge, maxDistanceKm, preferredGenders[], onlyVerified, onlyStudents
 
 Multi-network ad serving with location and language targeting:
 
-| Ad Type | Revenue | Placement |
-|---------|---------|-----------|
-| **Banner** | Low | Non-intrusive, persistent |
-| **Interstitial** | Medium | Between screens |
-| **Native** | Medium | In-feed discovery |
-| **Rewarded** | High | User-initiated for rewards |
+**Endpoints:**
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/ads/request` | GET | Request ad config for a placement (returns network unit IDs, targeting, reward info) |
+| `/api/ads/impression` | POST | Report ad impression/click with revenue data |
+| `/api/ads/rewarded-complete` | POST | Report rewarded ad completion, grants reward to user |
+| `/api/ads/rewards-balance` | GET | Get user's earned consumable balances |
+
+**10 Ad Placements:**
+
+| Placement ID | Type | Screen | Cap/hr |
+|---|---|---|---|
+| `discover_native` | Native | Between discover cards | 6 |
+| `reel_feed_native` | Native | Between reels | 6 |
+| `chat_banner` | Banner | Chat list bottom | 20 |
+| `inbox_banner` | Banner | Inbox/messages bottom | 15 |
+| `profile_interstitial` | Interstitial | After viewing profile | 3 |
+| `match_interstitial` | Interstitial | After match screen | 3 |
+| `boost_rewarded` | Rewarded | Boost screen | 5 |
+| `superlike_rewarded` | Rewarded | Super like screen | 5 |
+| `extra_likes_rewarded` | Rewarded | Likes screen | 5 |
+| `profile_view_rewarded` | Rewarded | Who liked you screen | 5 |
 
 **Ad Networks:** Google AdMob, Meta Audience Network, Unity Ads
 
 **Targeting:**
 - Location-based (country, state, city — India-first with regional targeting)
 - Language-based (Telugu, Hindi, Tamil, Kannada, + 9 more languages)
+- Metro detection (45+ Indian metros get 1.5x eCPM multiplier)
 - Platform-aware (iOS/Android)
+- Frequency-capped per user/placement/hour
+- Premium users excluded automatically (`should_show: false`)
 
 **Rewarded Ad Rewards:**
 
@@ -1116,8 +1159,10 @@ Multi-network ad serving with location and language targeting:
 | Boost | 1 free boost | Watch ad on boost screen |
 | Super Like | 1 super like | Watch ad on super like screen |
 | Premium Hours | 2 hours | Watch ad |
-| Extra Likes | 5 likes | Watch ad |
-| Profile View | 1 reveal | Watch ad |
+| Extra Likes | 5 likes | Watch ad on likes screen |
+| Profile View | 1 reveal | Watch ad on who-liked-you screen |
+
+**Config:** `ADS_ENABLED=true` to activate. Set AdMob unit IDs in `ad_placements` table.
 
 ### 3. Ambassador Program
 
