@@ -1,9 +1,11 @@
 //! Ads endpoints for ad monetization
 //!
 //! Endpoints:
+//! - GET /ads/placements - Get all active ad placements (iOS)
 //! - GET /api/ads/request - Request an ad for display
-//! - POST /api/ads/impression - Record ad impression
-//! - POST /api/ads/rewarded-complete - Record rewarded ad completion
+//! - POST /api/ads/impression | /ads/impression - Record ad impression
+//! - POST /api/ads/rewarded-complete | /ads/rewarded/complete - Record rewarded ad completion
+//! - GET /api/ads/rewards-balance | /ads/balances - Get consumable balances
 
 use axum::{
     extract::{Query, State},
@@ -214,4 +216,71 @@ pub async fn get_rewards_balance(
         .collect();
 
     Ok(Json(json!({ "balances": balances })))
+}
+
+/// Get all active ad placements with frequency caps and network unit IDs
+/// GET /ads/placements
+pub async fn get_all_placements(
+    State(state): State<AppState>,
+    claims: Claims,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user_id = claims.sub.parse::<i32>()
+        .map_err(|_| AppError::unauthorized("Invalid token"))?;
+
+    let ads_service = state.ads_service.as_ref()
+        .ok_or_else(|| AppError::internal("Ads service not configured"))?;
+
+    let is_premium = !ads_service.should_show_ads(user_id).await?;
+
+    #[derive(sqlx::FromRow, Serialize)]
+    struct PlacementRow {
+        placement_id: String,
+        name: String,
+        placement_type: String,
+        location: String,
+        admob_unit_id: Option<String>,
+        facebook_placement_id: Option<String>,
+        unity_placement_id: Option<String>,
+        show_to_free_users: bool,
+        show_to_premium_users: bool,
+        frequency_cap_per_hour: i32,
+        is_active: bool,
+    }
+
+    let placements = sqlx::query_as::<_, PlacementRow>(
+        r#"
+        SELECT placement_id, name, placement_type, location,
+               admob_unit_id, facebook_placement_id, unity_placement_id,
+               show_to_free_users, show_to_premium_users, frequency_cap_per_hour, is_active
+        FROM ad_placements
+        WHERE is_active = true
+        ORDER BY placement_id
+        "#
+    )
+    .fetch_all(state.read_pool())
+    .await?;
+
+    // Filter based on user's premium status
+    let filtered: Vec<&PlacementRow> = placements.iter().filter(|p| {
+        if is_premium { p.show_to_premium_users } else { p.show_to_free_users }
+    }).collect();
+
+    let result: Vec<serde_json::Value> = filtered.iter().map(|p| {
+        json!({
+            "placement_id": p.placement_id,
+            "name": p.name,
+            "ad_type": p.placement_type,
+            "location": p.location,
+            "admob_unit_id": p.admob_unit_id,
+            "facebook_placement_id": p.facebook_placement_id,
+            "unity_placement_id": p.unity_placement_id,
+            "frequency_cap_per_hour": p.frequency_cap_per_hour,
+        })
+    }).collect();
+
+    Ok(Json(json!({
+        "placements": result,
+        "is_premium": is_premium,
+        "show_ads": !is_premium,
+    })))
 }

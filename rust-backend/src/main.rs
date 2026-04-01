@@ -156,7 +156,7 @@ use handlers::{
         dlq_stats, delete_account,
     },
     // Ads
-    ads::{request_ad, record_impression, rewarded_complete, get_rewards_balance},
+    ads::{request_ad, record_impression, rewarded_complete, get_rewards_balance, get_all_placements},
     // Ambassador Program
     ambassador::{
         ambassador_login, get_ambassador_profile, get_performance, get_daily_breakdown,
@@ -791,6 +791,11 @@ async fn main() {
         .route("/api/ads/impression", post(record_impression))
         .route("/api/ads/rewarded-complete", post(rewarded_complete))
         .route("/api/ads/rewards-balance", get(get_rewards_balance))
+        // iOS ad routes
+        .route("/ads/placements", get(get_all_placements))
+        .route("/ads/impression", post(record_impression))
+        .route("/ads/rewarded/complete", post(rewarded_complete))
+        .route("/ads/balances", get(get_rewards_balance))
         // Ambassador Program
         .route("/api/ambassador/login", post(ambassador_login))
         .route("/api/ambassador/me", get(get_ambassador_profile))
