@@ -127,7 +127,7 @@ use handlers::{
     // Vision
     verify_selfie, vision_analyze,
     // Admin
-    admin_stats, secrets_status,
+    admin_stats, admin_override_identity, secrets_status,
     // WebSocket
     ws_call, ws_chat,
     // ML Training
@@ -947,6 +947,7 @@ async fn main() {
         .route("/vision/analyze", post(vision_analyze))
         // Admin
         .route("/admin/stats", get(admin_stats))
+        .route("/admin/user/{user_id}/override", post(admin_override_identity))
         .route("/admin/secrets/status", get(secrets_status))
         // WebSocket
         .route("/ws/chat", get(ws_chat))

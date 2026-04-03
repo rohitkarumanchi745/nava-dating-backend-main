@@ -5530,6 +5530,60 @@ pub async fn verify_selfie(
 // Admin Stats
 // ============================================================================
 
+/// POST /admin/user/{user_id}/override — Admin override for locked identity fields (gender, dob)
+/// Only accessible with admin JWT. Logs the change for audit trail.
+pub async fn admin_override_identity(
+    State(state): State<AppState>,
+    _admin: AdminClaims,
+    AxumPath(target_user_id): AxumPath<i32>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let mut changes = Vec::new();
+
+    if let Some(gender) = payload.get("gender").and_then(|v| v.as_str()) {
+        sqlx::query("UPDATE users SET gender = $1, updated_at = NOW() WHERE id = $2")
+            .bind(gender).bind(target_user_id).execute(&state.db).await?;
+        changes.push(format!("gender → {}", gender));
+    }
+
+    if let Some(dob) = payload.get("dob").and_then(|v| v.as_str()) {
+        let date = chrono::NaiveDate::parse_from_str(dob, "%Y-%m-%d")
+            .map_err(|_| AppError::bad_request("dob must be YYYY-MM-DD format"))?;
+        sqlx::query("UPDATE users SET dob = $1, updated_at = NOW() WHERE id = $2")
+            .bind(date).bind(target_user_id).execute(&state.db).await?;
+        changes.push(format!("dob → {}", dob));
+    }
+
+    if let Some(name) = payload.get("name").and_then(|v| v.as_str()) {
+        sqlx::query("UPDATE users SET name = $1, updated_at = NOW() WHERE id = $2")
+            .bind(name).bind(target_user_id).execute(&state.db).await?;
+        changes.push(format!("name → {}", name));
+    }
+
+    if changes.is_empty() {
+        return Err(AppError::bad_request("No fields to update. Send: gender, dob, name"));
+    }
+
+    // Audit log
+    let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("admin override");
+    tracing::info!(target_user_id, reason, changes = ?changes, "Admin identity override");
+
+    let _ = sqlx::query(
+        "INSERT INTO interaction_events (user_id, target_user_id, event_type, metadata, source, created_at) VALUES ($1, $2, 'admin_override', $3, 'admin', NOW())"
+    )
+    .bind(target_user_id)
+    .bind(target_user_id)
+    .bind(serde_json::json!({ "changes": changes, "reason": reason }).to_string())
+    .execute(&state.db)
+    .await;
+
+    Ok(Json(json!({
+        "updated": true,
+        "user_id": target_user_id,
+        "changes": changes,
+    })))
+}
+
 pub async fn admin_stats(
     State(state): State<AppState>,
     _admin: AdminClaims, // Requires admin authorization
