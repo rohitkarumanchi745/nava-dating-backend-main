@@ -1269,6 +1269,23 @@ impl MutationRoot {
         let state = ctx.data::<AppState>()?;
         let user_id = get_user_id_from_context(ctx)?;
 
+        // Lock immutable fields: gender and dob cannot be changed once set
+        if gender.is_some() || dob.is_some() {
+            #[derive(sqlx::FromRow)]
+            struct LockedFields { gender: Option<String>, dob: Option<chrono::NaiveDate> }
+            let existing = sqlx::query_as::<_, LockedFields>(
+                "SELECT gender, dob FROM users WHERE id = $1"
+            ).bind(user_id).fetch_optional(&state.db).await?;
+            if let Some(ref row) = existing {
+                if gender.is_some() && row.gender.is_some() {
+                    return Err(Error::new("Gender cannot be changed after initial setup"));
+                }
+                if dob.is_some() && row.dob.is_some() {
+                    return Err(Error::new("Date of birth cannot be changed after initial setup"));
+                }
+            }
+        }
+
         // Build dynamic update query
         let mut updates = Vec::new();
         let mut params: Vec<String> = Vec::new();
