@@ -324,6 +324,11 @@ impl ChatRooms {
         }
     }
 
+    /// Remove all rooms with zero subscribers (periodic cleanup)
+    pub fn cleanup_stale(&mut self) {
+        self.rooms.retain(|_match_id, sender| sender.receiver_count() > 0);
+    }
+
     /// Get count of active rooms (for monitoring)
     pub fn room_count(&self) -> usize {
         self.rooms.len()

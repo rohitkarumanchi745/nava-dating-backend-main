@@ -1032,6 +1032,18 @@ pub async fn discover(
         .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(state.config.discover_limit);
 
+    // Check Redis cache first
+    let cache_key = user_id.to_string();
+    if let Some(redis) = state.redis_service() {
+        if let Ok(Some(cached)) = redis
+            .cache_get::<Value>(crate::redis_service::keys::DISCOVERY_CACHE, &cache_key)
+            .await
+        {
+            tracing::debug!(user_id, "Discover cache hit");
+            return Ok(Json(cached));
+        }
+    }
+
     // Get user and preferences (read-replica safe)
     let read_db = state.read_pool();
     let _user = fetch_user_by_id(read_db, user_id)
@@ -1188,10 +1200,22 @@ pub async fn discover(
         .await;
     }
 
-    Ok(Json(json!({
+    let response = json!({
         "profiles": profiles,
         "slate_id": slate_id,
-    })))
+    });
+
+    // Cache the result in Redis (120s TTL, fail gracefully)
+    if let Some(redis) = state.redis_service() {
+        if let Err(e) = redis
+            .cache_set(crate::redis_service::keys::DISCOVERY_CACHE, &cache_key, &response, 120)
+            .await
+        {
+            tracing::warn!(user_id, error = %e, "Failed to cache discover results");
+        }
+    }
+
+    Ok(Json(response))
 }
 
 pub async fn like_user(

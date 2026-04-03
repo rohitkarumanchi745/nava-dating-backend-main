@@ -676,6 +676,19 @@ async fn main() {
         info!("Replica lag monitor started (cutoff: 2s, check interval: 5s)");
     }
 
+    // Chat room cleanup — remove stale rooms with zero subscribers every 5 minutes
+    {
+        let cleanup_rooms = state.chat_rooms.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                let mut rooms = cleanup_rooms.write().await;
+                rooms.cleanup_stale();
+            }
+        });
+        info!("Chat room cleanup task started (interval: 5m)");
+    }
+
     // Build GraphQL schema
     let schema = build_schema(state.clone());
     let is_dev = !state.config.is_production();

@@ -269,12 +269,19 @@ impl SmsProvider {
         let (Some(ref account_sid), Some(ref auth_token), Some(ref from_number)) =
             (&self.account_sid, &self.auth_token, &self.from_number)
         else {
-            warn!(phone = %phone_number, "Twilio not configured, skipping SMS");
+            warn!("Twilio not configured, skipping SMS");
             return Ok(());
         };
 
+        // Redact phone number in logs: show first 4 + last 2 chars
+        let redacted_phone = if phone_number.len() > 6 {
+            format!("{}***{}", &phone_number[..4], &phone_number[phone_number.len()-2..])
+        } else {
+            "***".to_string()
+        };
+
         info!(
-            phone = %phone_number,
+            phone = %redacted_phone,
             message_length = message.len(),
             "Sending SMS"
         );
@@ -300,7 +307,12 @@ impl SmsProvider {
             .map_err(|e| format!("Twilio request failed: {}", e))?;
 
         if response.status().is_success() {
-            info!(phone = %phone_number, "SMS sent successfully");
+            let redacted = if phone_number.len() > 6 {
+                format!("{}***{}", &phone_number[..4], &phone_number[phone_number.len()-2..])
+            } else {
+                "***".to_string()
+            };
+            info!(phone = %redacted, "SMS sent successfully");
             Ok(())
         } else {
             let status = response.status();

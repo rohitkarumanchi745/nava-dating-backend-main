@@ -575,7 +575,7 @@ pub struct CreateCallResponse {
     pub expires_in: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DiscoverProfile {
     pub id: i32,
     pub name: Option<String>,

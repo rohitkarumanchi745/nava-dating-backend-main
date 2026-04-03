@@ -92,6 +92,11 @@ pub async fn handle_chat(socket: WebSocket, state: AppState, match_id: String, t
                 match payload.message_type.as_str() {
                     "message" => {
                         if let Some(content) = payload.content {
+                            // Enforce 5KB max message size
+                            if content.len() > 5000 {
+                                tracing::warn!(user_id, len = content.len(), "Message exceeds 5KB limit, skipping");
+                                continue;
+                            }
                             // Get receiver ID
                             let receiver_id = get_other_user(&state, &match_id, user_id).await;
 

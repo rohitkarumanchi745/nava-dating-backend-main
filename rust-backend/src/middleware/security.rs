@@ -96,6 +96,14 @@ pub async fn security_headers_middleware(
         );
     }
 
+    // Ensure X-Request-Id is present on every response
+    if !headers.contains_key("x-request-id") {
+        headers.insert(
+            "X-Request-Id",
+            uuid::Uuid::new_v4().to_string().parse().unwrap(),
+        );
+    }
+
     response
 }
 

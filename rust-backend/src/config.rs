@@ -212,7 +212,7 @@ impl Config {
         let access_token_expire_minutes = env::var("ACCESS_TOKEN_EXPIRE_MINUTES")
             .ok()
             .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(10080); // 7 days
+            .unwrap_or(60); // 1 hour
         let call_token_expire_minutes = env::var("CALL_TOKEN_EXPIRE_MINUTES")
             .ok()
             .and_then(|value| value.parse::<i64>().ok())
@@ -532,7 +532,7 @@ impl Config {
 
         // CORS Configuration
         let cors_allowed_origins = env::var("CORS_ALLOWED_ORIGINS")
-            .unwrap_or_else(|_| "*".to_string())
+            .unwrap_or_else(|_| "https://nava.dating,https://app.nava.dating".to_string())
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
