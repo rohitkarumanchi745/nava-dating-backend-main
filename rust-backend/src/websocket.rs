@@ -97,8 +97,19 @@ pub async fn handle_chat(socket: WebSocket, state: AppState, match_id: String, t
                                 tracing::warn!(user_id, len = content.len(), "Message exceeds 5KB limit, skipping");
                                 continue;
                             }
-                            // Get receiver ID
-                            let receiver_id = get_other_user(&state, &match_id, user_id).await;
+                            // Get receiver ID — O(1) from cache, DB fallback
+                            let receiver_id = {
+                                let rooms = state.chat_rooms.read().await;
+                                rooms.get_other_user(&match_id, user_id)
+                            };
+                            let receiver_id = if let Some(rid) = receiver_id {
+                                rid
+                            } else {
+                                let rid = get_other_user(&state, &match_id, user_id).await;
+                                let mut rooms = state.chat_rooms.write().await;
+                                rooms.cache_participants(&match_id, user_id, rid);
+                                rid
+                            };
 
                             // Store message in database
                             let message_id = sqlx::query_scalar::<_, i32>(
@@ -116,13 +127,19 @@ pub async fn handle_chat(socket: WebSocket, state: AppState, match_id: String, t
                             .await
                             .ok();
 
-                            // Update match statistics
-                            let _ = sqlx::query(
-                                "UPDATE matches SET messages_count = COALESCE(messages_count, 0) + 1, last_message_at = NOW() WHERE id = $1",
-                            )
-                            .bind(&match_id)
-                            .execute(&state.db)
-                            .await;
+                            // Update match statistics (fire-and-forget)
+                            {
+                                let db = state.db.clone();
+                                let mid = match_id.clone();
+                                tokio::spawn(async move {
+                                    let _ = sqlx::query(
+                                        "UPDATE matches SET messages_count = COALESCE(messages_count, 0) + 1, last_message_at = NOW() WHERE id = $1",
+                                    )
+                                    .bind(&mid)
+                                    .execute(&db)
+                                    .await;
+                                });
+                            }
 
                             // Auto-queue for LLM labeling (toxicity check)
                             if let Some(mid) = message_id {
@@ -152,14 +169,18 @@ pub async fn handle_chat(socket: WebSocket, state: AppState, match_id: String, t
                     }
                     "read" => {
                         if let Some(message_id) = payload.message_id {
-                            // Mark message as read
-                            let _ = sqlx::query(
-                                "UPDATE messages SET is_read = TRUE, read_at = NOW() WHERE id = $1 AND receiver_id = $2",
-                            )
-                            .bind(message_id)
-                            .bind(user_id)
-                            .execute(&state.db)
-                            .await;
+                            // Mark message as read (fire-and-forget, don't block WebSocket loop)
+                            let db = state.db.clone();
+                            let mid = message_id;
+                            tokio::spawn(async move {
+                                let _ = sqlx::query(
+                                    "UPDATE messages SET is_read = TRUE, read_at = NOW() WHERE id = $1 AND receiver_id = $2",
+                                )
+                                .bind(mid)
+                                .bind(user_id)
+                                .execute(&db)
+                                .await;
+                            });
 
                             let chat_msg = ChatMessage {
                                 message_type: "read".to_string(),

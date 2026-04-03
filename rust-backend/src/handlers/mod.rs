@@ -1044,20 +1044,65 @@ pub async fn discover(
         }
     }
 
-    // Get user and preferences (read-replica safe)
+    // Get user and preferences (LRU cache → DB fallback)
     let read_db = state.read_pool();
     let _user = fetch_user_by_id(read_db, user_id)
         .await?
         .ok_or_else(|| AppError::not_found("User not found"))?;
 
-    let prefs = fetch_user_preferences(read_db, user_id).await?;
-    let user_loc = fetch_user_location(read_db, user_id).await?;
+    // Preferences: check in-memory LRU first (5 min TTL)
+    let (min_age, max_age, only_verified, max_distance) = {
+        let cache = state.preferences_cache.read().await;
+        if let Some(cp) = cache.peek(&user_id) {
+            if crate::state::cache_fresh(cp.cached_at, crate::state::PREFS_CACHE_TTL) {
+                (cp.min_age.unwrap_or(18), cp.max_age.unwrap_or(100),
+                 cp.only_verified.unwrap_or(false), cp.max_distance.unwrap_or(state.config.default_max_distance_km))
+            } else { (0, 0, false, 0) } // stale → will refetch below
+        } else { (0, 0, false, 0) }
+    };
+    let (min_age, max_age, only_verified, max_distance) = if min_age == 0 {
+        let prefs = fetch_user_preferences(read_db, user_id).await?;
+        let cp = crate::state::CachedPreferences {
+            min_age: prefs.as_ref().and_then(|p| p.min_age),
+            max_age: prefs.as_ref().and_then(|p| p.max_age),
+            max_distance: prefs.as_ref().and_then(|p| p.max_distance),
+            only_verified: prefs.as_ref().and_then(|p| p.only_verified),
+            only_students: prefs.as_ref().and_then(|p| p.only_students),
+            cached_at: std::time::Instant::now(),
+        };
+        let result = (cp.min_age.unwrap_or(18), cp.max_age.unwrap_or(100),
+                      cp.only_verified.unwrap_or(false), cp.max_distance.unwrap_or(state.config.default_max_distance_km));
+        state.preferences_cache.write().await.put(user_id, cp);
+        result
+    } else { (min_age, max_age, only_verified, max_distance) };
 
-    // Build discovery query with filters
-    let min_age = prefs.as_ref().and_then(|p| p.min_age).unwrap_or(18);
-    let max_age = prefs.as_ref().and_then(|p| p.max_age).unwrap_or(100);
-    let only_verified = prefs.as_ref().and_then(|p| p.only_verified).unwrap_or(false);
-    let max_distance = prefs.as_ref().and_then(|p| p.max_distance).unwrap_or(state.config.default_max_distance_km);
+    // Location: check in-memory LRU first (5 min TTL)
+    let user_loc = {
+        let cache = state.location_cache.read().await;
+        if let Some(cl) = cache.peek(&user_id) {
+            if crate::state::cache_fresh(cl.cached_at, crate::state::LOCATION_CACHE_TTL) {
+                Some(cl.clone())
+            } else { None }
+        } else { None }
+    };
+    let user_loc = if let Some(loc) = user_loc {
+        Some(loc)
+    } else {
+        let loc_row = fetch_user_location(read_db, user_id).await?;
+        if let Some(ref lr) = loc_row {
+            let cl = crate::state::CachedLocation {
+                latitude: lr.latitude,
+                longitude: lr.longitude,
+                city: lr.city.clone(),
+                cached_at: std::time::Instant::now(),
+            };
+            state.location_cache.write().await.put(user_id, cl);
+        }
+        loc_row.map(|lr| crate::state::CachedLocation {
+            latitude: lr.latitude, longitude: lr.longitude,
+            city: lr.city, cached_at: std::time::Instant::now(),
+        })
+    };
 
     // Get users who haven't been liked/passed by this user
     let candidates = sqlx::query_as::<_, DiscoverUserRow>(
@@ -1110,28 +1155,28 @@ pub async fn discover(
         }
     };
 
-    // Fetch who has super-liked this user (among candidates)
-    let super_likers: std::collections::HashSet<i32> = sqlx::query_scalar::<_, i64>(
-        "SELECT from_user_id FROM swipes WHERE to_user_id = $1 AND action = 'superlike'"
-    )
-    .bind(user_id as i64)
-    .fetch_all(read_db)
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .map(|id| id as i32)
-    .collect();
-
-    // Batch-lookup university info for all candidates
-    let uni_map = batch_lookup_university(read_db, &candidates.iter().map(|c| c.id).collect::<Vec<_>>()).await?;
+    // Parallel fetch: super-likers + university info (don't wait sequentially)
+    let candidate_id_list: Vec<i32> = candidates.iter().map(|c| c.id).collect();
+    let (super_likers_result, uni_result) = tokio::join!(
+        async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT from_user_id FROM swipes WHERE to_user_id = $1 AND action = 'superlike'"
+            )
+            .bind(user_id as i64)
+            .fetch_all(read_db)
+            .await
+            .unwrap_or_default()
+        },
+        batch_lookup_university(read_db, &candidate_id_list)
+    );
+    let super_likers: std::collections::HashSet<i32> = super_likers_result.into_iter().map(|id| id as i32).collect();
+    let uni_map = uni_result?;
 
     let mut profiles: Vec<DiscoverProfile> = candidates
         .into_iter()
         .map(|c| {
             let distance_km = if let (Some(ul), Some(lat), Some(lon)) = (&user_loc, c.latitude, c.longitude) {
-                ul.latitude.zip(ul.longitude).map(|(ulat, ulon)| {
-                    haversine_km(ulat, ulon, lat, lon)
-                })
+                ul.latitude.zip(ul.longitude).map(|(ulat, ulon)| haversine_km(ulat, ulon, lat, lon))
             } else {
                 None
             };
@@ -1185,20 +1230,25 @@ pub async fn discover(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Log impression events for ML
+    // Log impression events for ML (fire-and-forget, don't block response)
     let slate_id = Uuid::new_v4().to_string();
-    for (rank, profile) in profiles.iter().enumerate() {
-        let _ = log_interaction_event(
-            &state.db,
-            user_id,
-            profile.id,
-            "impression",
-            Some(&slate_id),
-            Some(rank as i32),
-            Some("discover"),
-        )
-        .await;
-    }
+    let db_clone = state.db.clone();
+    let slate_id_clone = slate_id.clone();
+    let profile_ids: Vec<(usize, i32)> = profiles.iter().enumerate().map(|(rank, p)| (rank, p.id)).collect();
+    tokio::spawn(async move {
+        for (rank, profile_id) in profile_ids {
+            let _ = log_interaction_event(
+                &db_clone,
+                user_id,
+                profile_id,
+                "impression",
+                Some(&slate_id_clone),
+                Some(rank as i32),
+                Some("discover"),
+            )
+            .await;
+        }
+    });
 
     let response = json!({
         "profiles": profiles,

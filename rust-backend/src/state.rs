@@ -1,12 +1,64 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use axum::extract::FromRef;
+use lru::LruCache;
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use tokio::sync::{broadcast, Mutex, RwLock};
+
+// ============================================================================
+// In-Memory LRU Caches (eliminate repeated DB queries on hot paths)
+// ============================================================================
+
+/// Cached user preferences (discover hot path) — 5 min TTL
+#[derive(Clone, Debug)]
+pub struct CachedPreferences {
+    pub min_age: Option<i32>,
+    pub max_age: Option<i32>,
+    pub max_distance: Option<i32>,
+    pub only_verified: Option<bool>,
+    pub only_students: Option<bool>,
+    pub cached_at: Instant,
+}
+
+/// Cached user location (discover hot path) — 5 min TTL
+#[derive(Clone, Debug)]
+pub struct CachedLocation {
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub city: Option<String>,
+    pub cached_at: Instant,
+}
+
+/// Cached university info (static data) — 6 hour TTL
+#[derive(Clone, Debug)]
+pub struct CachedUniversity {
+    pub name: String,
+    pub tier: String,
+    pub cached_at: Instant,
+}
+
+/// Cached premium status — 10 min TTL
+#[derive(Clone, Debug)]
+pub struct CachedPremiumStatus {
+    pub is_premium: bool,
+    pub tier: Option<String>,
+    pub cached_at: Instant,
+}
+
+/// Check if a cache entry is still fresh
+pub fn cache_fresh(cached_at: Instant, ttl_secs: u64) -> bool {
+    cached_at.elapsed().as_secs() < ttl_secs
+}
+
+pub const PREFS_CACHE_TTL: u64 = 300;     // 5 min
+pub const LOCATION_CACHE_TTL: u64 = 300;  // 5 min
+pub const UNI_CACHE_TTL: u64 = 21600;     // 6 hours
+pub const PREMIUM_CACHE_TTL: u64 = 600;   // 10 min
 
 use crate::config::Config;
 use crate::models::CallSession;
@@ -51,6 +103,13 @@ pub struct AppState {
     pub moderation: Option<Arc<ModerationPipeline>>,
     // Event bus for domain events (notifications, analytics)
     pub event_bus: Arc<EventBus>,
+    // In-memory LRU caches (hot path optimization)
+    pub preferences_cache: Arc<RwLock<LruCache<i32, CachedPreferences>>>,
+    pub location_cache: Arc<RwLock<LruCache<i32, CachedLocation>>>,
+    pub university_cache: Arc<RwLock<LruCache<i32, CachedUniversity>>>,
+    pub premium_cache: Arc<RwLock<LruCache<i32, CachedPremiumStatus>>>,
+    /// Blocked user pairs for O(1) lookup — rebuilt every 5 min
+    pub blocked_pairs: Arc<RwLock<HashSet<(i32, i32)>>>,
 }
 
 // Allow extracting AppState from Arc<AppState>
@@ -284,6 +343,8 @@ impl Default for AppMetrics {
 pub struct ChatRooms {
     /// Map of match_id -> broadcast sender for that room
     rooms: HashMap<String, broadcast::Sender<ChatMessage>>,
+    /// Cache match participants: match_id -> (user1_id, user2_id) — avoids DB query per message
+    match_participants: HashMap<String, (i32, i32)>,
     /// Buffer size for broadcast channels (configurable via config)
     buffer_size: usize,
 }
@@ -292,7 +353,8 @@ impl ChatRooms {
     pub fn new() -> Self {
         Self {
             rooms: HashMap::new(),
-            buffer_size: 100, // Default
+            match_participants: HashMap::new(),
+            buffer_size: 100,
         }
     }
 
@@ -300,8 +362,21 @@ impl ChatRooms {
     pub fn with_buffer_size(buffer_size: usize) -> Self {
         Self {
             rooms: HashMap::new(),
+            match_participants: HashMap::new(),
             buffer_size,
         }
+    }
+
+    /// Cache match participants for O(1) receiver lookup
+    pub fn cache_participants(&mut self, match_id: &str, user1: i32, user2: i32) {
+        self.match_participants.insert(match_id.to_string(), (user1, user2));
+    }
+
+    /// Get the other user in a match — O(1), no DB query
+    pub fn get_other_user(&self, match_id: &str, user_id: i32) -> Option<i32> {
+        self.match_participants.get(match_id).map(|(u1, u2)| {
+            if *u1 == user_id { *u2 } else { *u1 }
+        })
     }
 
     /// Get or create a chat room for a match
@@ -327,6 +402,9 @@ impl ChatRooms {
     /// Remove all rooms with zero subscribers (periodic cleanup)
     pub fn cleanup_stale(&mut self) {
         self.rooms.retain(|_match_id, sender| sender.receiver_count() > 0);
+        // Clean participant cache for rooms that no longer exist
+        let active_rooms: HashSet<&String> = self.rooms.keys().collect();
+        self.match_participants.retain(|mid, _| active_rooms.contains(mid));
     }
 
     /// Get count of active rooms (for monitoring)
@@ -362,6 +440,8 @@ pub struct CallSessions {
     sessions: HashMap<String, CallSession>,
     /// Map of call_id -> broadcast sender for signaling
     signals: HashMap<String, broadcast::Sender<CallSignal>>,
+    /// Reverse index: user_id -> call_id for O(1) lookup
+    user_to_call: HashMap<i32, String>,
     /// Buffer size for call signal channels
     buffer_size: usize,
 }
@@ -371,6 +451,7 @@ impl CallSessions {
         Self {
             sessions: HashMap::new(),
             signals: HashMap::new(),
+            user_to_call: HashMap::new(),
             buffer_size: 50, // Default
         }
     }
@@ -380,6 +461,7 @@ impl CallSessions {
         Self {
             sessions: HashMap::new(),
             signals: HashMap::new(),
+            user_to_call: HashMap::new(),
             buffer_size,
         }
     }
@@ -387,6 +469,8 @@ impl CallSessions {
     /// Create a new call session
     pub fn create(&mut self, session: CallSession) -> broadcast::Sender<CallSignal> {
         let call_id = session.call_id.clone();
+        self.user_to_call.insert(session.caller_id, call_id.clone());
+        self.user_to_call.insert(session.callee_id, call_id.clone());
         self.sessions.insert(call_id.clone(), session);
         let (sender, _) = broadcast::channel(self.buffer_size);
         self.signals.insert(call_id, sender.clone());
@@ -405,20 +489,16 @@ impl CallSessions {
 
     /// End a call session
     pub fn end(&mut self, call_id: &str) {
-        self.sessions.remove(call_id);
+        if let Some(session) = self.sessions.remove(call_id) {
+            self.user_to_call.remove(&session.caller_id);
+            self.user_to_call.remove(&session.callee_id);
+        }
         self.signals.remove(call_id);
     }
 
-    /// Check if user is in an active call
+    /// Check if user is in an active call — O(1) via reverse index
     pub fn user_in_call(&self, user_id: i32) -> Option<String> {
-        for (call_id, session) in &self.sessions {
-            if session.status != "ended"
-                && (session.caller_id == user_id || session.callee_id == user_id)
-            {
-                return Some(call_id.clone());
-            }
-        }
-        None
+        self.user_to_call.get(&user_id).cloned()
     }
 }
 

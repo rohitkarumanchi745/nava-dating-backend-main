@@ -593,6 +593,12 @@ async fn main() {
         trust_safety,
         moderation,
         event_bus: event_bus.clone(),
+        // In-memory LRU caches
+        preferences_cache: Arc::new(RwLock::new(lru::LruCache::new(std::num::NonZeroUsize::new(10_000).unwrap()))),
+        location_cache: Arc::new(RwLock::new(lru::LruCache::new(std::num::NonZeroUsize::new(10_000).unwrap()))),
+        university_cache: Arc::new(RwLock::new(lru::LruCache::new(std::num::NonZeroUsize::new(500).unwrap()))),
+        premium_cache: Arc::new(RwLock::new(lru::LruCache::new(std::num::NonZeroUsize::new(10_000).unwrap()))),
+        blocked_pairs: Arc::new(RwLock::new(std::collections::HashSet::new())),
     };
 
     // Start DLQ processor for payment retry handling
@@ -687,6 +693,25 @@ async fn main() {
             }
         });
         info!("Chat room cleanup task started (interval: 5m)");
+    }
+
+    // Blocked pairs cache rebuild — every 5 minutes
+    {
+        let bp_db = state.db.clone();
+        let bp_cache = state.blocked_pairs.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok(rows) = sqlx::query_as::<_, (i32, i32)>(
+                    "SELECT blocker_id, blocked_id FROM user_blocks"
+                ).fetch_all(&bp_db).await {
+                    let mut set = std::collections::HashSet::with_capacity(rows.len());
+                    for (a, b) in rows { set.insert((a, b)); }
+                    *bp_cache.write().await = set;
+                }
+                tokio::time::sleep(Duration::from_secs(300)).await;
+            }
+        });
+        info!("Blocked pairs cache started (interval: 5m)");
     }
 
     // Build GraphQL schema
