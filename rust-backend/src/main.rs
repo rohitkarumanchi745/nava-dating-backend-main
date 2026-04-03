@@ -744,7 +744,13 @@ async fn main() {
             CorsLayer::new()
                 .allow_origin(allowed)
                 .allow_methods(Any)
-                .allow_headers(Any)
+                .allow_headers([
+                    axum::http::header::AUTHORIZATION,
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::header::ACCEPT,
+                    axum::http::header::ORIGIN,
+                    axum::http::HeaderName::from_static("x-requested-with"),
+                ])
                 .allow_credentials(true)
         }
     };
