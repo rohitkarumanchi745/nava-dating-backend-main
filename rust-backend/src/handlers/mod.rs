@@ -1253,6 +1253,9 @@ pub async fn discover(
     let response = json!({
         "profiles": profiles,
         "slate_id": slate_id,
+        "count": profiles.len(),
+        "prefetch_at": (profiles.len() as f64 * 0.7).ceil() as usize,
+        "has_more": profiles.len() as i32 >= limit,
     });
 
     // Cache the result in Redis (120s TTL, fail gracefully)
@@ -1753,9 +1756,22 @@ pub async fn get_match(
 pub async fn get_matches(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, AppError> {
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let limit: i64 = params
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(30)
+        .min(100)
+        .max(1);
+
+    let before: Option<NaiveDateTime> = params
+        .get("before")
+        .and_then(|v| NaiveDateTime::parse_from_str(v, "%Y-%m-%dT%H:%M:%S%.f").ok()
+            .or_else(|| NaiveDateTime::parse_from_str(v, "%Y-%m-%dT%H:%M:%S").ok()));
 
     let read_db = state.read_pool();
     let matches = sqlx::query_as::<_, MatchRow>(
@@ -1768,15 +1784,22 @@ pub async fn get_matches(
         WHERE (user1_id = $1 OR user2_id = $1)
           AND is_mutual_match = TRUE
           AND status = 'active'
+          AND ($2::timestamp IS NULL OR last_message_at < $2)
         ORDER BY last_message_at DESC NULLS LAST, created_at DESC
+        LIMIT $3
         "#,
     )
     .bind(user_id)
+    .bind(before)
+    .bind(limit + 1)
     .fetch_all(read_db)
     .await?;
 
+    let has_more = matches.len() as i64 > limit;
+    let matches_page: Vec<_> = matches.into_iter().take(limit as usize).collect();
+
     let mut results = Vec::new();
-    for m in matches {
+    for m in &matches_page {
         let other_id = if m.user1_id == user_id { m.user2_id } else { m.user1_id };
         if let Some(other_user) = fetch_user_by_id(read_db, other_id).await? {
             results.push(json!({
@@ -1797,7 +1820,17 @@ pub async fn get_matches(
         }
     }
 
-    Ok(Json(json!({ "matches": results })))
+    let next_cursor = if has_more {
+        matches_page.last().and_then(|m| m.last_message_at.map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.f").to_string()))
+    } else {
+        None
+    };
+
+    Ok(Json(json!({
+        "matches": results,
+        "next_cursor": next_cursor,
+        "has_more": has_more
+    })))
 }
 
 // ============================================================================
@@ -13123,4 +13156,175 @@ pub async fn graph_write_edge(
     state.graph.write_edge(from_type, &from_id, edge_type, to_type, &to_id, properties).await?;
 
     Ok(Json(json!({ "ok": true, "edge": format!("{} -[{}]-> {}", from_id, edge_type, to_id) })))
+}
+
+// ============================================================================
+// App Bootstrap & Badges — reduce cold-start round-trips
+// ============================================================================
+
+/// GET /app/bootstrap — Single call returns everything needed on app launch.
+/// Runs profile, matches, badge counts, and preferences queries in parallel
+/// via `tokio::join!` so total latency ≈ slowest single query (~20 ms).
+pub async fn app_bootstrap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let read_db = state.read_pool();
+
+    // ── parallel fan-out ────────────────────────────────────────────────
+    let (user_res, matches_res, unread_messages, unread_likes, new_matches, prefs_res) = tokio::join!(
+        // 1. User profile
+        fetch_user_by_id(read_db, user_id),
+        // 2. Recent mutual matches (last 50)
+        sqlx::query_as::<_, MatchRow>(
+            r#"
+            SELECT id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match,
+                   ai_compatibility_score, visual_compatibility_score, match_reason,
+                   messages_count, voice_messages_count, last_message_at, can_send_text,
+                   status, blocked_by_user_id, created_at, updated_at
+            FROM matches
+            WHERE (user1_id = $1 OR user2_id = $1)
+              AND is_mutual_match = TRUE
+              AND status = 'active'
+            ORDER BY last_message_at DESC NULLS LAST, created_at DESC
+            LIMIT 50
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(read_db),
+        // 3. Unread message count
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM messages WHERE receiver_id = $1 AND is_read = FALSE"
+        )
+        .bind(user_id)
+        .fetch_one(read_db),
+        // 4. Unread likes (pending incoming likes)
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM matches WHERE user2_id = $1 AND user2_liked IS NULL AND user1_liked = TRUE"
+        )
+        .bind(user_id)
+        .fetch_one(read_db),
+        // 5. New mutual matches in the last 24 h
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM matches WHERE (user1_id = $1 OR user2_id = $1) AND is_mutual_match = TRUE AND created_at > NOW() - INTERVAL '24 hours'"
+        )
+        .bind(user_id)
+        .fetch_one(read_db),
+        // 6. User preferences
+        fetch_user_preferences(read_db, user_id)
+    );
+
+    // ── unwrap results ──────────────────────────────────────────────────
+    let user = user_res?
+        .ok_or_else(|| AppError::not_found("User not found"))?;
+
+    let matches_rows = matches_res?;
+
+    // Build lightweight match list (id, other user name/photo, last message, unread)
+    let mut matches_out = Vec::with_capacity(matches_rows.len());
+    for m in &matches_rows {
+        let other_id = if m.user1_id == user_id { m.user2_id } else { m.user1_id };
+        if let Some(other_user) = fetch_user_by_id(read_db, other_id).await? {
+            matches_out.push(json!({
+                "match_id": m.id,
+                "is_mutual": true,
+                "matched_at": m.created_at.map(format_datetime),
+                "can_send_text": m.can_send_text.unwrap_or(false),
+                "messages_count": m.messages_count.unwrap_or(0),
+                "voice_messages_count": m.voice_messages_count.unwrap_or(0),
+                "last_message_at": m.last_message_at.map(format_datetime),
+                "other_user": {
+                    "id": other_user.id,
+                    "name": other_user.name,
+                    "photos": get_user_photos(&other_user),
+                    "is_verified": other_user.is_verified.unwrap_or(false),
+                }
+            }));
+        }
+    }
+
+    // Profile payload (essential fields only)
+    let profile = json!({
+        "id": user.id,
+        "name": user.name,
+        "dob": user.dob.map(format_date),
+        "age": user.dob.map(calculate_age),
+        "gender": user.gender,
+        "bio": user.bio,
+        "location": user.location_text,
+        "photos": get_user_photos(&user),
+        "is_profile_complete": user.is_profile_complete,
+        "profile_completion": compute_profile_completion(&user),
+        "is_verified": user.is_verified,
+        "is_student_verified": user.is_student_verified,
+    });
+
+    let preferences = prefs_res?.map(|pref| json!({
+        "min_age": pref.min_age,
+        "max_age": pref.max_age,
+        "preferred_genders": pref.preferred_genders,
+        "max_distance_km": pref.max_distance,
+        "only_verified": pref.only_verified,
+        "only_students": pref.only_students,
+        "preferred_locations": pref.preferred_locations,
+    }));
+
+    Ok(Json(json!({
+        "profile": profile,
+        "matches": matches_out,
+        "badges": {
+            "unread_messages": unread_messages.unwrap_or(0),
+            "unread_likes": unread_likes.unwrap_or(0),
+            "new_matches_24h": new_matches.unwrap_or(0),
+        },
+        "preferences": preferences,
+    })))
+}
+
+/// GET /app/badges — Lightweight unread counts for app badges.
+/// Called on app foreground / tab switches; must be very fast.
+pub async fn app_badges(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+    let read_db = state.read_pool();
+
+    let (unread_messages, unread_reel_messages, unread_likes, new_matches) = tokio::join!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM messages WHERE receiver_id = $1 AND is_read = FALSE"
+        )
+        .bind(user_id)
+        .fetch_one(read_db),
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM reel_messages WHERE receiver_id = $1 AND is_read = FALSE"
+        )
+        .bind(user_id)
+        .fetch_one(read_db),
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM matches WHERE user2_id = $1 AND user2_liked IS NULL AND user1_liked = TRUE"
+        )
+        .bind(user_id)
+        .fetch_one(read_db),
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM matches WHERE (user1_id = $1 OR user2_id = $1) AND is_mutual_match = TRUE AND created_at > NOW() - INTERVAL '24 hours'"
+        )
+        .bind(user_id)
+        .fetch_one(read_db),
+    );
+
+    let msgs = unread_messages.unwrap_or(0);
+    let reel_msgs = unread_reel_messages.unwrap_or(0);
+    let likes = unread_likes.unwrap_or(0);
+
+    Ok(Json(json!({
+        "unread_messages": msgs,
+        "unread_reel_messages": reel_msgs,
+        "unread_likes": likes,
+        "new_matches_24h": new_matches.unwrap_or(0),
+        "total": msgs + reel_msgs + likes,
+    })))
 }

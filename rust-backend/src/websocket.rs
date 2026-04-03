@@ -3,6 +3,8 @@ use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::{
     auth::decode_access_token,
@@ -53,7 +55,8 @@ pub async fn handle_chat(socket: WebSocket, state: AppState, match_id: String, t
     };
     let mut rx = tx.subscribe();
 
-    let (mut sender, mut receiver) = socket.split();
+    let (sender, mut receiver) = socket.split();
+    let sender = Arc::new(Mutex::new(sender));
 
     // Send welcome message
     let welcome = json!({
@@ -62,10 +65,23 @@ pub async fn handle_chat(socket: WebSocket, state: AppState, match_id: String, t
         "user_id": user_id,
         "timestamp": Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
     });
-    let _ = sender.send(Message::Text(welcome.to_string().into())).await;
+    let _ = sender.lock().await.send(Message::Text(welcome.to_string().into())).await;
+
+    // Spawn keepalive ping every 30 seconds
+    let ping_sender = Arc::clone(&sender);
+    let ping_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if ping_sender.lock().await.send(Message::Ping(vec![].into())).await.is_err() {
+                break; // Connection closed
+            }
+        }
+    });
 
     // Spawn task to forward broadcasts to this client
     let match_id_clone = match_id.clone();
+    let fwd_sender = Arc::clone(&sender);
     let forward_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             // Don't echo back to sender
@@ -79,7 +95,7 @@ pub async fn handle_chat(socket: WebSocket, state: AppState, match_id: String, t
                 "message_id": msg.message_id,
                 "timestamp": msg.timestamp,
             });
-            if sender.send(Message::Text(payload.to_string().into())).await.is_err() {
+            if fwd_sender.lock().await.send(Message::Text(payload.to_string().into())).await.is_err() {
                 break;
             }
         }
@@ -87,6 +103,13 @@ pub async fn handle_chat(socket: WebSocket, state: AppState, match_id: String, t
 
     // Handle incoming messages
     while let Some(Ok(msg)) = receiver.next().await {
+        if let Message::Ping(_) | Message::Pong(_) = msg {
+            // Ping/Pong handled by framework; ignore in application layer
+            continue;
+        }
+        if let Message::Close(_) = msg {
+            break;
+        }
         if let Message::Text(text) = msg {
             if let Ok(payload) = serde_json::from_str::<ChatPayload>(&text) {
                 match payload.message_type.as_str() {
@@ -195,12 +218,11 @@ pub async fn handle_chat(socket: WebSocket, state: AppState, match_id: String, t
                     _ => {}
                 }
             }
-        } else if let Message::Close(_) = msg {
-            break;
         }
     }
 
     // Cleanup
+    ping_task.abort();
     forward_task.abort();
     {
         let mut rooms = state.chat_rooms.write().await;

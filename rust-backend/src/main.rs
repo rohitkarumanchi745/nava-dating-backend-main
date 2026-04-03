@@ -126,6 +126,8 @@ use handlers::{
     update_privacy_settings, get_privacy_settings,
     // Vision
     verify_selfie, vision_analyze,
+    // App Bootstrap & Badges
+    app_bootstrap, app_badges,
     // Admin
     admin_stats, admin_override_identity, secrets_status,
     // WebSocket
@@ -787,6 +789,9 @@ async fn main() {
         .route("/profile/me", get(profile_me))
         .route("/profile/city-arrival", put(set_city_arrival))
         .route("/preferences", post(update_preferences))
+        // App Bootstrap & Badges (cold-start + lightweight polling)
+        .route("/app/bootstrap", get(app_bootstrap))
+        .route("/app/badges", get(app_badges))
         // Voice Intro
         .route("/voice-intro", post(upload_voice_intro))
         .route("/voice-intro/url", post(upload_voice_intro_json))

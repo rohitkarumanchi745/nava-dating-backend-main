@@ -664,11 +664,17 @@ impl QueryRoot {
         }).collect())
     }
 
-    /// Get all matches for current user
-    async fn matches(&self, ctx: &Context<'_>) -> Result<Vec<Match>> {
+    /// Get matches for current user (paginated)
+    async fn matches(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 30)] limit: Option<i32>,
+    ) -> Result<Vec<Match>> {
         let state = ctx.data::<AppState>()?;
         let user_id = get_user_id_from_context(ctx)?;
         let loader = ctx.data::<DataLoader<UserLoader>>()?;
+
+        let effective_limit: i64 = (limit.unwrap_or(30) as i64).min(100).max(1);
 
         let rows = sqlx::query_as::<_, MatchRow>(
             r#"
@@ -685,9 +691,11 @@ impl QueryRoot {
                 AND msg.sender_id != $1
             WHERE (m.user1_id = $1 OR m.user2_id = $1) AND m.is_mutual_match = true
             ORDER BY m.created_at DESC
+            LIMIT $2
             "#,
         )
         .bind(user_id)
+        .bind(effective_limit)
         .fetch_all(&state.db)
         .await?;
 
