@@ -116,6 +116,7 @@ use handlers::{
     connect_account, get_connected_accounts,
     // Fitness
     sync_fitness, get_fitness_profile, create_fitness_challenge, get_fitness_challenges,
+    get_fitness_stats, get_fitness_workouts, get_fitness_goals, get_fitness_leaderboard,
     // Outdoor Spots + Weather + Memories
     get_outdoor_spots, create_outdoor_spot, log_spot_visit, get_spot_memories, get_seasonal_guide, get_location_activity,
     track_map_search, get_map_trending, get_map_user_interests,
@@ -1008,6 +1009,10 @@ async fn main() {
         // Fitness
         .route("/fitness/sync", post(sync_fitness))
         .route("/fitness/profile", get(get_fitness_profile))
+        .route("/fitness/stats", get(get_fitness_stats))
+        .route("/fitness/workouts", get(get_fitness_workouts))
+        .route("/fitness/goals", get(get_fitness_goals))
+        .route("/fitness/leaderboard", get(get_fitness_leaderboard))
         .route("/fitness/challenge", post(create_fitness_challenge))
         .route("/fitness/challenges", get(get_fitness_challenges))
         // Outdoor Spots + Weather + Memories

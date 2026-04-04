@@ -4546,6 +4546,170 @@ pub async fn get_fitness_profile(
     }
 }
 
+/// GET /fitness/stats — self stats in the field names iOS expects.
+/// Never 404s for new users — returns zeros. Also derives a fitness_score in 0..100.
+pub async fn get_fitness_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)? as i64;
+
+    let row = sqlx::query_as::<_, (Option<i32>, Option<i32>, Option<i32>, Option<i32>)>(
+        r#"SELECT weekly_active_minutes, weekly_calories, weekly_workouts, streak_days
+           FROM user_fitness_profile WHERE user_id = $1"#,
+    ).bind(user_id).fetch_optional(&state.db).await?;
+
+    let (wam, wcal, wwk, streak) = row.map(|r| (r.0.unwrap_or(0), r.1.unwrap_or(0), r.2.unwrap_or(0), r.3.unwrap_or(0)))
+        .unwrap_or((0, 0, 0, 0));
+
+    // fitness_score in 0..100, each component capped at 1.0 then weighted.
+    let active_part   = (wam as f64 / 150.0).min(1.0)  * 30.0; // WHO: 150 min/week
+    let workouts_part = (wwk as f64 / 5.0).min(1.0)    * 20.0; // 5 sessions/week
+    let streak_part   = (streak as f64 / 30.0).min(1.0) * 30.0; // 30-day streak
+    let cal_part      = (wcal as f64 / 3500.0).min(1.0) * 20.0;
+    let fitness_score = (active_part + workouts_part + streak_part + cal_part).round() as i32;
+
+    Ok(Json(json!({
+        "weekly_calories": wcal,
+        "weekly_active_minutes": wam,
+        "weekly_workout_count": wwk,
+        "current_streak": streak,
+        "fitness_score": fitness_score
+    })))
+}
+
+/// GET /fitness/workouts?limit=&offset=
+pub async fn get_fitness_workouts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)? as i64;
+    let limit: i64 = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(20).clamp(1, 100);
+    let offset: i64 = params.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0).max(0);
+
+    let rows = sqlx::query_as::<_, (i64, String, Option<f64>, Option<f64>, Option<f64>, Option<String>, chrono::NaiveDateTime, Option<String>)>(
+        r#"SELECT id, activity_type, calories_burned, duration_min, distance_km, location_name, started_at, source
+           FROM user_fitness_activities WHERE user_id = $1
+           ORDER BY started_at DESC LIMIT $2 OFFSET $3"#,
+    ).bind(user_id).bind(limit).bind(offset).fetch_all(&state.db).await?;
+
+    let workouts: Vec<Value> = rows.into_iter().map(|r| json!({
+        "id": r.0,
+        "activity_type": r.1,
+        "calories": r.2.map(|v| v as i32).unwrap_or(0),
+        "duration_min": r.3.map(|v| v as i32).unwrap_or(0),
+        "distance_km": r.4.unwrap_or(0.0),
+        "location": r.5,
+        "started_at": format_datetime(r.6),
+        "source": r.7
+    })).collect();
+
+    Ok(Json(json!({ "workouts": workouts, "limit": limit, "offset": offset })))
+}
+
+/// GET /fitness/goals
+pub async fn get_fitness_goals(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)? as i64;
+
+    // Ensure table exists — idempotent, cheap.
+    let _ = sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS user_fitness_goals (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            goal_type TEXT NOT NULL,
+            target_value DOUBLE PRECISION NOT NULL,
+            unit TEXT NOT NULL,
+            period TEXT NOT NULL DEFAULT 'weekly',
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )"#,
+    ).execute(&state.db).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_fitness_goals_user ON user_fitness_goals(user_id, is_active)")
+        .execute(&state.db).await;
+
+    let goals = sqlx::query_as::<_, (i64, String, f64, String, String, bool)>(
+        "SELECT id, goal_type, target_value, unit, period, is_active FROM user_fitness_goals WHERE user_id = $1 ORDER BY created_at DESC"
+    ).bind(user_id).fetch_all(&state.db).await.unwrap_or_default();
+
+    // Compute current progress for weekly goals from user_fitness_profile.
+    let prof = sqlx::query_as::<_, (Option<i32>, Option<i32>, Option<i32>, Option<f64>, Option<i32>)>(
+        "SELECT weekly_active_minutes, weekly_calories, weekly_workouts, total_distance_km, streak_days FROM user_fitness_profile WHERE user_id = $1"
+    ).bind(user_id).fetch_optional(&state.db).await?;
+    let (wam, wcal, wwk, tot_dist, streak) = prof.map(|r| (
+        r.0.unwrap_or(0), r.1.unwrap_or(0), r.2.unwrap_or(0), r.3.unwrap_or(0.0), r.4.unwrap_or(0)
+    )).unwrap_or((0, 0, 0, 0.0, 0));
+
+    let goal_list: Vec<Value> = goals.into_iter().map(|(id, gtype, target, unit, period, active)| {
+        let current = match gtype.as_str() {
+            "active_minutes" => wam as f64,
+            "calories"       => wcal as f64,
+            "workouts"       => wwk as f64,
+            "distance_km"    => tot_dist,
+            "streak"         => streak as f64,
+            _ => 0.0,
+        };
+        let pct = if target > 0.0 { (current / target * 100.0).min(100.0) } else { 0.0 };
+        json!({
+            "id": id, "goal_type": gtype, "target_value": target, "unit": unit,
+            "period": period, "is_active": active, "current_value": current, "progress_pct": pct
+        })
+    }).collect();
+
+    Ok(Json(json!({ "goals": goal_list })))
+}
+
+/// GET /fitness/leaderboard?metric=weekly_calories&limit=50
+/// Respects share_fitness privacy flag on users.
+pub async fn get_fitness_leaderboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let viewer_id = decode_access_token(&token, &state.config.secret_key)? as i64;
+    let metric = params.get("metric").cloned().unwrap_or_else(|| "weekly_calories".to_string());
+    let limit: i64 = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50).clamp(1, 100);
+
+    let (col, label) = match metric.as_str() {
+        "weekly_active_minutes" => ("weekly_active_minutes", "weekly_active_minutes"),
+        "weekly_workouts"       => ("weekly_workouts", "weekly_workouts"),
+        "streak_days"           => ("streak_days", "streak_days"),
+        _                       => ("weekly_calories", "weekly_calories"),
+    };
+
+    let sql = format!(
+        r#"SELECT p.user_id, u.full_name, u.profile_photo_1, p.{col}::bigint, p.streak_days
+           FROM user_fitness_profile p
+           JOIN users u ON u.id = p.user_id
+           WHERE COALESCE(u.share_fitness, FALSE) = TRUE OR u.id = $1
+           ORDER BY p.{col} DESC NULLS LAST
+           LIMIT $2"#
+    );
+
+    let rows = sqlx::query_as::<_, (i64, Option<String>, Option<String>, Option<i64>, Option<i32>)>(&sql)
+        .bind(viewer_id).bind(limit).fetch_all(&state.db).await.unwrap_or_default();
+
+    let mut my_rank: Option<i64> = None;
+    let entries: Vec<Value> = rows.into_iter().enumerate().map(|(i, r)| {
+        let rank = (i as i64) + 1;
+        if r.0 == viewer_id { my_rank = Some(rank); }
+        json!({
+            "rank": rank, "user_id": r.0, "full_name": r.1, "photo": r.2,
+            "value": r.3.unwrap_or(0), "streak_days": r.4.unwrap_or(0)
+        })
+    }).collect();
+
+    Ok(Json(json!({ "metric": label, "my_rank": my_rank, "entries": entries })))
+}
+
 /// POST /fitness/challenge — create a fitness challenge with a match
 pub async fn create_fitness_challenge(
     State(state): State<AppState>,
