@@ -1277,8 +1277,34 @@ pub async fn discover(
     let viewer_spd = viewer_behavior.as_ref().and_then(|(_, s, _, _)| *s).unwrap_or(0.0);
     let viewer_profile_missing = viewer_behavior.is_none();
 
-    use crate::services::shadow_scoring::{self as ss, GraphFeatures, BehaviorFeatures, LocationFeatures};
-    let mut rows: Vec<(i32, f64, f64, ss::ShadowComponents, GraphFeatures, BehaviorFeatures, LocationFeatures, f64, f64)> = Vec::with_capacity(profiles.len());
+    // Music signal: batch-fetch shared genre counts (same pattern as GraphQL resolver).
+    let viewer_genre_count: i32 = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM user_genre_profile WHERE user_id = $1"
+    ).bind(user_id).fetch_one(read_db).await.unwrap_or(0) as i32;
+
+    let shared_genre_counts: std::collections::HashMap<i32, i32> = if viewer_genre_count > 0 && !cand_ids.is_empty() {
+        let cand_i64s: Vec<i64> = cand_ids.iter().map(|&i| i as i64).collect();
+        sqlx::query_as::<_, (i64, i64)>(
+            r#"SELECT b.user_id, COUNT(*)::bigint
+               FROM user_genre_profile a
+               JOIN user_genre_profile b ON a.genre = b.genre
+               WHERE a.user_id = $1 AND b.user_id = ANY($2)
+               GROUP BY b.user_id"#,
+        )
+        .bind(user_id as i64)
+        .bind(&cand_i64s)
+        .fetch_all(read_db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(cid, cnt)| (cid as i32, cnt as i32))
+        .collect()
+    } else { std::collections::HashMap::new() };
+
+    let music_missing_viewer = viewer_genre_count <= 0;
+
+    use crate::services::shadow_scoring::{self as ss, GraphFeatures, BehaviorFeatures, LocationFeatures, MusicFeatures};
+    let mut rows: Vec<(i32, f64, f64, ss::ShadowComponents, GraphFeatures, BehaviorFeatures, LocationFeatures, MusicFeatures, f64, f64)> = Vec::with_capacity(profiles.len());
     for p in &profiles {
         let base = p.compatibility_score.unwrap_or(0.0);
         let base_norm = if base > 1.5 { base / 100.0 } else { base };
@@ -1318,8 +1344,15 @@ pub async fn discover(
             stale: stale_location_viewer,
         };
 
-        let components = ss::compute(base_norm, gfeat, bfeat, lfeat);
-        rows.push((p.id, base_norm, base, components, gfeat, bfeat, lfeat, peak_gap, activity_gap));
+        let shared = *shared_genre_counts.get(&p.id).unwrap_or(&0);
+        let mfeat = MusicFeatures {
+            shared_genre_count: shared,
+            viewer_genre_count,
+            missing: music_missing_viewer,
+        };
+
+        let components = ss::compute(base_norm, gfeat, bfeat, lfeat, mfeat);
+        rows.push((p.id, base_norm, base, components, gfeat, bfeat, lfeat, mfeat, peak_gap, activity_gap));
     }
 
     let mut current_rank_map: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
@@ -1347,7 +1380,7 @@ pub async fn discover(
         let current_ranks = current_rank_map.clone();
         let shadow_ranks = shadow_rank_map.clone();
         tokio::spawn(async move {
-            for (cid, base_norm, base_raw, comps, g, b, l, peak_gap, activity_gap) in rows_to_log {
+            for (cid, base_norm, base_raw, comps, g, b, l, m, peak_gap, activity_gap) in rows_to_log {
                 let was_shown = shown_ids.contains(&cid);
                 let c_rank = current_ranks.get(&cid).copied();
                 let s_rank = shadow_ranks.get(&cid).copied();
@@ -1355,21 +1388,21 @@ pub async fn discover(
                     r#"INSERT INTO discover_feature_log
                        (request_id, viewer_user_id, candidate_user_id, was_shown, current_rank, shadow_rank,
                         current_score, shadow_score, base_score, category_score, attractiveness_score,
-                        graph_score, behavior_score, location_score,
+                        graph_score, behavior_score, location_score, music_score,
                         fof_count, mutual_like_neighbors, same_city, viewer_is_traveler, candidate_is_traveler,
-                        peak_hour_gap, activity_level_gap,
-                        behavior_profile_missing, graph_features_missing, stale_location,
+                        peak_hour_gap, activity_level_gap, music_shared_genres,
+                        behavior_profile_missing, graph_features_missing, stale_location, music_features_missing,
                         candidate_pool_size, scoring_version, shadow_version)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,'v1','shadow_v1')"#
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,'v1','shadow_v1')"#
                 )
                 .bind(req_id).bind(user_id).bind(cid).bind(was_shown).bind(c_rank).bind(s_rank)
                 .bind(base_norm).bind(comps.shadow_score).bind(base_norm)
                 .bind(None::<f64>).bind(Some(base_raw))
-                .bind(comps.graph_score).bind(comps.behavior_score).bind(comps.location_score)
+                .bind(comps.graph_score).bind(comps.behavior_score).bind(comps.location_score).bind(comps.music_score)
                 .bind(g.fof_count).bind(g.mutual_like_neighbors)
                 .bind(l.same_city).bind(l.viewer_is_traveler).bind(l.candidate_is_traveler)
-                .bind(peak_gap).bind(activity_gap)
-                .bind(b.missing).bind(g.missing).bind(l.stale)
+                .bind(peak_gap).bind(activity_gap).bind(m.shared_genre_count)
+                .bind(b.missing).bind(g.missing).bind(l.stale).bind(m.missing)
                 .bind(candidate_pool_size)
                 .execute(&db).await;
             }

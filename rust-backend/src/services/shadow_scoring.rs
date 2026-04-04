@@ -40,12 +40,21 @@ pub struct LocationFeatures {
     pub stale: bool,
 }
 
+/// Music signal inputs (from user_genre_profile overlap).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MusicFeatures {
+    pub shared_genre_count: i32,
+    pub viewer_genre_count: i32,
+    pub missing: bool,
+}
+
 /// Computed components for one candidate.
 #[derive(Debug, Clone, Copy)]
 pub struct ShadowComponents {
     pub graph_score: f64,
     pub behavior_score: f64,
     pub location_score: f64,
+    pub music_score: f64,
     pub shadow_score: f64,
 }
 
@@ -73,14 +82,27 @@ pub fn compute_location_score(l: LocationFeatures) -> f64 {
     0.0
 }
 
-/// Apply the first-pass shadow formula.
+/// music_score in [0, 1]. Shared genres / viewer's total genres (not full Jaccard —
+/// mirrors the existing GraphQL formula for A/B comparability). Returns 0.0 when
+/// the viewer has no genre profile (can't compute overlap).
+pub fn compute_music_score(m: MusicFeatures) -> f64 {
+    if m.missing || m.viewer_genre_count <= 0 { return 0.0; }
+    (m.shared_genre_count as f64 / m.viewer_genre_count as f64).clamp(0.0, 1.0)
+}
+
+/// Apply the first-pass shadow formula (now with music as the 5th signal).
 pub fn shadow_formula(
     base_score: f64,
     graph_score: f64,
     behavior_score: f64,
     location_score: f64,
+    music_score: f64,
 ) -> f64 {
-    base_score + 0.15 * graph_score + 0.10 * behavior_score + location_score
+    base_score
+        + 0.15 * graph_score
+        + 0.10 * behavior_score
+        + location_score
+        + 0.10 * music_score
 }
 
 /// Compose everything for one candidate.
@@ -89,12 +111,14 @@ pub fn compute(
     g: GraphFeatures,
     b: BehaviorFeatures,
     l: LocationFeatures,
+    m: MusicFeatures,
 ) -> ShadowComponents {
     let graph_score = compute_graph_score(g);
     let behavior_score = compute_behavior_score(b);
     let location_score = compute_location_score(l);
-    let shadow_score = shadow_formula(base_score, graph_score, behavior_score, location_score);
-    ShadowComponents { graph_score, behavior_score, location_score, shadow_score }
+    let music_score = compute_music_score(m);
+    let shadow_score = shadow_formula(base_score, graph_score, behavior_score, location_score, music_score);
+    ShadowComponents { graph_score, behavior_score, location_score, music_score, shadow_score }
 }
 
 /// Circular 24h hour gap folded to [0, 12].
@@ -139,8 +163,21 @@ mod tests {
 
     #[test]
     fn shadow_formula_matches_spec() {
-        let s = shadow_formula(0.8, 1.0, 1.0, 0.15);
+        // base + 0.15*1 + 0.10*1 + 0.15 + 0.10*0 = 0.8+0.15+0.10+0.15 = 1.20
+        let s = shadow_formula(0.8, 1.0, 1.0, 0.15, 0.0);
         assert!((s - 1.20).abs() < 1e-9);
+        // full music: 1.20 + 0.10 = 1.30
+        let s2 = shadow_formula(0.8, 1.0, 1.0, 0.15, 1.0);
+        assert!((s2 - 1.30).abs() < 1e-9);
+    }
+
+    #[test]
+    fn music_score_bounds() {
+        assert_eq!(compute_music_score(MusicFeatures { missing: true, ..Default::default() }), 0.0);
+        assert_eq!(compute_music_score(MusicFeatures { shared_genre_count: 3, viewer_genre_count: 0, missing: false }), 0.0);
+        assert_eq!(compute_music_score(MusicFeatures { shared_genre_count: 0, viewer_genre_count: 5, missing: false }), 0.0);
+        assert!((compute_music_score(MusicFeatures { shared_genre_count: 3, viewer_genre_count: 5, missing: false }) - 0.6).abs() < 1e-9);
+        assert_eq!(compute_music_score(MusicFeatures { shared_genre_count: 10, viewer_genre_count: 5, missing: false }), 1.0);
     }
 
     #[test]
