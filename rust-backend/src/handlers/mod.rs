@@ -1297,64 +1297,12 @@ pub async fn like_user(
         return Err(AppError::not_found("User not found"));
     }
 
-    // Determine user order (lower ID is user1)
-    let (user1_id, user2_id, is_user1) = if user_id < target_id {
-        (user_id, target_id, true)
-    } else {
-        (target_id, user_id, false)
-    };
-
-    // Check for existing match record
-    let existing = sqlx::query_as::<_, MatchCheckRow>(
-        "SELECT id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match FROM matches WHERE user1_id = $1 AND user2_id = $2",
-    )
-    .bind(user1_id)
-    .bind(user2_id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let (match_id, is_mutual) = match existing {
-        Some(m) => {
-            // Update existing match
-            let other_liked = if is_user1 { m.user2_liked } else { m.user1_liked };
-            let is_mutual = other_liked.unwrap_or(false);
-
-            let query = if is_user1 {
-                "UPDATE matches SET user1_liked = TRUE, is_mutual_match = $1, updated_at = NOW() WHERE id = $2"
-            } else {
-                "UPDATE matches SET user2_liked = TRUE, is_mutual_match = $1, updated_at = NOW() WHERE id = $2"
-            };
-
-            sqlx::query(query)
-                .bind(is_mutual)
-                .bind(&m.id)
-                .execute(&state.db)
-                .await?;
-
-            (m.id, is_mutual)
-        }
-        None => {
-            // Create new match record
-            let new_id = Uuid::new_v4().to_string();
-            let (u1_liked, u2_liked) = if is_user1 { (true, false) } else { (false, true) };
-
-            sqlx::query(
-                r#"
-                INSERT INTO matches (id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match, status, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, FALSE, 'active', NOW(), NOW())
-                "#,
-            )
-            .bind(&new_id)
-            .bind(user1_id)
-            .bind(user2_id)
-            .bind(u1_liked)
-            .bind(u2_liked)
-            .execute(&state.db)
-            .await?;
-
-            (new_id, false)
-        }
-    };
+    // Delegate to swipe_service (shared with GraphQL)
+    let outcome = crate::services::swipe_service::execute_like(
+        &state.db, user_id, target_id, "discover"
+    ).await?;
+    let match_id = outcome.match_id;
+    let is_mutual = outcome.is_mutual;
 
     // Store message request if provided
     let message_text = payload.message.as_deref()
@@ -1383,9 +1331,10 @@ pub async fn like_user(
         }
     }
 
-    // Log like event
-    let event_type = if message_text.is_some() { "like_with_message" } else { "like" };
-    let _ = log_interaction_event(&state.db, user_id, target_id, event_type, None, None, Some("discover")).await;
+    // Log like_with_message if message was attached (service already logged 'like')
+    if message_text.is_some() {
+        let _ = log_interaction_event(&state.db, user_id, target_id, "like_with_message", None, None, Some("discover")).await;
+    }
 
     // Feed RL agent with like signal (non-blocking, never fails the request)
     let ml = state.ml.clone();
@@ -1616,55 +1565,8 @@ pub async fn pass_user(
         ml.record_swipe(&db, user_id, target_id, false).await;
     });
 
-    // Determine user order
-    let (user1_id, user2_id, is_user1) = if user_id < target_id {
-        (user_id, target_id, true)
-    } else {
-        (target_id, user_id, false)
-    };
-
-    // Check for existing match record and mark as passed
-    let existing = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM matches WHERE user1_id = $1 AND user2_id = $2",
-    )
-    .bind(user1_id)
-    .bind(user2_id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    if let Some(match_id) = existing {
-        let query = if is_user1 {
-            "UPDATE matches SET user1_liked = FALSE, updated_at = NOW() WHERE id = $1"
-        } else {
-            "UPDATE matches SET user2_liked = FALSE, updated_at = NOW() WHERE id = $1"
-        };
-        sqlx::query(query)
-            .bind(&match_id)
-            .execute(&state.db)
-            .await?;
-    } else {
-        // Create record to track the pass
-        let new_id = Uuid::new_v4().to_string();
-        let (u1_liked, u2_liked): (Option<bool>, Option<bool>) = if is_user1 {
-            (Some(false), None)
-        } else {
-            (None, Some(false))
-        };
-
-        sqlx::query(
-            r#"
-            INSERT INTO matches (id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match, status, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, FALSE, 'active', NOW(), NOW())
-            "#,
-        )
-        .bind(&new_id)
-        .bind(user1_id)
-        .bind(user2_id)
-        .bind(u1_liked)
-        .bind(u2_liked)
-        .execute(&state.db)
-        .await?;
-    }
+    // Delegate to swipe_service (shared with GraphQL)
+    crate::services::swipe_service::execute_pass(&state.db, user_id, target_id, "discover").await?;
 
     Ok(Json(json!({ "message": "Passed" })))
 }
@@ -8638,6 +8540,21 @@ pub fn auto_queue_for_labeling(db: sqlx::PgPool, config_enabled: bool, content_t
     });
 }
 
+/// Write a user→user graph edge (fire-and-forget, never fails the caller).
+/// Writes to both forward and reverse indexes for bidirectional traversal.
+pub fn write_user_edge(db: sqlx::PgPool, from_id: i32, to_id: i32, edge_type: &'static str) {
+    let from_s = from_id.to_string();
+    let to_s = to_id.to_string();
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            "INSERT INTO graph_edge_links_fwd (from_type, from_id, edge_type, to_type, to_id) VALUES ('user', $1, $2, 'user', $3) ON CONFLICT DO NOTHING"
+        ).bind(&from_s).bind(edge_type).bind(&to_s).execute(&db).await;
+        let _ = sqlx::query(
+            "INSERT INTO graph_edge_links_rev (to_type, to_id, edge_type, from_type, from_id) VALUES ('user', $3, $2, 'user', $1) ON CONFLICT DO NOTHING"
+        ).bind(&from_s).bind(edge_type).bind(&to_s).execute(&db).await;
+    });
+}
+
 /// Queue a reel for LLM labeling
 pub async fn queue_reel_labeling(
     State(state): State<AppState>,
@@ -13327,4 +13244,189 @@ pub async fn app_badges(
         "new_matches_24h": new_matches.unwrap_or(0),
         "total": msgs + reel_msgs + likes,
     })))
+}
+
+// ============================================================================
+// Knowledge Graph: Session + Location + Behavior tracking
+// ============================================================================
+
+/// POST /sessions/start — Start app session, capture device + screen metrics
+/// Body: { device_id, device_type, device_model, os_version, app_version,
+///         screen_width, screen_height, network_type, latitude, longitude, city }
+pub async fn start_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let session_id = sqlx::query_scalar::<_, uuid::Uuid>(
+        r#"INSERT INTO user_sessions
+           (user_id, device_id, device_type, device_model, os_version, app_version,
+            screen_width, screen_height, network_type, latitude, longitude, city)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+           RETURNING id"#
+    )
+    .bind(user_id)
+    .bind(payload.get("device_id").and_then(|v| v.as_str()))
+    .bind(payload.get("device_type").and_then(|v| v.as_str()))
+    .bind(payload.get("device_model").and_then(|v| v.as_str()))
+    .bind(payload.get("os_version").and_then(|v| v.as_str()))
+    .bind(payload.get("app_version").and_then(|v| v.as_str()))
+    .bind(payload.get("screen_width").and_then(|v| v.as_i64()).map(|v| v as i32))
+    .bind(payload.get("screen_height").and_then(|v| v.as_i64()).map(|v| v as i32))
+    .bind(payload.get("network_type").and_then(|v| v.as_str()))
+    .bind(payload.get("latitude").and_then(|v| v.as_f64()))
+    .bind(payload.get("longitude").and_then(|v| v.as_f64()))
+    .bind(payload.get("city").and_then(|v| v.as_str()))
+    .fetch_one(&state.db)
+    .await?;
+
+    // Also record location snapshot in history (fire-and-forget)
+    if let (Some(lat), Some(lon)) = (
+        payload.get("latitude").and_then(|v| v.as_f64()),
+        payload.get("longitude").and_then(|v| v.as_f64()),
+    ) {
+        let db = state.db.clone();
+        let city = payload.get("city").and_then(|v| v.as_str()).map(String::from);
+        tokio::spawn(async move {
+            let _ = sqlx::query(
+                "INSERT INTO location_history (user_id, latitude, longitude, city, source, session_id) VALUES ($1, $2, $3, $4, 'session_start', $5)"
+            )
+            .bind(user_id).bind(lat).bind(lon).bind(city).bind(session_id)
+            .execute(&db).await;
+        });
+    }
+
+    Ok(Json(json!({ "session_id": session_id })))
+}
+
+/// POST /sessions/heartbeat — Keep session alive, update last_heartbeat_at
+/// Body: { session_id }
+pub async fn session_heartbeat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let session_id: uuid::Uuid = payload.get("session_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .ok_or_else(|| AppError::bad_request("session_id required"))?;
+
+    sqlx::query(
+        "UPDATE user_sessions SET last_heartbeat_at = NOW() WHERE id = $1 AND user_id = $2 AND ended_at IS NULL"
+    )
+    .bind(session_id).bind(user_id)
+    .execute(&state.db).await?;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// POST /sessions/end — Close session
+/// Body: { session_id }
+pub async fn end_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let session_id: uuid::Uuid = payload.get("session_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .ok_or_else(|| AppError::bad_request("session_id required"))?;
+
+    sqlx::query(
+        "UPDATE user_sessions SET ended_at = NOW() WHERE id = $1 AND user_id = $2 AND ended_at IS NULL"
+    )
+    .bind(session_id).bind(user_id)
+    .execute(&state.db).await?;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// POST /location/track — Append location to history + update current location
+/// Body: { latitude, longitude, accuracy_m?, city?, country?, source? }
+pub async fn track_location(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let lat = payload.get("latitude").and_then(|v| v.as_f64())
+        .ok_or_else(|| AppError::bad_request("latitude required"))?;
+    let lon = payload.get("longitude").and_then(|v| v.as_f64())
+        .ok_or_else(|| AppError::bad_request("longitude required"))?;
+    let accuracy = payload.get("accuracy_m").and_then(|v| v.as_f64());
+    let city = payload.get("city").and_then(|v| v.as_str());
+    let country = payload.get("country").and_then(|v| v.as_str());
+    let source = payload.get("source").and_then(|v| v.as_str()).unwrap_or("gps");
+
+    // Append to history (async)
+    {
+        let db = state.db.clone();
+        let city_own = city.map(String::from);
+        let country_own = country.map(String::from);
+        let source_own = source.to_string();
+        tokio::spawn(async move {
+            let _ = sqlx::query(
+                "INSERT INTO location_history (user_id, latitude, longitude, accuracy_m, city, country, source) VALUES ($1, $2, $3, $4, $5, $6, $7)"
+            )
+            .bind(user_id).bind(lat).bind(lon).bind(accuracy).bind(city_own).bind(country_own).bind(source_own)
+            .execute(&db).await;
+        });
+    }
+
+    // Update current location (upsert)
+    sqlx::query(
+        r#"INSERT INTO user_locations (user_id, latitude, longitude, accuracy, city, country, update_source, last_updated)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+           ON CONFLICT (user_id) DO UPDATE SET
+               latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude,
+               accuracy = EXCLUDED.accuracy, city = COALESCE(EXCLUDED.city, user_locations.city),
+               country = COALESCE(EXCLUDED.country, user_locations.country),
+               update_source = EXCLUDED.update_source, last_updated = NOW()"#
+    )
+    .bind(user_id).bind(lat).bind(lon).bind(accuracy).bind(city).bind(country).bind(source)
+    .execute(&state.db).await?;
+
+    // Invalidate location LRU cache
+    state.location_cache.write().await.pop(&user_id);
+
+    Ok(Json(json!({ "updated": true })))
+}
+
+/// GET /behavior/me — Get computed behavior profile for current user
+pub async fn get_my_behavior(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let row: Option<(Option<f64>, Option<f64>, Option<i32>, Option<i16>, Option<i16>, Option<f64>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT swipes_per_min_7d, like_rate_7d, avg_session_duration_sec, peak_hour_utc, peak_day_of_week, sessions_per_day_7d, primary_city FROM user_behavior_profile WHERE user_id = $1"
+        ).bind(user_id).fetch_optional(state.read_pool()).await?;
+
+    if let Some((spm, lr, dur, hour, dow, spd, city)) = row {
+        Ok(Json(json!({
+            "swipes_per_min_7d": spm,
+            "like_rate_7d": lr,
+            "avg_session_duration_sec": dur,
+            "peak_hour_utc": hour,
+            "peak_day_of_week": dow,
+            "sessions_per_day_7d": spd,
+            "primary_city": city,
+        })))
+    } else {
+        Ok(Json(json!({ "message": "Profile not yet computed — need at least 7 days of activity" })))
+    }
 }

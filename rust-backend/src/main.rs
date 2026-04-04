@@ -128,6 +128,7 @@ use handlers::{
     verify_selfie, vision_analyze,
     // App Bootstrap & Badges
     app_bootstrap, app_badges,
+    start_session, session_heartbeat, end_session, track_location, get_my_behavior,
     // Admin
     admin_stats, admin_override_identity, secrets_status,
     // WebSocket
@@ -716,6 +717,23 @@ async fn main() {
         info!("Blocked pairs cache started (interval: 5m)");
     }
 
+    // Behavior profile recompute — every hour
+    {
+        let bh_db = state.db.clone();
+        tokio::spawn(async move {
+            // Run once at startup (5s delay to let DB settle), then hourly
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            loop {
+                match services::behavior_service::recompute_all(&bh_db).await {
+                    Ok(n) => info!("Behavior profiles recomputed: {n} users"),
+                    Err(e) => warn!("Behavior profile recompute failed: {e}"),
+                }
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        info!("Behavior profile recompute task started (interval: 1h)");
+    }
+
     // Build GraphQL schema
     let schema = build_schema(state.clone());
     let is_dev = !state.config.is_production();
@@ -805,6 +823,11 @@ async fn main() {
         // App Bootstrap & Badges (cold-start + lightweight polling)
         .route("/app/bootstrap", get(app_bootstrap))
         .route("/app/badges", get(app_badges))
+        .route("/sessions/start", post(start_session))
+        .route("/sessions/heartbeat", post(session_heartbeat))
+        .route("/sessions/end", post(end_session))
+        .route("/location/track", post(track_location))
+        .route("/behavior/me", get(get_my_behavior))
         // Voice Intro
         .route("/voice-intro", post(upload_voice_intro))
         .route("/voice-intro/url", post(upload_voice_intro_json))

@@ -1846,112 +1846,16 @@ impl MutationRoot {
             return Err(Error::new("User not found"));
         }
 
-        // Determine user order (lower ID is user1)
-        let (user1_id, user2_id, is_user1) = if user_id < target_user_id {
-            (user_id, target_user_id, true)
-        } else {
-            (target_user_id, user_id, false)
-        };
-
-        // Check for existing match record
-        let existing = sqlx::query_as::<_, MatchCheckRow>(
-            "SELECT id, user1_liked, user2_liked FROM matches WHERE user1_id = $1 AND user2_id = $2",
-        )
-        .bind(user1_id)
-        .bind(user2_id)
-        .fetch_optional(&state.db)
-        .await?;
-
-        let (match_id, is_mutual) = match existing {
-            Some(m) => {
-                // Update existing match
-                let other_liked = if is_user1 { m.user2_liked } else { m.user1_liked };
-                let is_mutual = other_liked.unwrap_or(false);
-
-                let query = if is_user1 {
-                    "UPDATE matches SET user1_liked = TRUE, is_mutual_match = $1, updated_at = NOW() WHERE id = $2"
-                } else {
-                    "UPDATE matches SET user2_liked = TRUE, is_mutual_match = $1, updated_at = NOW() WHERE id = $2"
-                };
-
-                sqlx::query(query)
-                    .bind(is_mutual)
-                    .bind(&m.id)
-                    .execute(&state.db)
-                    .await?;
-
-                (m.id, is_mutual)
-            }
-            None => {
-                // Create new match record
-                let new_id = uuid::Uuid::new_v4().to_string();
-                let (u1_liked, u2_liked) = if is_user1 { (Some(true), None) } else { (None, Some(true)) };
-
-                sqlx::query(
-                    r#"
-                    INSERT INTO matches (id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match, status, created_at, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, FALSE, 'active', NOW(), NOW())
-                    "#,
-                )
-                .bind(&new_id)
-                .bind(user1_id)
-                .bind(user2_id)
-                .bind(u1_liked)
-                .bind(u2_liked)
-                .execute(&state.db)
-                .await?;
-
-                (new_id, false)
-            }
-        };
-
-        // Log interaction event
-        let _ = sqlx::query(
-            "INSERT INTO interaction_events (user_id, target_user_id, event_type, surface, created_at) VALUES ($1, $2, 'like', 'discover', NOW())"
-        )
-        .bind(user_id)
-        .bind(target_user_id)
-        .execute(&state.db)
-        .await;
-
-        // Populate graph (Netflix-style: every interaction becomes an edge)
-        {
-            let db = state.db.clone();
-            let uid = user_id.to_string();
-            let tid = target_user_id.to_string();
-            let mutual = is_mutual;
-            tokio::spawn(async move {
-                // Forward + reverse edge: user liked target
-                let _ = sqlx::query(
-                    "INSERT INTO graph_edge_links_fwd (from_type, from_id, edge_type, to_type, to_id) VALUES ('user', $1, 'liked', 'user', $2) ON CONFLICT DO NOTHING"
-                ).bind(&uid).bind(&tid).execute(&db).await;
-                let _ = sqlx::query(
-                    "INSERT INTO graph_edge_links_rev (to_type, to_id, edge_type, from_type, from_id) VALUES ('user', $2, 'liked', 'user', $1) ON CONFLICT DO NOTHING"
-                ).bind(&uid).bind(&tid).execute(&db).await;
-                // Upsert user nodes
-                let _ = sqlx::query(
-                    "INSERT INTO graph_nodes (node_type, node_id, properties) VALUES ('user', $1, '{}') ON CONFLICT DO NOTHING"
-                ).bind(&uid).execute(&db).await;
-                let _ = sqlx::query(
-                    "INSERT INTO graph_nodes (node_type, node_id, properties) VALUES ('user', $1, '{}') ON CONFLICT DO NOTHING"
-                ).bind(&tid).execute(&db).await;
-                // If mutual match, add matched_with edges
-                if mutual {
-                    let _ = sqlx::query(
-                        "INSERT INTO graph_edge_links_fwd (from_type, from_id, edge_type, to_type, to_id) VALUES ('user', $1, 'matched_with', 'user', $2) ON CONFLICT DO NOTHING"
-                    ).bind(&uid).bind(&tid).execute(&db).await;
-                    let _ = sqlx::query(
-                        "INSERT INTO graph_edge_links_rev (to_type, to_id, edge_type, from_type, from_id) VALUES ('user', $2, 'matched_with', 'user', $1) ON CONFLICT DO NOTHING"
-                    ).bind(&uid).bind(&tid).execute(&db).await;
-                }
-            });
-        }
+        // Delegate to shared swipe_service (same code path as REST)
+        let outcome = crate::services::swipe_service::execute_like(
+            &state.db, user_id as i32, target_user_id as i32, "discover"
+        ).await?;
 
         Ok(LikeResult {
             success: true,
-            is_mutual,
-            match_id: if is_mutual { Some(match_id) } else { None },
-            message: if is_mutual { "It's a match!".to_string() } else { "Like sent".to_string() },
+            is_mutual: outcome.is_mutual,
+            match_id: if outcome.is_mutual { Some(outcome.match_id) } else { None },
+            message: if outcome.is_mutual { "It's a match!".to_string() } else { "Like sent".to_string() },
         })
     }
 
@@ -1961,79 +1865,10 @@ impl MutationRoot {
         let state = ctx.data::<AppState>()?;
         let user_id = get_user_id_from_context(ctx)?;
 
-        // Determine user order
-        let (user1_id, user2_id, is_user1) = if user_id < target_user_id {
-            (user_id, target_user_id, true)
-        } else {
-            (target_user_id, user_id, false)
-        };
-
-        // Check for existing match record
-        let existing = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM matches WHERE user1_id = $1 AND user2_id = $2",
-        )
-        .bind(user1_id)
-        .bind(user2_id)
-        .fetch_optional(&state.db)
-        .await?;
-
-        if let Some(match_id) = existing {
-            let query = if is_user1 {
-                "UPDATE matches SET user1_liked = FALSE, updated_at = NOW() WHERE id = $1"
-            } else {
-                "UPDATE matches SET user2_liked = FALSE, updated_at = NOW() WHERE id = $1"
-            };
-            sqlx::query(query)
-                .bind(&match_id)
-                .execute(&state.db)
-                .await?;
-        } else {
-            // Create record to track the pass
-            let new_id = uuid::Uuid::new_v4().to_string();
-            let (u1_liked, u2_liked): (Option<bool>, Option<bool>) = if is_user1 {
-                (Some(false), None)
-            } else {
-                (None, Some(false))
-            };
-
-            sqlx::query(
-                r#"
-                INSERT INTO matches (id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match, status, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, FALSE, 'active', NOW(), NOW())
-                "#,
-            )
-            .bind(&new_id)
-            .bind(user1_id)
-            .bind(user2_id)
-            .bind(u1_liked)
-            .bind(u2_liked)
-            .execute(&state.db)
-            .await?;
-        }
-
-        // Log interaction event
-        let _ = sqlx::query(
-            "INSERT INTO interaction_events (user_id, target_user_id, event_type, surface, created_at) VALUES ($1, $2, 'pass', 'discover', NOW())"
-        )
-        .bind(user_id)
-        .bind(target_user_id)
-        .execute(&state.db)
-        .await;
-
-        // Graph: user passed target
-        {
-            let db = state.db.clone();
-            let uid = user_id.to_string();
-            let tid = target_user_id.to_string();
-            tokio::spawn(async move {
-                let _ = sqlx::query(
-                    "INSERT INTO graph_edge_links_fwd (from_type, from_id, edge_type, to_type, to_id) VALUES ('user', $1, 'passed', 'user', $2) ON CONFLICT DO NOTHING"
-                ).bind(&uid).bind(&tid).execute(&db).await;
-                let _ = sqlx::query(
-                    "INSERT INTO graph_edge_links_rev (to_type, to_id, edge_type, from_type, from_id) VALUES ('user', $2, 'passed', 'user', $1) ON CONFLICT DO NOTHING"
-                ).bind(&uid).bind(&tid).execute(&db).await;
-            });
-        }
+        // Delegate to shared swipe_service (same code path as REST)
+        crate::services::swipe_service::execute_pass(
+            &state.db, user_id as i32, target_user_id as i32, "discover"
+        ).await?;
 
         Ok(true)
     }

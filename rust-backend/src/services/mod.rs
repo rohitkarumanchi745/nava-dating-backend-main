@@ -20,3 +20,5 @@ pub mod moderation;
 pub mod freshness;
 pub mod media_optimizer;
 pub mod photo_pipeline;
+pub mod swipe_service;
+pub mod behavior_service;
