@@ -23,3 +23,4 @@ pub mod photo_pipeline;
 pub mod swipe_service;
 pub mod behavior_service;
 pub mod graph_replay;
+pub mod shadow_scoring;

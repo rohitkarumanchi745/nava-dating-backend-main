@@ -1230,6 +1230,152 @@ pub async fn discover(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // -------------------------------------------------------------------
+    // Shadow scoring v1 — compute + log only, do NOT reorder production.
+    // Contract: log top-50 by current_rank ∪ top-50 by shadow_rank.
+    // -------------------------------------------------------------------
+    let request_id = Uuid::new_v4();
+    let candidate_pool_size = profiles.len() as i32;
+    let viewer_primary_city = user_loc.as_ref().and_then(|l| l.city.clone());
+
+    let viewer_behavior: Option<(Option<i16>, Option<f64>, Option<String>, Option<i32>)> =
+        sqlx::query_as("SELECT peak_hour_utc, sessions_per_day_7d, primary_city, city_change_count_30d FROM user_behavior_profile WHERE user_id = $1")
+        .bind(user_id).fetch_optional(read_db).await.ok().flatten();
+    let viewer_is_traveler = viewer_behavior.as_ref().and_then(|(_, _, _, ccc)| *ccc).unwrap_or(0) >= 2;
+
+    let cand_ids: Vec<i32> = profiles.iter().map(|p| p.id).collect();
+    let cand_behaviors: std::collections::HashMap<i32, (Option<i16>, Option<f64>, Option<String>, Option<i32>)> = if !cand_ids.is_empty() {
+        let placeholders: Vec<String> = (1..=cand_ids.len()).map(|i| format!("${}", i)).collect();
+        let q = format!(
+            "SELECT user_id, peak_hour_utc, sessions_per_day_7d, primary_city, city_change_count_30d FROM user_behavior_profile WHERE user_id IN ({})",
+            placeholders.join(",")
+        );
+        let mut query = sqlx::query_as::<_, (i32, Option<i16>, Option<f64>, Option<String>, Option<i32>)>(&q);
+        for id in &cand_ids { query = query.bind(id); }
+        query.fetch_all(read_db).await.unwrap_or_default()
+            .into_iter().map(|(id, h, s, c, t)| (id, (h, s, c, t))).collect()
+    } else { std::collections::HashMap::new() };
+
+    let fof_counts: std::collections::HashMap<i32, i32> = if !cand_ids.is_empty() {
+        let placeholders: Vec<String> = (1..=cand_ids.len()).map(|i| format!("${}", i + 1)).collect();
+        let q = format!(
+            r#"SELECT g2.to_id::int AS candidate_id, COUNT(DISTINCT g1.to_id)::int AS fof
+               FROM graph_edge_links_fwd g1
+               JOIN graph_edge_links_fwd g2 ON g2.from_id = g1.to_id AND g2.edge_type = 'matched_with'
+               WHERE g1.from_id = $1::text AND g1.edge_type = 'matched_with'
+                 AND g2.to_id::int IN ({}) AND g2.to_id != $1::text
+               GROUP BY g2.to_id"#,
+            placeholders.join(",")
+        );
+        let mut query = sqlx::query_as::<_, (i32, i32)>(&q).bind(user_id.to_string());
+        for id in &cand_ids { query = query.bind(id); }
+        query.fetch_all(read_db).await.unwrap_or_default().into_iter().collect()
+    } else { std::collections::HashMap::new() };
+
+    let stale_location_viewer = user_loc.is_none();
+    let viewer_peak = viewer_behavior.as_ref().and_then(|(h, _, _, _)| *h);
+    let viewer_spd = viewer_behavior.as_ref().and_then(|(_, s, _, _)| *s).unwrap_or(0.0);
+    let viewer_profile_missing = viewer_behavior.is_none();
+
+    use crate::services::shadow_scoring::{self as ss, GraphFeatures, BehaviorFeatures, LocationFeatures};
+    let mut rows: Vec<(i32, f64, f64, ss::ShadowComponents, GraphFeatures, BehaviorFeatures, LocationFeatures, f64, f64)> = Vec::with_capacity(profiles.len());
+    for p in &profiles {
+        let base = p.compatibility_score.unwrap_or(0.0);
+        let base_norm = if base > 1.5 { base / 100.0 } else { base };
+
+        let gfeat = GraphFeatures {
+            fof_count: *fof_counts.get(&p.id).unwrap_or(&0),
+            mutual_like_neighbors: 0,
+            missing: false,
+        };
+
+        let cand = cand_behaviors.get(&p.id);
+        let cand_missing = cand.is_none();
+        let cand_peak = cand.and_then(|(h, _, _, _)| *h);
+        let cand_spd = cand.and_then(|(_, s, _, _)| *s).unwrap_or(0.0);
+        let cand_city = cand.and_then(|(_, _, c, _)| c.clone());
+        let cand_traveler = cand.and_then(|(_, _, _, t)| *t).unwrap_or(0) >= 2;
+
+        let peak_gap = match (viewer_peak, cand_peak) {
+            (Some(a), Some(b)) => ss::circular_hour_gap(a, b),
+            _ => 12.0,
+        };
+        let activity_gap = (viewer_spd - cand_spd).abs();
+        let bfeat = BehaviorFeatures {
+            peak_hour_gap: peak_gap,
+            activity_level_gap: activity_gap,
+            missing: viewer_profile_missing || cand_missing,
+        };
+
+        let same_city = match (&viewer_primary_city, &cand_city) {
+            (Some(v), Some(c)) => v.eq_ignore_ascii_case(c),
+            _ => false,
+        };
+        let lfeat = LocationFeatures {
+            same_city,
+            viewer_is_traveler,
+            candidate_is_traveler: cand_traveler,
+            stale: stale_location_viewer,
+        };
+
+        let components = ss::compute(base_norm, gfeat, bfeat, lfeat);
+        rows.push((p.id, base_norm, base, components, gfeat, bfeat, lfeat, peak_gap, activity_gap));
+    }
+
+    let mut current_rank_map: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+    for (idx, p) in profiles.iter().enumerate() {
+        current_rank_map.insert(p.id, idx as i32);
+    }
+
+    let mut shadow_order: Vec<(i32, f64)> = rows.iter().map(|r| (r.0, r.3.shadow_score)).collect();
+    shadow_order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut shadow_rank_map: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+    for (idx, (cid, _)) in shadow_order.iter().enumerate() {
+        shadow_rank_map.insert(*cid, idx as i32);
+    }
+
+    let to_log: std::collections::HashSet<i32> = current_rank_map.iter()
+        .filter(|(_, r)| **r < 50).map(|(id, _)| *id)
+        .chain(shadow_rank_map.iter().filter(|(_, r)| **r < 50).map(|(id, _)| *id))
+        .collect();
+    let shown_ids: std::collections::HashSet<i32> = profiles.iter().take(limit as usize).map(|p| p.id).collect();
+
+    {
+        let db = state.db.clone();
+        let req_id = request_id;
+        let rows_to_log: Vec<_> = rows.iter().filter(|r| to_log.contains(&r.0)).cloned().collect();
+        let current_ranks = current_rank_map.clone();
+        let shadow_ranks = shadow_rank_map.clone();
+        tokio::spawn(async move {
+            for (cid, base_norm, base_raw, comps, g, b, l, peak_gap, activity_gap) in rows_to_log {
+                let was_shown = shown_ids.contains(&cid);
+                let c_rank = current_ranks.get(&cid).copied();
+                let s_rank = shadow_ranks.get(&cid).copied();
+                let _ = sqlx::query(
+                    r#"INSERT INTO discover_feature_log
+                       (request_id, viewer_user_id, candidate_user_id, was_shown, current_rank, shadow_rank,
+                        current_score, shadow_score, base_score, category_score, attractiveness_score,
+                        graph_score, behavior_score, location_score,
+                        fof_count, mutual_like_neighbors, same_city, viewer_is_traveler, candidate_is_traveler,
+                        peak_hour_gap, activity_level_gap,
+                        behavior_profile_missing, graph_features_missing, stale_location,
+                        candidate_pool_size, scoring_version, shadow_version)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,'v1','shadow_v1')"#
+                )
+                .bind(req_id).bind(user_id).bind(cid).bind(was_shown).bind(c_rank).bind(s_rank)
+                .bind(base_norm).bind(comps.shadow_score).bind(base_norm)
+                .bind(None::<f64>).bind(Some(base_raw))
+                .bind(comps.graph_score).bind(comps.behavior_score).bind(comps.location_score)
+                .bind(g.fof_count).bind(g.mutual_like_neighbors)
+                .bind(l.same_city).bind(l.viewer_is_traveler).bind(l.candidate_is_traveler)
+                .bind(peak_gap).bind(activity_gap)
+                .bind(b.missing).bind(g.missing).bind(l.stale)
+                .bind(candidate_pool_size)
+                .execute(&db).await;
+            }
+        });
+    }
+
     // Log impression events for ML (fire-and-forget, don't block response)
     let slate_id = Uuid::new_v4().to_string();
     let db_clone = state.db.clone();
