@@ -743,7 +743,14 @@ async fn main() {
                 .collect();
             CorsLayer::new()
                 .allow_origin(allowed)
-                .allow_methods(Any)
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::PUT,
+                    axum::http::Method::DELETE,
+                    axum::http::Method::OPTIONS,
+                    axum::http::Method::PATCH,
+                ])
                 .allow_headers([
                     axum::http::header::AUTHORIZATION,
                     axum::http::header::CONTENT_TYPE,
