@@ -130,7 +130,7 @@ use handlers::{
     app_bootstrap, app_badges,
     start_session, session_heartbeat, end_session, track_location, get_my_behavior,
     // Admin
-    admin_stats, admin_override_identity, secrets_status,
+    admin_stats, admin_override_identity, admin_replay_graph, admin_data_quality, secrets_status,
     // WebSocket
     ws_call, ws_chat,
     // ML Training
@@ -720,18 +720,66 @@ async fn main() {
     // Behavior profile recompute — every hour
     {
         let bh_db = state.db.clone();
+        let bh_metrics = state.metrics.clone();
         tokio::spawn(async move {
-            // Run once at startup (5s delay to let DB settle), then hourly
             tokio::time::sleep(Duration::from_secs(5)).await;
             loop {
+                let start = Instant::now();
                 match services::behavior_service::recompute_all(&bh_db).await {
-                    Ok(n) => info!("Behavior profiles recomputed: {n} users"),
+                    Ok(n) => {
+                        let ms = start.elapsed().as_millis() as u64;
+                        bh_metrics.behavior_recompute_rows.store(n, std::sync::atomic::Ordering::Relaxed);
+                        bh_metrics.behavior_recompute_duration_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+                        info!("Behavior profiles recomputed: {n} users in {ms}ms");
+                    }
                     Err(e) => warn!("Behavior profile recompute failed: {e}"),
                 }
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         });
         info!("Behavior profile recompute task started (interval: 1h)");
+    }
+
+    // Location history retention — delete raw trails older than 30 days, daily
+    {
+        let lh_db = state.db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            loop {
+                match sqlx::query("DELETE FROM location_history WHERE created_at < NOW() - INTERVAL '30 days'")
+                    .execute(&lh_db).await {
+                    Ok(r) => info!("Location retention: deleted {} rows older than 30d", r.rows_affected()),
+                    Err(e) => warn!("Location retention failed: {e}"),
+                }
+                tokio::time::sleep(Duration::from_secs(86400)).await;
+            }
+        });
+        info!("Location retention task started (interval: 24h, cutoff: 30d)");
+    }
+
+    // Stale session reaper — close sessions with no heartbeat for 15 min
+    {
+        let ss_db = state.db.clone();
+        let ss_metrics = state.metrics.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            loop {
+                match sqlx::query(
+                    "UPDATE user_sessions SET ended_at = last_heartbeat_at WHERE ended_at IS NULL AND last_heartbeat_at < NOW() - INTERVAL '15 minutes'"
+                ).execute(&ss_db).await {
+                    Ok(r) => {
+                        let n = r.rows_affected();
+                        if n > 0 {
+                            ss_metrics.session_heartbeat_drops.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                            info!("Session reaper: closed {n} stale sessions");
+                        }
+                    }
+                    Err(e) => warn!("Session reaper failed: {e}"),
+                }
+                tokio::time::sleep(Duration::from_secs(300)).await;
+            }
+        });
+        info!("Stale session reaper started (interval: 5m, cutoff: 15m)");
     }
 
     // Build GraphQL schema
@@ -989,6 +1037,8 @@ async fn main() {
         // Admin
         .route("/admin/stats", get(admin_stats))
         .route("/admin/user/{user_id}/override", post(admin_override_identity))
+        .route("/admin/graph/replay", post(admin_replay_graph))
+        .route("/admin/data-quality", get(admin_data_quality))
         .route("/admin/secrets/status", get(secrets_status))
         // WebSocket
         .route("/ws/chat", get(ws_chat))

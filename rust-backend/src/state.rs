@@ -194,6 +194,15 @@ pub struct AppMetrics {
     pub trust_safety_flags_total: AtomicU64,
     /// Upload deferrals due to client conditions
     pub upload_deferrals_total: AtomicU64,
+    // --- Knowledge graph observability ---
+    pub graph_edge_writes_ok: AtomicU64,
+    pub graph_edge_writes_failed: AtomicU64,
+    pub event_log_writes_failed: AtomicU64,
+    pub behavior_recompute_rows: AtomicU64,
+    pub behavior_recompute_duration_ms: AtomicU64,
+    pub session_heartbeat_drops: AtomicU64,
+    pub location_track_ingested: AtomicU64,
+    pub location_precision_reduced: AtomicU64,
 
     // --- HTTP request duration histogram ---
     /// Bucket counters for http_request_duration_seconds histogram.
@@ -228,6 +237,14 @@ impl AppMetrics {
             moderation_actions_total: AtomicU64::new(0),
             trust_safety_flags_total: AtomicU64::new(0),
             upload_deferrals_total: AtomicU64::new(0),
+            graph_edge_writes_ok: AtomicU64::new(0),
+            graph_edge_writes_failed: AtomicU64::new(0),
+            event_log_writes_failed: AtomicU64::new(0),
+            behavior_recompute_rows: AtomicU64::new(0),
+            behavior_recompute_duration_ms: AtomicU64::new(0),
+            session_heartbeat_drops: AtomicU64::new(0),
+            location_track_ingested: AtomicU64::new(0),
+            location_precision_reduced: AtomicU64::new(0),
             duration_buckets: [
                 AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
                 AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),

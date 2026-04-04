@@ -13360,10 +13360,21 @@ pub async fn track_location(
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
 
-    let lat = payload.get("latitude").and_then(|v| v.as_f64())
+    let lat_raw = payload.get("latitude").and_then(|v| v.as_f64())
         .ok_or_else(|| AppError::bad_request("latitude required"))?;
-    let lon = payload.get("longitude").and_then(|v| v.as_f64())
+    let lon_raw = payload.get("longitude").and_then(|v| v.as_f64())
         .ok_or_else(|| AppError::bad_request("longitude required"))?;
+    // Validate coordinates are plausible
+    if !(-90.0..=90.0).contains(&lat_raw) || !(-180.0..=180.0).contains(&lon_raw)
+        || (lat_raw == 0.0 && lon_raw == 0.0) {
+        return Err(AppError::bad_request("invalid coordinates"));
+    }
+    // Privacy guardrail: store only ~100m precision in history trail (3 decimal places).
+    // Current location table keeps the original precision for distance calc.
+    let lat = (lat_raw * 1000.0).round() / 1000.0;
+    let lon = (lon_raw * 1000.0).round() / 1000.0;
+    state.metrics.location_precision_reduced.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state.metrics.location_track_ingested.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let accuracy = payload.get("accuracy_m").and_then(|v| v.as_f64());
     let city = payload.get("city").and_then(|v| v.as_str());
     let country = payload.get("country").and_then(|v| v.as_str());
@@ -13394,13 +13405,84 @@ pub async fn track_location(
                country = COALESCE(EXCLUDED.country, user_locations.country),
                update_source = EXCLUDED.update_source, last_updated = NOW()"#
     )
-    .bind(user_id).bind(lat).bind(lon).bind(accuracy).bind(city).bind(country).bind(source)
+    .bind(user_id).bind(lat_raw).bind(lon_raw).bind(accuracy).bind(city).bind(country).bind(source)
     .execute(&state.db).await?;
 
     // Invalidate location LRU cache
     state.location_cache.write().await.pop(&user_id);
 
     Ok(Json(json!({ "updated": true })))
+}
+
+/// POST /admin/graph/replay — Rebuild graph edges from interaction_events.
+/// Query param: since_days (int, optional — omit for full rebuild)
+pub async fn admin_replay_graph(
+    State(state): State<AppState>,
+    _admin: AdminClaims,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let since_days = params.get("since_days").and_then(|v| v.parse::<i32>().ok());
+    let report = crate::services::graph_replay::replay_user_edges(&state.db, since_days)
+        .await
+        .map_err(|e| AppError::internal(format!("Replay failed: {e}")))?;
+    tracing::info!(?report, since_days, "Graph replay complete");
+    Ok(Json(serde_json::to_value(report).unwrap_or(json!({}))))
+}
+
+/// GET /admin/data-quality — Reports drift between operational and derived state.
+pub async fn admin_data_quality(
+    State(state): State<AppState>,
+    _admin: AdminClaims,
+) -> Result<Json<Value>, AppError> {
+    let db = state.read_pool();
+
+    // Mutual matches without corresponding graph edges
+    let orphaned_matches = sqlx::query_scalar::<_, i64>(
+        r#"SELECT COUNT(*) FROM matches m
+           WHERE m.is_mutual_match = TRUE
+             AND NOT EXISTS (
+                SELECT 1 FROM graph_edge_links_fwd g
+                WHERE g.edge_type = 'matched_with'
+                  AND g.from_type = 'user' AND g.to_type = 'user'
+                  AND g.from_id = m.user1_id::text AND g.to_id = m.user2_id::text
+             )"#
+    ).fetch_one(db).await.unwrap_or(0);
+
+    // Users with recent events but stale (or missing) behavior profiles
+    let stale_behavior_profiles = sqlx::query_scalar::<_, i64>(
+        r#"SELECT COUNT(DISTINCT ie.user_id)
+           FROM interaction_events ie
+           LEFT JOIN user_behavior_profile bp ON bp.user_id = ie.user_id
+           WHERE ie.created_at > NOW() - INTERVAL '7 days'
+             AND (bp.last_computed_at IS NULL OR bp.last_computed_at < NOW() - INTERVAL '6 hours')"#
+    ).fetch_one(db).await.unwrap_or(0);
+
+    // Session durations > 24h = likely bad client shutdown
+    let impossible_sessions = sqlx::query_scalar::<_, i64>(
+        r#"SELECT COUNT(*) FROM user_sessions
+           WHERE ended_at IS NULL AND started_at < NOW() - INTERVAL '24 hours'"#
+    ).fetch_one(db).await.unwrap_or(0);
+
+    // Invalid GPS: out of range or exact zero
+    let bad_gps = sqlx::query_scalar::<_, i64>(
+        r#"SELECT COUNT(*) FROM location_history
+           WHERE created_at > NOW() - INTERVAL '7 days'
+             AND (latitude NOT BETWEEN -90 AND 90 OR longitude NOT BETWEEN -180 AND 180
+                  OR (latitude = 0 AND longitude = 0))"#
+    ).fetch_one(db).await.unwrap_or(0);
+
+    // Sessions missing device_type (client instrumentation gap)
+    let missing_device_type = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM user_sessions WHERE started_at > NOW() - INTERVAL '7 days' AND device_type IS NULL"
+    ).fetch_one(db).await.unwrap_or(0);
+
+    Ok(Json(json!({
+        "orphaned_mutual_matches": orphaned_matches,
+        "stale_behavior_profiles": stale_behavior_profiles,
+        "impossible_sessions_over_24h": impossible_sessions,
+        "bad_gps_last_7d": bad_gps,
+        "sessions_missing_device_type_7d": missing_device_type,
+    })))
 }
 
 /// GET /behavior/me — Get computed behavior profile for current user
