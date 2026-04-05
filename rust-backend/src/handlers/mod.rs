@@ -3552,15 +3552,30 @@ pub async fn create_call(
 // Banner image upload helper (shared by events, playgrounds, spots)
 // ============================================================================
 
-/// Decode a base64 image (with or without data: prefix), validate size/dims,
-/// re-encode as JPEG, persist under /uploads/banners/. Returns URL path.
-/// Returns None for empty/None input. Errors only for validation failures.
+/// Decode a base64 image, validate, encode as high-quality JPEG, persist
+/// under /uploads/banners/. Returns URL path or None.
+///
+/// Quality targets (retina/@3x iPhone + iPad):
+/// - Long-edge cap: 2560px (iPad 3x landscape banners, 12.9" iPad Pro width)
+/// - JPEG quality: 92 (near-lossless; doubles our profile-photo encoder's 90)
+/// - Lanczos3 resample (best-in-class for downscale sharpness)
+/// - No resize at all if source is already at/under target (avoids double-JPEG
+///   softening when iOS already sent an appropriately-sized banner)
 async fn save_base64_banner(
     state: &AppState,
     user_id: i32,
     b64: &str,
     prefix: &str, // "event", "playground", "spot"
 ) -> Result<Option<String>, AppError> {
+    use image::codecs::jpeg::JpegEncoder;
+    use image::ColorType;
+
+    const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;   // 10MB source cap
+    const TARGET_LONG_EDGE: u32   = 2560;               // retina/iPad-safe
+    const MIN_DIM: u32            = 64;
+    const MAX_DIM: u32            = 8000;               // allow large originals
+    const JPEG_QUALITY: u8        = 92;
+
     let cleaned = b64.trim();
     if cleaned.is_empty() { return Ok(None); }
 
@@ -3572,23 +3587,32 @@ async fn save_base64_banner(
 
     let bytes = STANDARD.decode(raw)
         .map_err(|_| AppError::bad_request("banner: invalid base64"))?;
-    if bytes.len() > 5 * 1024 * 1024 {
-        return Err(AppError::bad_request("banner: max 5MB"));
+    if bytes.len() > MAX_UPLOAD_BYTES {
+        return Err(AppError::bad_request("banner: max 10MB"));
     }
 
     let img = image::load_from_memory(&bytes)
         .map_err(|_| AppError::bad_request("banner: invalid image"))?;
     let (w, h) = (img.width(), img.height());
-    if w > 4000 || h > 4000 || w < 64 || h < 64 {
-        return Err(AppError::bad_request("banner: dimensions must be 64-4000px"));
+    if w < MIN_DIM || h < MIN_DIM {
+        return Err(AppError::bad_request(format!("banner: min {}x{}px", MIN_DIM, MIN_DIM)));
+    }
+    if w > MAX_DIM || h > MAX_DIM {
+        return Err(AppError::bad_request(format!("banner: max {}x{}px", MAX_DIM, MAX_DIM)));
     }
 
-    // Cap long edge at 1920 to keep banners light.
-    let img = if w.max(h) > 1920 {
-        img.resize(1920, 1920, image::imageops::FilterType::Lanczos3)
+    // Only downscale when the source actually exceeds target. Upscaling or
+    // re-resizing an already-sized image just costs quality for zero benefit.
+    let img = if w.max(h) > TARGET_LONG_EDGE {
+        img.resize(TARGET_LONG_EDGE, TARGET_LONG_EDGE, image::imageops::FilterType::Lanczos3)
     } else { img };
 
-    let jpeg_bytes = encode_jpeg(&img)
+    // High-quality JPEG encode (q=92). Separate from encode_jpeg() helper
+    // which is tuned for smaller profile thumbnails at q=90.
+    let rgb = img.to_rgb8();
+    let mut jpeg_bytes = Vec::with_capacity(bytes.len());
+    let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_bytes, JPEG_QUALITY);
+    encoder.encode(&rgb, rgb.width(), rgb.height(), ColorType::Rgb8.into())
         .map_err(|_| AppError::internal("banner: jpeg encode failed"))?;
 
     let banner_dir = Path::new(&state.config.upload_dir).join("banners");
