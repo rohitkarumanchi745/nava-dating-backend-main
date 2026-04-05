@@ -4348,6 +4348,128 @@ pub async fn get_playground_members(
     Ok(Json(json!({ "members": results })))
 }
 
+/// GET /playgrounds/:id/messages?before=ISO8601&limit=N
+/// Members-only. Returns ASC (oldest first) for natural chat rendering.
+pub async fn get_playground_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(pg_id): AxumPath<i64>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Member check
+    let is_member = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM playground_members WHERE playground_id = $1 AND user_id = $2 AND is_active = true)"
+    ).bind(pg_id).bind(user_id).fetch_one(&state.db).await.unwrap_or(false);
+    if !is_member {
+        return Err(AppError::forbidden("Not a member of this playground"));
+    }
+
+    let limit: i64 = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50).clamp(1, 200);
+    // 'before' cursor — return messages strictly older than this timestamp.
+    let before = params.get("before").and_then(|s|
+        chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.naive_utc())
+            .or_else(|| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok())
+            .or_else(|| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok())
+    );
+
+    // Query newest-first to respect the 'before' cursor + limit, then reverse for ASC output.
+    let rows: Vec<(i64, i64, i64, String, chrono::NaiveDateTime, Option<String>, Option<String>)> = match before {
+        Some(cutoff) => sqlx::query_as(
+            r#"SELECT m.id, m.playground_id, m.sender_id, m.content, m.created_at,
+                      u.name as sender_name, u.profile_photo_1 as sender_photo
+               FROM playground_messages m
+               JOIN users u ON u.id = m.sender_id
+               WHERE m.playground_id = $1 AND m.created_at < $2
+               ORDER BY m.created_at DESC LIMIT $3"#
+        ).bind(pg_id).bind(cutoff).bind(limit).fetch_all(&state.db).await?,
+        None => sqlx::query_as(
+            r#"SELECT m.id, m.playground_id, m.sender_id, m.content, m.created_at,
+                      u.name as sender_name, u.profile_photo_1 as sender_photo
+               FROM playground_messages m
+               JOIN users u ON u.id = m.sender_id
+               WHERE m.playground_id = $1
+               ORDER BY m.created_at DESC LIMIT $2"#
+        ).bind(pg_id).bind(limit).fetch_all(&state.db).await?,
+    };
+
+    // Query is DESC (newest-first) so 'before' + limit work as a cursor;
+    // reverse once here to emit ASC (oldest-first) for chat rendering.
+    let messages: Vec<Value> = rows.into_iter().rev().map(|r| json!({
+        "id": r.0.to_string(),
+        "playground_id": r.1.to_string(),
+        "sender_id": r.2.to_string(),
+        "sender_name": r.5,
+        "sender_photo": r.6,
+        "content": r.3,
+        "created_at": format_datetime(r.4),
+    })).collect();
+
+    Ok(Json(json!({ "messages": messages })))
+}
+
+/// POST /playgrounds/:id/messages
+#[derive(Deserialize)]
+pub struct SendPlaygroundMessagePayload { pub content: String }
+
+pub async fn send_playground_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(pg_id): AxumPath<i64>,
+    Json(payload): Json<SendPlaygroundMessagePayload>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let trimmed = payload.content.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::bad_request("content required"));
+    }
+    if trimmed.chars().count() > 2000 {
+        return Err(AppError::bad_request("content must be 2000 characters or less"));
+    }
+
+    // Member check
+    let is_member = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM playground_members WHERE playground_id = $1 AND user_id = $2 AND is_active = true)"
+    ).bind(pg_id).bind(user_id).fetch_one(&state.db).await.unwrap_or(false);
+    if !is_member {
+        return Err(AppError::forbidden("Not a member of this playground"));
+    }
+
+    // Insert + fetch joined row for response
+    let row = sqlx::query_as::<_, (i64, i64, i64, String, chrono::NaiveDateTime, Option<String>, Option<String>)>(
+        r#"WITH inserted AS (
+             INSERT INTO playground_messages (playground_id, sender_id, content)
+             VALUES ($1, $2, $3)
+             RETURNING id, playground_id, sender_id, content, created_at
+           )
+           SELECT i.id, i.playground_id, i.sender_id, i.content, i.created_at,
+                  u.name as sender_name, u.profile_photo_1 as sender_photo
+           FROM inserted i JOIN users u ON u.id = i.sender_id"#
+    )
+    .bind(pg_id).bind(user_id).bind(trimmed)
+    .fetch_one(&state.db).await?;
+
+    // Bump playground activity for ranking / member_count is unchanged.
+    let _ = sqlx::query("UPDATE playgrounds SET updated_at = NOW() WHERE id = $1")
+        .bind(pg_id).execute(&state.db).await;
+
+    let message = json!({
+        "id": row.0.to_string(),
+        "playground_id": row.1.to_string(),
+        "sender_id": row.2.to_string(),
+        "sender_name": row.5,
+        "sender_photo": row.6,
+        "content": row.3,
+        "created_at": format_datetime(row.4),
+    });
+
+    Ok(Json(json!({ "message": message })))
+}
+
 // ============================================================================
 // Events (Real-World Meetups)
 // ============================================================================

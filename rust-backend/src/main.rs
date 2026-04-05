@@ -105,6 +105,7 @@ use handlers::{
     create_spot, get_spots, get_spots_feed, get_spot_messages, send_spot_message, react_to_spot,
     // Playgrounds
     get_playgrounds, create_playground, get_playground_detail, join_playground, leave_playground, get_playground_members,
+    get_playground_messages, send_playground_message,
     // Events
     create_event, get_events_near_me, rsvp_event,
     // Location Search History
@@ -623,6 +624,18 @@ async fn main() {
     let _ = sqlx::query("ALTER TABLE events ADD COLUMN IF NOT EXISTS banner_url TEXT").execute(&state.db).await;
     let _ = sqlx::query("ALTER TABLE playgrounds ADD COLUMN IF NOT EXISTS banner_url TEXT").execute(&state.db).await;
     let _ = sqlx::query("ALTER TABLE outdoor_spots ADD COLUMN IF NOT EXISTS banner_url TEXT").execute(&state.db).await;
+    // Matches migrations/029_playground_messages.sql.
+    let _ = sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS playground_messages (
+            id BIGSERIAL PRIMARY KEY,
+            playground_id BIGINT NOT NULL REFERENCES playgrounds(id) ON DELETE CASCADE,
+            sender_id BIGINT NOT NULL REFERENCES users(id),
+            content TEXT NOT NULL CHECK (char_length(content) BETWEEN 1 AND 2000),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"#
+    ).execute(&state.db).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_playground_messages_playground_time ON playground_messages (playground_id, created_at DESC)")
+        .execute(&state.db).await;
 
     // Ensure user_event_outbox table exists (durable /ws/events delivery).
     // Idempotent — matches migrations/024_user_event_outbox.sql.
@@ -1042,6 +1055,7 @@ async fn main() {
         .route("/playgrounds/{id}/join", post(join_playground))
         .route("/playgrounds/{id}/leave", post(leave_playground))
         .route("/playgrounds/{id}/members", get(get_playground_members))
+        .route("/playgrounds/{id}/messages", get(get_playground_messages).post(send_playground_message))
         // Events
         .route("/events", post(create_event))
         .route("/events", get(get_events_near_me))
