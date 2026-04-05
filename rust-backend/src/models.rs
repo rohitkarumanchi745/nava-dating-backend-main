@@ -61,6 +61,8 @@ pub struct ProfileStatusRow {
 pub struct DiscoverUserRow {
     pub id: i32,
     pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub show_verified_name: Option<bool>,
     pub dob: Option<NaiveDate>,
     pub gender: Option<String>,
     pub bio: Option<String>,
@@ -582,6 +584,8 @@ pub struct CreateCallResponse {
 pub struct DiscoverProfile {
     pub id: i32,
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub age: Option<i32>,
     pub gender: Option<String>,
     pub bio: Option<String>,

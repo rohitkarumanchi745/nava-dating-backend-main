@@ -1209,7 +1209,8 @@ pub async fn discover(
     // Get users who haven't been liked/passed by this user
     let candidates = sqlx::query_as::<_, DiscoverUserRow>(
         r#"
-        SELECT u.id, u.name, u.dob, u.gender, u.bio, u.profile_photo_url, u.profile_photos,
+        SELECT u.id, u.name, u.display_name, u.show_verified_name,
+               u.dob, u.gender, u.bio, u.profile_photo_url, u.profile_photos,
                u.profile_photo_1, u.profile_photo_2, u.profile_photo_3, u.is_verified,
                u.attractiveness_score, u.looking_for, u.profession_title, u.height_cm,
                l.city, l.latitude, l.longitude
@@ -1286,9 +1287,13 @@ pub async fn discover(
             let photos = get_photos_from_row(&c);
             let ml_score = score_map.get(&c.id).copied();
             let uni_info = uni_map.get(&c.id);
+            let public_name = public_name_for_viewer(
+                c.name.as_deref(), c.display_name.as_deref(), c.show_verified_name,
+            );
             DiscoverProfile {
                 id: c.id,
-                name: c.name,
+                name: public_name,
+                display_name: c.display_name,
                 age: c.dob.map(calculate_age),
                 gender: c.gender,
                 bio: c.bio,
@@ -1902,9 +1907,15 @@ pub async fn get_match(
     let uni_map = batch_lookup_university(&state.db, &[other_id]).await?;
     let uni_info = uni_map.get(&other_id);
 
+    let public_name = public_name_for_viewer(
+        other_user.name.as_deref(),
+        other_user.display_name.as_deref(),
+        other_user.show_verified_name,
+    );
     let profile = DiscoverProfile {
         id: other_user.id,
-        name: other_user.name,
+        name: public_name,
+        display_name: other_user.display_name.clone(),
         age: other_user.dob.map(calculate_age),
         gender: other_user.gender,
         bio: other_user.bio,
@@ -2198,7 +2209,8 @@ pub async fn get_nearby(
     // Find nearby users with location
     let nearby = sqlx::query_as::<_, DiscoverUserRow>(
         r#"
-        SELECT u.id, u.name, u.dob, u.gender, u.bio, u.profile_photo_url, u.profile_photos,
+        SELECT u.id, u.name, u.display_name, u.show_verified_name,
+               u.dob, u.gender, u.bio, u.profile_photo_url, u.profile_photos,
                u.profile_photo_1, u.profile_photo_2, u.profile_photo_3, u.is_verified,
                u.attractiveness_score, u.looking_for, u.profession_title, u.height_cm,
                l.city, l.latitude, l.longitude
@@ -2239,9 +2251,12 @@ pub async fn get_nearby(
             }
 
             let photos = get_photos_from_row(&n);
+            let public_name = public_name_for_viewer(
+                n.name.as_deref(), n.display_name.as_deref(), n.show_verified_name,
+            );
             Some(NearbyMatch {
                 user_id: n.id,
-                name: n.name,
+                name: public_name,
                 photos,
                 distance_km: if can_see_exact { distance_km } else { fuzzy_distance(distance_km) },
                 distance_text: if can_see_exact {
@@ -6185,6 +6200,25 @@ async fn analyze_photo_bytes(
     })
     .await
     .map_err(|_| AppError::internal("Vision task failed"))?
+}
+
+/// When a viewer sees another user's profile, honor the target's privacy toggle.
+/// - show_verified_name = TRUE (default)  → return users.name
+/// - show_verified_name = FALSE           → return users.display_name if non-empty, else None
+/// Returns None to let iOS fall back through publicName: displayName ?? name ?? "User".
+fn public_name_for_viewer(
+    name: Option<&str>,
+    display_name: Option<&str>,
+    show_verified_name: Option<bool>,
+) -> Option<String> {
+    if show_verified_name.unwrap_or(true) {
+        name.map(|s| s.to_string())
+    } else {
+        display_name
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
 }
 
 async fn fetch_user_by_id(db: &PgPool, user_id: i32) -> Result<Option<UserRow>, sqlx::Error> {
@@ -10655,7 +10689,8 @@ pub async fn discover_university_profiles(
     // Get verified students from this university
     let profiles = sqlx::query_as::<_, DiscoverUserRow>(
         r#"
-        SELECT u.id, u.name, u.dob, u.gender, u.bio, u.profile_photo_url, u.profile_photos,
+        SELECT u.id, u.name, u.display_name, u.show_verified_name,
+               u.dob, u.gender, u.bio, u.profile_photo_url, u.profile_photos,
                u.profile_photo_1, u.profile_photo_2, u.profile_photo_3,
                u.is_verified, u.attractiveness_score, u.looking_for, u.profession_title,
                u.height_cm, l.city, l.latitude, l.longitude
@@ -10695,9 +10730,13 @@ pub async fn discover_university_profiles(
             today.years_since(dob).unwrap_or(0) as i32
         });
 
+        let public_name = public_name_for_viewer(
+            row.name.as_deref(), row.display_name.as_deref(), row.show_verified_name,
+        );
         DiscoverProfile {
             id: row.id,
-            name: row.name.clone(),
+            name: public_name,
+            display_name: row.display_name.clone(),
             age,
             gender: row.gender.clone(),
             bio: row.bio.clone(),
@@ -11257,6 +11296,7 @@ struct StudentSearchRow {
     name: Option<String>,
     display_name: Option<String>,
     show_display_name_in_search: Option<bool>,
+    show_verified_name: Option<bool>,
     dob: Option<NaiveDate>,
     gender: Option<String>,
     bio: Option<String>,
@@ -12553,7 +12593,8 @@ pub async fn view_student_profile(
     // Fetch target profile with university info
     let profile = sqlx::query_as::<_, StudentSearchRow>(
         r#"
-        SELECT u.id, u.name, u.dob, u.gender, u.bio,
+        SELECT u.id, u.name, u.display_name, u.show_display_name_in_search, u.show_verified_name,
+               u.dob, u.gender, u.bio,
                u.profile_photo_url, u.profile_photos,
                u.profile_photo_1, u.profile_photo_2, u.profile_photo_3,
                u.is_verified, u.attractiveness_score, u.looking_for,
@@ -12612,10 +12653,17 @@ pub async fn view_student_profile(
         "none"
     };
 
+    let public_name = public_name_for_viewer(
+        profile.name.as_deref(),
+        profile.display_name.as_deref(),
+        profile.show_verified_name,
+    );
+
     Ok(Json(json!({
         "profile": {
             "id": profile.id.to_string(),
-            "name": profile.name,
+            "name": public_name,
+            "display_name": profile.display_name,
             "age": age,
             "gender": profile.gender,
             "bio": profile.bio,
@@ -12660,7 +12708,8 @@ pub async fn get_user_profile(
     // Fetch target user
     let target = sqlx::query_as::<_, DiscoverUserRow>(
         r#"
-        SELECT u.id, u.name, u.dob, u.gender, u.bio, u.profile_photo_url, u.profile_photos,
+        SELECT u.id, u.name, u.display_name, u.show_verified_name,
+               u.dob, u.gender, u.bio, u.profile_photo_url, u.profile_photos,
                u.profile_photo_1, u.profile_photo_2, u.profile_photo_3,
                u.is_verified, u.attractiveness_score, u.looking_for,
                u.profession_title, u.height_cm,
@@ -12705,10 +12754,17 @@ pub async fn get_user_profile(
         "profile_view", None, None, Some(&source),
     ).await;
 
+    let public_name = public_name_for_viewer(
+        target.name.as_deref(),
+        target.display_name.as_deref(),
+        target.show_verified_name,
+    );
+
     Ok(Json(json!({
         "profile": {
             "id": target.id,
-            "name": target.name,
+            "name": public_name,
+            "display_name": target.display_name,
             "age": age,
             "gender": target.gender,
             "bio": target.bio,
