@@ -3549,6 +3549,80 @@ pub async fn create_call(
 }
 
 // ============================================================================
+// Banner image upload helper (shared by events, playgrounds, spots)
+// ============================================================================
+
+/// Decode a base64 image (with or without data: prefix), validate size/dims,
+/// re-encode as JPEG, persist under /uploads/banners/. Returns URL path.
+/// Returns None for empty/None input. Errors only for validation failures.
+async fn save_base64_banner(
+    state: &AppState,
+    user_id: i32,
+    b64: &str,
+    prefix: &str, // "event", "playground", "spot"
+) -> Result<Option<String>, AppError> {
+    let cleaned = b64.trim();
+    if cleaned.is_empty() { return Ok(None); }
+
+    // Strip optional data URL prefix: data:image/jpeg;base64,xxxx
+    let raw = cleaned
+        .split_once(',')
+        .map(|(_, tail)| tail)
+        .unwrap_or(cleaned);
+
+    let bytes = STANDARD.decode(raw)
+        .map_err(|_| AppError::bad_request("banner: invalid base64"))?;
+    if bytes.len() > 5 * 1024 * 1024 {
+        return Err(AppError::bad_request("banner: max 5MB"));
+    }
+
+    let img = image::load_from_memory(&bytes)
+        .map_err(|_| AppError::bad_request("banner: invalid image"))?;
+    let (w, h) = (img.width(), img.height());
+    if w > 4000 || h > 4000 || w < 64 || h < 64 {
+        return Err(AppError::bad_request("banner: dimensions must be 64-4000px"));
+    }
+
+    // Cap long edge at 1920 to keep banners light.
+    let img = if w.max(h) > 1920 {
+        img.resize(1920, 1920, image::imageops::FilterType::Lanczos3)
+    } else { img };
+
+    let jpeg_bytes = encode_jpeg(&img)
+        .map_err(|_| AppError::internal("banner: jpeg encode failed"))?;
+
+    let banner_dir = Path::new(&state.config.upload_dir).join("banners");
+    fs::create_dir_all(&banner_dir).await
+        .map_err(|_| AppError::internal("banner: mkdir failed"))?;
+
+    let filename = format!(
+        "{}_{}_{}_{}.jpg",
+        prefix, user_id, Utc::now().timestamp(), Uuid::new_v4()
+    );
+    let path = banner_dir.join(&filename);
+    fs::write(&path, &jpeg_bytes).await
+        .map_err(|_| AppError::internal("banner: write failed"))?;
+
+    Ok(Some(format!("/uploads/banners/{}", filename)))
+}
+
+/// Extract banner_url from a create payload: accept either `banner` (base64) or
+/// a pre-uploaded `banner_url`. Base64 wins if both provided.
+async fn extract_banner_url(
+    state: &AppState,
+    user_id: i32,
+    payload: &Value,
+    prefix: &str,
+) -> Result<Option<String>, AppError> {
+    if let Some(b64) = payload.get("banner").and_then(|v| v.as_str()) {
+        if !b64.trim().is_empty() {
+            return save_base64_banner(state, user_id, b64, prefix).await;
+        }
+    }
+    Ok(payload.get("banner_url").and_then(|v| v.as_str()).map(|s| s.to_string()))
+}
+
+// ============================================================================
 // Spots (Short Videos)
 // ============================================================================
 
@@ -3982,12 +4056,13 @@ pub async fn create_playground(
     let pg_type = payload["type"].as_str().unwrap_or("interest").to_string();
     let city = payload["city"].as_str().map(|s| s.to_string());
     let max_members = payload["max_members"].as_i64().unwrap_or(50) as i32;
+    let banner_url = extract_banner_url(&state, user_id, &payload, "playground").await?;
 
     let id = sqlx::query_scalar::<_, i64>(
-        r#"INSERT INTO playgrounds (name, description, playground_type, city, max_members, is_public, is_active)
-           VALUES ($1, $2, $3, $4, $5, true, true) RETURNING id"#,
+        r#"INSERT INTO playgrounds (name, description, playground_type, city, max_members, is_public, is_active, banner_url)
+           VALUES ($1, $2, $3, $4, $5, true, true, $6) RETURNING id"#,
     )
-    .bind(&name).bind(&description).bind(&pg_type).bind(&city).bind(max_members)
+    .bind(&name).bind(&description).bind(&pg_type).bind(&city).bind(max_members).bind(&banner_url)
     .fetch_one(&state.db).await?;
 
     // Creator auto-joins as admin
@@ -4009,8 +4084,8 @@ pub async fn get_playground_detail(
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
 
-    let pg = sqlx::query_as::<_, (i64, String, Option<String>, String, Option<String>, i32, i32, bool)>(
-        "SELECT id, name, description, playground_type, city, member_count, active_today, is_public FROM playgrounds WHERE id = $1"
+    let pg = sqlx::query_as::<_, (i64, String, Option<String>, String, Option<String>, i32, i32, bool, Option<String>)>(
+        "SELECT id, name, description, playground_type, city, member_count, active_today, is_public, banner_url FROM playgrounds WHERE id = $1"
     ).bind(pg_id).fetch_optional(&state.db).await?
     .ok_or_else(|| AppError::not_found("Playground not found"))?;
 
@@ -4020,7 +4095,8 @@ pub async fn get_playground_detail(
 
     Ok(Json(json!({
         "id": pg.0, "name": pg.1, "description": pg.2, "type": pg.3, "city": pg.4,
-        "member_count": pg.5, "active_today": pg.6, "is_public": pg.7, "is_member": is_member
+        "member_count": pg.5, "active_today": pg.6, "is_public": pg.7, "is_member": is_member,
+        "banner_url": pg.8
     })))
 }
 
@@ -4108,13 +4184,14 @@ pub async fn create_event(
         .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok())
         .ok_or_else(|| AppError::bad_request("Missing or invalid 'starts_at' (format: YYYY-MM-DDTHH:MM:SS)"))?;
     let max_attendees = payload["max_attendees"].as_i64().map(|v| v as i32);
+    let banner_url = extract_banner_url(&state, user_id, &payload, "event").await?;
 
     let id = sqlx::query_scalar::<_, i64>(
-        r#"INSERT INTO events (creator_id, title, description, category, location_name, latitude, longitude, starts_at, max_attendees)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id"#,
+        r#"INSERT INTO events (creator_id, title, description, category, location_name, latitude, longitude, starts_at, max_attendees, banner_url)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id"#,
     )
     .bind(user_id).bind(&title).bind(&description).bind(&category)
-    .bind(&location_name).bind(latitude).bind(longitude).bind(starts_at).bind(max_attendees)
+    .bind(&location_name).bind(latitude).bind(longitude).bind(starts_at).bind(max_attendees).bind(&banner_url)
     .fetch_one(&state.db).await?;
 
     // Creator auto-RSVPs
@@ -4152,13 +4229,14 @@ pub async fn get_events_near_me(
         .unwrap_or_default();
 
     // Get events with RSVP counts + whether user's matches are going
-    let events = sqlx::query_as::<_, (i64, i64, String, Option<String>, Option<String>, Option<String>, Option<f64>, Option<f64>, chrono::NaiveDateTime, Option<i32>, i64, i64)>(
+    let events = sqlx::query_as::<_, (i64, i64, String, Option<String>, Option<String>, Option<String>, Option<f64>, Option<f64>, chrono::NaiveDateTime, Option<i32>, i64, i64, Option<String>)>(
         r#"SELECT e.id, e.creator_id, e.title, e.description, e.category, e.location_name,
                   e.latitude, e.longitude, e.starts_at, e.max_attendees,
                   (SELECT COUNT(*) FROM event_rsvps WHERE event_id = e.id) as rsvp_count,
                   (SELECT COUNT(*) FROM event_rsvps er
                    JOIN matches m ON (m.user1_id = $1 AND m.user2_id = er.user_id) OR (m.user2_id = $1 AND m.user1_id = er.user_id)
-                   WHERE er.event_id = e.id AND m.is_mutual_match = true) as friends_going
+                   WHERE er.event_id = e.id AND m.is_mutual_match = true) as friends_going,
+                  e.banner_url
            FROM events e WHERE e.is_active = true AND e.starts_at > NOW()
            ORDER BY e.starts_at ASC LIMIT $2"#,
     ).bind(user_id).bind(limit * 3).fetch_all(&state.db).await?;
@@ -4197,6 +4275,7 @@ pub async fn get_events_near_me(
             "category": e.4, "location_name": e.5, "latitude": e.6, "longitude": e.7,
             "starts_at": format_datetime(e.8), "max_attendees": e.9,
             "rsvp_count": e.10, "friends_going": e.11,
+            "banner_url": e.12,
             "relevance_score": (score * 100.0) as i32
         });
         (score, val)
@@ -5005,12 +5084,13 @@ pub async fn create_outdoor_spot(
 
     let name = payload["name"].as_str().unwrap_or("").to_string();
     if name.is_empty() { return Err(AppError::bad_request("Missing 'name'")); }
+    let banner_url = extract_banner_url(&state, user_id, &payload, "spot").await?;
 
     let id = sqlx::query_scalar::<_, i64>(
         r#"INSERT INTO outdoor_spots (name, description, category, latitude, longitude, city, elevation_m,
                   difficulty, distance_km, best_months, best_time_of_day, photo_golden_hour,
-                  sunset_viewpoint, sunrise_viewpoint, created_by)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id"#,
+                  sunset_viewpoint, sunrise_viewpoint, created_by, banner_url)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING id"#,
     )
     .bind(&name)
     .bind(payload["description"].as_str())
@@ -5027,6 +5107,7 @@ pub async fn create_outdoor_spot(
     .bind(payload["sunset_viewpoint"].as_bool().unwrap_or(false))
     .bind(payload["sunrise_viewpoint"].as_bool().unwrap_or(false))
     .bind(user_id)
+    .bind(&banner_url)
     .fetch_one(&state.db).await?;
 
     // Graph: user created outdoor_spot

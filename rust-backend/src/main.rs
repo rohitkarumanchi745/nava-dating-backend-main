@@ -618,6 +618,10 @@ async fn main() {
     // Matches migrations/027_show_verified_name.sql.
     let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS show_verified_name BOOLEAN NOT NULL DEFAULT TRUE")
         .execute(&state.db).await;
+    // Matches migrations/028_banner_urls.sql.
+    let _ = sqlx::query("ALTER TABLE events ADD COLUMN IF NOT EXISTS banner_url TEXT").execute(&state.db).await;
+    let _ = sqlx::query("ALTER TABLE playgrounds ADD COLUMN IF NOT EXISTS banner_url TEXT").execute(&state.db).await;
+    let _ = sqlx::query("ALTER TABLE outdoor_spots ADD COLUMN IF NOT EXISTS banner_url TEXT").execute(&state.db).await;
 
     // Ensure user_event_outbox table exists (durable /ws/events delivery).
     // Idempotent — matches migrations/024_user_event_outbox.sql.
