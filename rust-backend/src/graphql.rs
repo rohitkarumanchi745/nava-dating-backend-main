@@ -21,6 +21,9 @@ pub struct User {
     pub phone_number: Option<String>,
     pub email: Option<String>,
     pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub show_verified_name: bool,
+    pub show_display_name_in_search: bool,
     pub age: Option<i32>,
     pub gender: Option<String>,
     pub bio: Option<String>,
@@ -247,7 +250,8 @@ impl Loader<i64> for UserLoader {
         let int_keys: Vec<i64> = keys.to_vec();
         let rows = sqlx::query_as::<_, UserRow>(
             r#"
-            SELECT id, phone_number, email, name, dob, gender, bio, location_text,
+            SELECT id, phone_number, email, name, display_name, show_verified_name, show_display_name_in_search,
+                   dob, gender, bio, location_text,
                    interests, languages, looking_for, profession_category, profession_title,
                    height_cm, profile_photo_1, profile_photo_2, profile_photo_3, profile_photos,
                    is_profile_complete, is_verified, is_student_verified, attractiveness_score
@@ -269,6 +273,9 @@ struct UserRow {
     phone_number: Option<String>,
     email: Option<String>,
     name: Option<String>,
+    display_name: Option<String>,
+    show_verified_name: Option<bool>,
+    show_display_name_in_search: Option<bool>,
     dob: Option<chrono::NaiveDate>,
     gender: Option<String>,
     bio: Option<String>,
@@ -323,6 +330,9 @@ impl From<UserRow> for User {
             phone_number: r.phone_number,
             email: r.email,
             name: r.name,
+            display_name: r.display_name,
+            show_verified_name: r.show_verified_name.unwrap_or(true),
+            show_display_name_in_search: r.show_display_name_in_search.unwrap_or(false),
             age,
             gender: r.gender,
             bio: r.bio,
