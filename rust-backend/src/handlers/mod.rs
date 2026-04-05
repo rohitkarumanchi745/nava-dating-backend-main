@@ -3552,6 +3552,65 @@ pub async fn create_call(
 // Banner image upload helper (shared by events, playgrounds, spots)
 // ============================================================================
 
+/// Decode image bytes. Tries the `image` crate first (JPEG/PNG/GIF/WebP/TIFF/
+/// BMP/ICO/TGA/QOI/PNM), falls back to ffmpeg for HEIC/HEIF/AVIF/anything else
+/// the image crate can't natively decode.
+///
+/// The ffmpeg fallback handles any format ffmpeg knows, including:
+/// - HEIC/HEIF (iPhone default camera format)
+/// - AVIF
+/// - JPEG 2000, JPEG XL
+/// - RAW/DNG (via ffmpeg's libraw)
+async fn decode_any_image(bytes: &[u8]) -> Result<image::DynamicImage, AppError> {
+    // Fast path: pure-rust decoders for common formats.
+    if let Ok(img) = image::load_from_memory(bytes) {
+        return Ok(img);
+    }
+
+    // Fallback: shell out to ffmpeg. Writes input+output to temp files in /tmp
+    // because ffmpeg's stdin parsing can fail for some formats (HEIC in particular).
+    let tmp_dir = std::env::temp_dir();
+    let nonce = Uuid::new_v4();
+    let input_path  = tmp_dir.join(format!("banner_in_{}.bin", nonce));
+    let output_path = tmp_dir.join(format!("banner_out_{}.png", nonce));
+
+    fs::write(&input_path, bytes).await
+        .map_err(|_| AppError::internal("image decode: tmp write failed"))?;
+
+    let status = tokio::process::Command::new("ffmpeg")
+        .arg("-y")                       // overwrite output
+        .arg("-i").arg(&input_path)
+        .arg("-frames:v").arg("1")       // single frame (HEIC sequences, GIFs)
+        .arg("-f").arg("image2")
+        .arg("-vcodec").arg("png")       // lossless handoff to image crate
+        .arg(&output_path)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .await;
+
+    // Always clean up input; output handled below
+    let _ = fs::remove_file(&input_path).await;
+
+    let ok = status.map(|s| s.success()).unwrap_or(false);
+    if !ok {
+        let _ = fs::remove_file(&output_path).await;
+        return Err(AppError::bad_request("unsupported or invalid image format"));
+    }
+
+    let png_bytes = match fs::read(&output_path).await {
+        Ok(b) => b,
+        Err(_) => {
+            let _ = fs::remove_file(&output_path).await;
+            return Err(AppError::internal("image decode: read converted failed"));
+        }
+    };
+    let _ = fs::remove_file(&output_path).await;
+
+    image::load_from_memory(&png_bytes)
+        .map_err(|_| AppError::bad_request("image decode: converted image unreadable"))
+}
+
 /// Decode a base64 image, validate, encode as high-quality JPEG, persist
 /// under /uploads/banners/. Returns URL path or None.
 ///
@@ -3591,8 +3650,7 @@ async fn save_base64_banner(
         return Err(AppError::bad_request("banner: max 10MB"));
     }
 
-    let img = image::load_from_memory(&bytes)
-        .map_err(|_| AppError::bad_request("banner: invalid image"))?;
+    let img = decode_any_image(&bytes).await?;
     let (w, h) = (img.width(), img.height());
     if w < MIN_DIM || h < MIN_DIM {
         return Err(AppError::bad_request(format!("banner: min {}x{}px", MIN_DIM, MIN_DIM)));
@@ -3663,8 +3721,14 @@ pub async fn upload_banner(
         let name = field.name().unwrap_or("").to_string();
         if name != "banner" && name != "file" && name != "image" { continue; }
 
+        // Some clients (notably iOS Share Extension with HEIC) send
+        // application/octet-stream. Trust the decoder below rather than
+        // rejecting on MIME alone.
         let ct = field.content_type().map(|s| s.to_string()).unwrap_or_default();
-        if !ct.starts_with("image/") {
+        if !ct.is_empty()
+            && !ct.starts_with("image/")
+            && ct != "application/octet-stream"
+        {
             return Err(AppError::bad_request("banner must be an image"));
         }
 
@@ -3686,10 +3750,9 @@ pub async fn upload_banner(
         return Err(AppError::bad_request("banner: empty file"));
     }
 
-    // Decode. image crate supports JPEG/PNG/GIF/WebP/TIFF/BMP/ICO out of the box.
-    // HEIC from iOS share sheet is NOT supported — client must convert to JPEG first.
-    let img = image::load_from_memory(&bytes)
-        .map_err(|_| AppError::bad_request("banner: unsupported/invalid image format"))?;
+    // Decode via format-agnostic helper (image crate + ffmpeg fallback for
+    // HEIC/HEIF/AVIF/JPEG-XL/RAW and anything ffmpeg knows).
+    let img = decode_any_image(&bytes).await?;
     let (w, h) = (img.width(), img.height());
     if w < MIN_DIM || h < MIN_DIM {
         return Err(AppError::bad_request(format!("banner: min {}x{}px", MIN_DIM, MIN_DIM)));
