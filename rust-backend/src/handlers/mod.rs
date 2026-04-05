@@ -11412,11 +11412,20 @@ pub async fn search_students(
     let mut bind_idx = 0u32;
     let mut bind_values: Vec<String> = Vec::new();
 
-    // Free-text name search
+    // Free-text name search.
+    // Always matches against users.name (verified legal name).
+    // ALSO matches against users.display_name when that user has opted in
+    // via show_display_name_in_search = TRUE. Single bind, one LOWER(q)
+    // value — Postgres evaluates the OR branch short-circuit.
     if let Some(ref q) = params.q {
         if !q.trim().is_empty() {
             bind_idx += 1;
-            conditions.push(format!("LOWER(u.name) LIKE ${}", bind_idx));
+            conditions.push(format!(
+                "(LOWER(u.name) LIKE ${idx} \
+                  OR (COALESCE(u.show_display_name_in_search, FALSE) = TRUE \
+                      AND LOWER(u.display_name) LIKE ${idx}))",
+                idx = bind_idx
+            ));
             bind_values.push(format!("%{}%", q.trim().to_lowercase()));
         }
     }
@@ -11802,12 +11811,13 @@ pub async fn unified_search(
         }));
     }
 
-    // 3. Also search people by name (across all universities) with filters
+    // 3. Also search people by name (across all universities) with filters.
+    // Matches verified users.name; also display_name if the user opted in.
     let mut people_conditions = vec![
         "u.is_active = TRUE".to_string(),
         "u.is_profile_complete = TRUE".to_string(),
         format!("u.id != {}", user_id),
-        "LOWER(u.name) LIKE $1".to_string(),
+        "(LOWER(u.name) LIKE $1 OR (COALESCE(u.show_display_name_in_search, FALSE) = TRUE AND LOWER(u.display_name) LIKE $1))".to_string(),
     ];
     let mut people_binds: Vec<String> = vec![search_term.clone()];
     let mut pidx = 1u32;
