@@ -4467,6 +4467,32 @@ pub async fn send_playground_message(
         "created_at": format_datetime(row.4),
     });
 
+    // Realtime fanout: publish to every active member's /ws/events channel.
+    // Uses the durable outbox, so offline members receive it on reconnect.
+    // Fire-and-forget in a background task — never blocks the POST response.
+    {
+        let state_clone = state.clone();
+        let msg_payload = message.clone();
+        let pg_id_str = pg_id.to_string();
+        tokio::spawn(async move {
+            let member_ids: Vec<i32> = sqlx::query_scalar(
+                "SELECT user_id FROM playground_members WHERE playground_id = $1 AND is_active = true"
+            )
+            .bind(pg_id)
+            .fetch_all(&state_clone.db)
+            .await
+            .unwrap_or_default();
+
+            for uid in member_ids {
+                let evt = json!({
+                    "playground_id": pg_id_str,
+                    "message": msg_payload.clone(),
+                });
+                publish_user_event(&state_clone, uid, "playground_message", evt).await;
+            }
+        });
+    }
+
     Ok(Json(json!({ "message": message })))
 }
 
