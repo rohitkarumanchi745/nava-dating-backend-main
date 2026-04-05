@@ -1266,6 +1266,7 @@ impl MutationRoot {
         &self,
         ctx: &Context<'_>,
         name: Option<String>,
+        #[graphql(name = "display_name")] display_name: Option<String>,
         gender: Option<String>,
         dob: Option<String>,
         bio: Option<String>,
@@ -1308,8 +1309,36 @@ impl MutationRoot {
         let mut updates = Vec::new();
         let mut params: Vec<String> = Vec::new();
 
-        if let Some(ref val) = name {
+        // Identity lock: once student-verified, users.name is immutable.
+        // A verified user's `name` argument is redirected into display_name.
+        let (is_verified, current_name) = {
+            #[derive(sqlx::FromRow)]
+            struct VRow { is_student_verified: Option<bool>, name: Option<String> }
+            match sqlx::query_as::<_, VRow>(
+                "SELECT is_student_verified, name FROM users WHERE id = $1"
+            ).bind(user_id).fetch_optional(&state.db).await? {
+                Some(r) => (r.is_student_verified.unwrap_or(false), r.name),
+                None => (false, None),
+            }
+        };
+
+        let (effective_name, effective_display_name) = if is_verified {
+            // Verified: reject any name change, route new value to display_name.
+            let forced_display = match (&name, &current_name) {
+                (Some(n), Some(cn)) if n != cn => Some(n.clone()),
+                _ => None,
+            };
+            (None, display_name.clone().or(forced_display))
+        } else {
+            (name.clone(), display_name.clone())
+        };
+
+        if let Some(ref val) = effective_name {
             updates.push(format!("name = ${}", params.len() + 2));
+            params.push(val.clone());
+        }
+        if let Some(ref val) = effective_display_name {
+            updates.push(format!("display_name = ${}", params.len() + 2));
             params.push(val.clone());
         }
         if let Some(ref val) = gender {
