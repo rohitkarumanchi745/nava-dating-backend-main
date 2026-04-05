@@ -407,10 +407,14 @@ impl NotificationHandlers {
     }
 
     pub async fn send_reel_match_accepted_notification(&self, user_id: i32, other_user_id: i32, reel_id: i32, match_id: &str) -> Result<(), String> {
-        let other_name = self.user_name(other_user_id).await;
-        let title = "It's a match!";
-        let body = format!("You and {} matched from a reel conversation!", other_name);
-        let data = serde_json::json!({ "type": "reel_match", "reel_id": reel_id, "match_id": match_id, "other_user_id": other_user_id });
+        let _other_name = self.user_name(other_user_id).await; // reserved for future per-user variants
+        // type: iOS routes "reel_match_accepted" → match chat. Do not rename without coordinating client-side.
+        let data = serde_json::json!({
+            "type": "reel_match_accepted",
+            "reel_id": reel_id,
+            "match_id": match_id,
+            "other_user_id": other_user_id
+        });
         let utc_offset = self.user_utc_offset(user_id).await;
         self.gated_send(user_id, NotifCategory::NewMatch, utc_offset, Some(&data)).await?;
         Ok(())
