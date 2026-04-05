@@ -23,6 +23,8 @@ pub struct UserRow {
     pub email: Option<String>,
     pub name: Option<String>,
     pub display_name: Option<String>,
+    pub show_verified_name: Option<bool>,
+    pub show_display_name_in_search: Option<bool>,
     pub dob: Option<NaiveDate>,
     pub gender: Option<String>,
     pub bio: Option<String>,

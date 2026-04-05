@@ -730,6 +730,27 @@ pub async fn set_show_display_name_in_search(
     Ok(Json(json!({ "show_display_name_in_search": payload.enabled })))
 }
 
+/// POST /profile/show-verified-name
+/// Toggle whether OTHER users viewing this person's profile see users.name.
+/// Default: TRUE. Owner always sees their own verified name.
+/// Does NOT affect name search — search always uses users.name.
+#[derive(Deserialize)]
+pub struct ShowVerifiedNameRequest { pub enabled: bool }
+
+pub async fn set_show_verified_name(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ShowVerifiedNameRequest>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    sqlx::query("UPDATE users SET show_verified_name = $1, updated_at = NOW() WHERE id = $2")
+        .bind(payload.enabled).bind(user_id).execute(&state.db).await?;
+
+    Ok(Json(json!({ "show_verified_name": payload.enabled })))
+}
+
 // ============================================================================
 // Voice Intro Upload
 // ============================================================================
@@ -972,6 +993,8 @@ pub async fn profile_me(
         "email": user.email,
         "name": user.name,
         "display_name": user.display_name,
+        "show_verified_name": user.show_verified_name.unwrap_or(true),
+        "show_display_name_in_search": user.show_display_name_in_search.unwrap_or(false),
         "dob": user.dob.map(format_date),
         "age": user.dob.map(calculate_age),
         "gender": user.gender,
@@ -6167,7 +6190,7 @@ async fn analyze_photo_bytes(
 async fn fetch_user_by_id(db: &PgPool, user_id: i32) -> Result<Option<UserRow>, sqlx::Error> {
     sqlx::query_as::<_, UserRow>(
         r#"
-        SELECT id, phone_number, email, name, display_name, dob, gender, bio, location_text,
+        SELECT id, phone_number, email, name, display_name, show_verified_name, show_display_name_in_search, dob, gender, bio, location_text,
                interests, languages, looking_for, profession_category, profession_title,
                height_cm, profile_photo_url, profile_photos, profile_photo_1,
                profile_photo_2, profile_photo_3, is_profile_complete, attractiveness_score,
