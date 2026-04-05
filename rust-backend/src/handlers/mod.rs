@@ -5960,6 +5960,16 @@ pub async fn ws_call(
     ws.on_upgrade(move |socket| websocket::handle_call(socket, state, call_id, token))
 }
 
+/// App-wide user events socket: /ws/events?token=JWT
+pub async fn ws_events(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let token = params.get("token").cloned().unwrap_or_default();
+    ws.on_upgrade(move |socket| websocket::handle_events(socket, state, token))
+}
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -8252,6 +8262,9 @@ pub async fn send_reel_message(
         reel_id: payload.reel_id, sender_id, receiver_id, content_preview: preview,
     });
 
+    // Real-time inbox badge update for the receiver (if their /ws/events is connected).
+    publish_reel_inbox_update(&state, receiver_id).await;
+
     Ok(Json(json!({ "message_id": message_id, "effort_score": effort_score, "sent": true })))
 }
 
@@ -8391,6 +8404,9 @@ pub async fn reply_reel_message(
         });
     }
 
+    // Real-time badge update for the original sender (the recipient of this reply).
+    publish_reel_inbox_update(&state, orig_sender_id).await;
+
     Ok(Json(json!({ "reply_id": reply_id, "conversation_continued": conversation_continued, "response_time_sec": response_time_sec })))
 }
 
@@ -8406,7 +8422,23 @@ pub async fn mark_reel_message_read(
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
     sqlx::query("UPDATE reel_messages SET is_read = TRUE, read_at = NOW() WHERE id = $1 AND receiver_id = $2").bind(payload.message_id).bind(user_id).execute(&state.db).await?;
+    publish_reel_inbox_update(&state, user_id).await;
     Ok(Json(json!({ "marked_read": true })))
+}
+
+/// Recompute unread reel message count for a user and publish to their
+/// /ws/events subscribers. Fire-and-forget — never fails the caller.
+pub async fn publish_reel_inbox_update(state: &AppState, user_id: i32) {
+    let unread: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reel_messages WHERE receiver_id = $1 AND is_read = FALSE"
+    )
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0);
+
+    let payload = json!({ "type": "reel_inbox_update", "unread_count": unread }).to_string();
+    state.user_events.read().await.publish(user_id, payload);
 }
 
 /// Get conversation thread

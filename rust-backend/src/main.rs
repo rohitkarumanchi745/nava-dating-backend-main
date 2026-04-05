@@ -133,7 +133,7 @@ use handlers::{
     // Admin
     admin_stats, admin_override_identity, admin_replay_graph, admin_data_quality, secrets_status,
     // WebSocket
-    ws_call, ws_chat,
+    ws_call, ws_chat, ws_events,
     // ML Training
     update_user_embedding, get_user_embedding, get_batch_embeddings,
     update_bandit_arm, get_bandit_arm,
@@ -603,6 +603,7 @@ async fn main() {
         university_cache: Arc::new(RwLock::new(lru::LruCache::new(std::num::NonZeroUsize::new(500).unwrap()))),
         premium_cache: Arc::new(RwLock::new(lru::LruCache::new(std::num::NonZeroUsize::new(10_000).unwrap()))),
         blocked_pairs: Arc::new(RwLock::new(std::collections::HashSet::new())),
+        user_events: Arc::new(RwLock::new(state::UserEventHub::new())),
     };
 
     // Start DLQ processor for payment retry handling
@@ -1048,6 +1049,7 @@ async fn main() {
         // WebSocket
         .route("/ws/chat", get(ws_chat))
         .route("/ws/call", get(ws_call))
+        .route("/ws/events", get(ws_events))
         // ML Training Endpoints
         .route("/ml/embeddings", post(update_user_embedding))
         .route("/ml/embeddings", get(get_user_embedding))

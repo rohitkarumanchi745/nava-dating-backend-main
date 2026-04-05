@@ -398,3 +398,87 @@ pub async fn handle_call(socket: WebSocket, state: AppState, call_id: String, to
         sessions.end(&call_id_clone);
     }
 }
+
+// ============================================================================
+// App-wide User Events WebSocket (/ws/events)
+// ============================================================================
+
+/// Handles /ws/events?token=JWT. One connection per device. Receives pushed
+/// events (e.g., reel_inbox_update) scoped to the authenticated user.
+pub async fn handle_events(socket: WebSocket, state: AppState, token: String) {
+    let user_id = match decode_access_token(&token, &state.config.secret_key) {
+        Ok(id) => id,
+        Err(_) => {
+            tracing::warn!("Invalid token for events WebSocket");
+            return;
+        }
+    };
+
+    // Subscribe to this user's broadcast channel.
+    let mut rx = {
+        let mut hub = state.user_events.write().await;
+        hub.get_or_create(user_id).subscribe()
+    };
+
+    let (sender, mut receiver) = socket.split();
+    let sender = Arc::new(Mutex::new(sender));
+
+    // Send initial unread reel messages count so the client gets a value
+    // immediately on connect (no race with polling fallback).
+    let initial_unread: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reel_messages WHERE receiver_id = $1 AND is_read = FALSE"
+    )
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0);
+
+    let initial = json!({
+        "type": "reel_inbox_update",
+        "unread_count": initial_unread
+    });
+    let _ = sender.lock().await.send(Message::Text(initial.to_string().into())).await;
+
+    // 30s keepalive ping.
+    let ping_sender = Arc::clone(&sender);
+    let ping_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if ping_sender.lock().await.send(Message::Ping(vec![].into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Forward events from the broadcast channel to the socket.
+    let fwd_sender = Arc::clone(&sender);
+    let forward_task = tokio::spawn(async move {
+        while let Ok(evt) = rx.recv().await {
+            if fwd_sender.lock().await.send(Message::Text(evt.json.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Drain client → server messages. We don't expect any meaningful client
+    // traffic today (heartbeat pongs handled by axum), but we still need to
+    // consume or the connection backs up.
+    let incoming_task = tokio::spawn(async move {
+        while let Some(msg) = receiver.next().await {
+            match msg {
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    // When any task exits, tear down the others.
+    tokio::select! {
+        _ = ping_task => {},
+        _ = forward_task => {},
+        _ = incoming_task => {},
+    }
+
+    tracing::debug!("events WebSocket closed for user {}", user_id);
+}

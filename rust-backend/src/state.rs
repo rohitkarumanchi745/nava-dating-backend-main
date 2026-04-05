@@ -110,6 +110,8 @@ pub struct AppState {
     pub premium_cache: Arc<RwLock<LruCache<i32, CachedPremiumStatus>>>,
     /// Blocked user pairs for O(1) lookup — rebuilt every 5 min
     pub blocked_pairs: Arc<RwLock<HashSet<(i32, i32)>>>,
+    /// Per-user event hub for app-wide WebSocket fanout (unread counts, etc.)
+    pub user_events: Arc<RwLock<UserEventHub>>,
 }
 
 // Allow extracting AppState from Arc<AppState>
@@ -531,4 +533,52 @@ pub struct CallSignal {
     pub signal_type: String, // "offer", "answer", "ice", "join", "leave", "end"
     pub sender_id: i32,
     pub payload: String, // JSON payload (SDP, ICE candidate, etc.)
+}
+
+// ============================================================================
+// User Event Hub — per-user WebSocket fanout (unread counts, app-wide events)
+// ============================================================================
+
+/// App-wide user event. Frontend subscribes over /ws/events and receives these
+/// as JSON with the `type` field discriminating the payload.
+#[derive(Debug, Clone)]
+pub struct UserEvent {
+    pub json: String,
+}
+
+/// Hub mapping user_id -> broadcast channel. Each authenticated WebSocket
+/// subscribes to its user's channel. Multiple devices per user all receive
+/// the same event via broadcast::channel's multi-consumer semantics.
+pub struct UserEventHub {
+    channels: HashMap<i32, broadcast::Sender<UserEvent>>,
+    buffer_size: usize,
+}
+
+impl UserEventHub {
+    pub fn new() -> Self {
+        Self { channels: HashMap::new(), buffer_size: 32 }
+    }
+
+    /// Get or create the broadcast sender for a user.
+    pub fn get_or_create(&mut self, user_id: i32) -> broadcast::Sender<UserEvent> {
+        if let Some(s) = self.channels.get(&user_id) {
+            s.clone()
+        } else {
+            let (s, _) = broadcast::channel(self.buffer_size);
+            self.channels.insert(user_id, s.clone());
+            s
+        }
+    }
+
+    /// Publish a pre-serialized JSON event to a user. If nobody is listening,
+    /// the send is a no-op (broadcast channels drop when no subscribers).
+    pub fn publish(&self, user_id: i32, json: String) {
+        if let Some(s) = self.channels.get(&user_id) {
+            let _ = s.send(UserEvent { json });
+        }
+    }
+}
+
+impl Default for UserEventHub {
+    fn default() -> Self { Self::new() }
 }
