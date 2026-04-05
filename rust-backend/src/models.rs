@@ -22,6 +22,7 @@ pub struct UserRow {
     pub phone_number: String,
     pub email: Option<String>,
     pub name: Option<String>,
+    pub display_name: Option<String>,
     pub dob: Option<NaiveDate>,
     pub gender: Option<String>,
     pub bio: Option<String>,

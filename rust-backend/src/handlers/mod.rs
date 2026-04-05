@@ -407,7 +407,7 @@ pub async fn update_profile(
         }
     }
 
-    let name = name.ok_or_else(|| AppError::bad_request("name is required"))?;
+    let mut name = name.ok_or_else(|| AppError::bad_request("name is required"))?;
     let dob_raw = dob_raw.ok_or_else(|| AppError::bad_request("dob is required"))?;
     let gender = gender.ok_or_else(|| AppError::bad_request("gender is required"))?;
 
@@ -565,6 +565,26 @@ pub async fn update_profile(
     let csv_paths = saved_paths.join(",");
     let photos_json = sqlx::types::Json(saved_paths.clone());
 
+    // Identity lock: once student-verified, users.name is immutable.
+    // Any new value from the client is redirected into users.display_name.
+    // Rationale: name search relies on users.name being a stable verified key.
+    let verified_row = sqlx::query_as::<_, (Option<bool>, Option<String>)>(
+        "SELECT is_student_verified, name FROM users WHERE id = $1"
+    )
+    .bind(user_id).fetch_one(&state.db).await.ok();
+    let (is_verified, current_name) = match verified_row {
+        Some((v, n)) => (v.unwrap_or(false), n),
+        None => (false, None),
+    };
+
+    let display_name_update: Option<String> = if is_verified && current_name.as_deref().map(|c| c != name.as_str()).unwrap_or(false) {
+        let new_display = name.clone();
+        name = current_name.unwrap_or(name); // pin to verified value
+        Some(new_display)
+    } else {
+        None
+    };
+
     let result = sqlx::query(
         r#"
         UPDATE users
@@ -605,6 +625,12 @@ pub async fn update_profile(
     if result.rows_affected() == 0 {
         cleanup_files(&saved_paths).await;
         return Err(AppError::not_found("User not found"));
+    }
+
+    // If verified user tried to change name, persist it as display_name instead.
+    if let Some(ref dn) = display_name_update {
+        let _ = sqlx::query("UPDATE users SET display_name = $1, updated_at = NOW() WHERE id = $2")
+            .bind(dn).bind(user_id).execute(&state.db).await;
     }
 
     // Create default preferences if not exist
@@ -650,6 +676,38 @@ pub async fn update_bio(
     }
 
     Ok(Json(json!({ "message": "Bio updated successfully" })))
+}
+
+/// POST /users/display-name
+/// Update the mutable UI name. Does NOT change users.name (search key) for
+/// verified users. Free-text, max 60 chars. Falls back to users.name in reads
+/// when empty/null.
+#[derive(Deserialize)]
+pub struct UpdateDisplayNameRequest { pub display_name: String }
+
+pub async fn update_display_name(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdateDisplayNameRequest>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    let trimmed = payload.display_name.trim();
+    if trimmed.is_empty() {
+        // Empty → clear display_name, fall back to users.name in reads.
+        sqlx::query("UPDATE users SET display_name = NULL, updated_at = NOW() WHERE id = $1")
+            .bind(user_id).execute(&state.db).await?;
+        return Ok(Json(json!({ "display_name": null, "cleared": true })));
+    }
+    if trimmed.chars().count() > 60 {
+        return Err(AppError::bad_request("display_name must be 60 characters or less"));
+    }
+
+    sqlx::query("UPDATE users SET display_name = $1, updated_at = NOW() WHERE id = $2")
+        .bind(trimmed).bind(user_id).execute(&state.db).await?;
+
+    Ok(Json(json!({ "display_name": trimmed })))
 }
 
 // ============================================================================
@@ -893,6 +951,7 @@ pub async fn profile_me(
         "phone_number": user.phone_number,
         "email": user.email,
         "name": user.name,
+        "display_name": user.display_name,
         "dob": user.dob.map(format_date),
         "age": user.dob.map(calculate_age),
         "gender": user.gender,
@@ -6088,7 +6147,7 @@ async fn analyze_photo_bytes(
 async fn fetch_user_by_id(db: &PgPool, user_id: i32) -> Result<Option<UserRow>, sqlx::Error> {
     sqlx::query_as::<_, UserRow>(
         r#"
-        SELECT id, phone_number, email, name, dob, gender, bio, location_text,
+        SELECT id, phone_number, email, name, display_name, dob, gender, bio, location_text,
                interests, languages, looking_for, profession_category, profession_title,
                height_cm, profile_photo_url, profile_photos, profile_photo_1,
                profile_photo_2, profile_photo_3, is_profile_complete, attractiveness_score,
@@ -13582,6 +13641,7 @@ pub async fn app_bootstrap(
     let profile = json!({
         "id": user.id,
         "name": user.name,
+        "display_name": user.display_name,
         "dob": user.dob.map(format_date),
         "age": user.dob.map(calculate_age),
         "gender": user.gender,
