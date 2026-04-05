@@ -710,6 +710,26 @@ pub async fn update_display_name(
     Ok(Json(json!({ "display_name": trimmed })))
 }
 
+/// POST /profile/display-name-in-search
+/// Toggle whether display_name appears as an alias in /search/students results.
+/// Default: FALSE. Verified users.name always appears regardless.
+#[derive(Deserialize)]
+pub struct ShowDisplayNameInSearchRequest { pub enabled: bool }
+
+pub async fn set_show_display_name_in_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ShowDisplayNameInSearchRequest>,
+) -> Result<Json<Value>, AppError> {
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    sqlx::query("UPDATE users SET show_display_name_in_search = $1, updated_at = NOW() WHERE id = $2")
+        .bind(payload.enabled).bind(user_id).execute(&state.db).await?;
+
+    Ok(Json(json!({ "show_display_name_in_search": payload.enabled })))
+}
+
 // ============================================================================
 // Voice Intro Upload
 // ============================================================================
@@ -11185,7 +11205,12 @@ pub struct StudentSearchQuery {
 #[derive(Debug, Serialize)]
 pub struct StudentSearchResult {
     pub id: String,
+    /// Verified legal name (users.name). This is the search key; always returned.
     pub name: Option<String>,
+    /// Mutable UI alias (users.display_name) — only present when the user has
+    /// opted in via show_display_name_in_search. Clients should show this
+    /// as a secondary line ("aka ...") not replace `name`.
+    pub display_name_alias: Option<String>,
     pub age: Option<i32>,
     pub photos: Vec<String>,
     pub university: Option<String>,
@@ -11207,6 +11232,8 @@ pub struct StudentSearchResult {
 struct StudentSearchRow {
     id: i32,
     name: Option<String>,
+    display_name: Option<String>,
+    show_display_name_in_search: Option<bool>,
     dob: Option<NaiveDate>,
     gender: Option<String>,
     bio: Option<String>,
@@ -11528,9 +11555,16 @@ pub async fn search_students(
 
         let is_matched = interaction_status == "matched";
 
+        let display_name_alias = if row.show_display_name_in_search.unwrap_or(false) {
+            row.display_name.clone().filter(|s| !s.trim().is_empty())
+        } else {
+            None
+        };
+
         StudentSearchResult {
             id: row.id.to_string(),
             name: row.name.clone(),
+            display_name_alias,
             age,
             photos,
             university: row.university_name.clone().or_else(|| row.university_short_name.clone()),

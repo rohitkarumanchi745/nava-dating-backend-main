@@ -72,7 +72,7 @@ use handlers::{
     // Auth
     send_otp, verify_otp,
     // Profile
-    profile_me, profile_status, update_bio, update_display_name, update_profile, update_preferences, set_city_arrival,
+    profile_me, profile_status, update_bio, update_display_name, set_show_display_name_in_search, update_profile, update_preferences, set_city_arrival,
     // Voice Intro
     upload_voice_intro, upload_voice_intro_json, track_voice_play,
     // Discovery & Matching
@@ -612,6 +612,9 @@ async fn main() {
         .execute(&state.db).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_users_name_lower ON users (LOWER(name))")
         .execute(&state.db).await;
+    // Matches migrations/026_show_display_name_in_search.sql.
+    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS show_display_name_in_search BOOLEAN NOT NULL DEFAULT FALSE")
+        .execute(&state.db).await;
 
     // Ensure user_event_outbox table exists (durable /ws/events delivery).
     // Idempotent — matches migrations/024_user_event_outbox.sql.
@@ -905,6 +908,7 @@ async fn main() {
         .route("/profile/status", get(profile_status))
         .route("/profile/me", get(profile_me))
         .route("/profile/display-name", post(update_display_name))
+        .route("/profile/display-name-in-search", post(set_show_display_name_in_search))
         .route("/profile/city-arrival", put(set_city_arrival))
         .route("/preferences", post(update_preferences))
         // App Bootstrap & Badges (cold-start + lightweight polling)
