@@ -3944,7 +3944,7 @@ pub async fn create_spot(
 
     Ok(Json(json!({
         "message": "Spot created successfully",
-        "spot_id": spot_id,
+        "spot_id": spot_id.to_string(),
         "url": path,
         "expires_at": expires_at.map(format_datetime),
     })))
@@ -4042,7 +4042,7 @@ pub async fn get_spots_feed(
         }
 
         let val = json!({
-            "id": s.id, "user_id": s.user_id, "title": s.title,
+            "id": s.id.to_string(), "user_id": s.user_id.to_string(), "title": s.title,
             "poster_url": s.poster_url, "original_url": s.original_url,
             "city": s.city, "tags": s.tags, "relevance_score": (score * 100.0) as i32,
             "created_at": s.created_at.map(format_datetime),
@@ -4089,7 +4089,7 @@ pub async fn get_spot_messages(
     };
 
     let results: Vec<Value> = msgs.into_iter().map(|m| {
-        json!({ "id": m.id, "spot_id": m.spot_id, "sender_id": m.sender_id, "text": m.text, "created_at": m.created_at.map(format_datetime) })
+        json!({ "id": m.id.to_string(), "spot_id": m.spot_id.to_string(), "sender_id": m.sender_id.to_string(), "text": m.text, "created_at": m.created_at.map(format_datetime) })
     }).collect();
 
     Ok(Json(json!({ "messages": results })))
@@ -4123,7 +4123,7 @@ pub async fn send_spot_message(
            ON CONFLICT (spot_id, user_a, user_b) DO UPDATE SET a_count = spot_pair_status.a_count + 1, updated_at = NOW()"#
     ).bind(spot_id).bind(user_id).execute(&state.db).await;
 
-    Ok(Json(json!({ "message_id": id })))
+    Ok(Json(json!({ "message_id": id.to_string() })))
 }
 
 /// POST /spots/:id/react — react to a spot (tracks engagement for pair matching)
@@ -4216,7 +4216,7 @@ pub async fn get_playgrounds(
         score += 0.2 * (p.6 as f64 / (p.6 as f64 + 10.0)); // sigmoid-like
 
         let val = json!({
-            "id": p.0, "name": p.1, "description": p.2, "type": p.3, "city": p.4,
+            "id": p.0.to_string(), "name": p.1, "description": p.2, "type": p.3, "city": p.4,
             "member_count": p.5, "active_today": p.6, "cover_image_url": p.7, "icon_url": p.8,
             "is_joined": is_joined, "relevance_score": (score * 100.0) as i32
         });
@@ -4260,7 +4260,7 @@ pub async fn create_playground(
     sqlx::query("UPDATE playgrounds SET member_count = 1 WHERE id = $1")
         .bind(id).execute(&state.db).await?;
 
-    Ok(Json(json!({ "playground_id": id })))
+    Ok(Json(json!({ "playground_id": id.to_string() })))
 }
 
 /// GET /playgrounds/:id
@@ -4282,7 +4282,7 @@ pub async fn get_playground_detail(
     ).bind(pg_id).bind(user_id).fetch_one(&state.db).await.unwrap_or(false);
 
     Ok(Json(json!({
-        "id": pg.0, "name": pg.1, "description": pg.2, "type": pg.3, "city": pg.4,
+        "id": pg.0.to_string(), "name": pg.1, "description": pg.2, "type": pg.3, "city": pg.4,
         "member_count": pg.5, "active_today": pg.6, "is_public": pg.7, "is_member": is_member,
         "banner_url": pg.8
     })))
@@ -4342,7 +4342,7 @@ pub async fn get_playground_members(
     ).bind(pg_id).fetch_all(&state.db).await?;
 
     let results: Vec<Value> = members.into_iter().map(|m| {
-        json!({ "user_id": m.0, "name": m.1, "photo": m.2, "role": m.3, "last_active": m.4.map(format_datetime) })
+        json!({ "user_id": m.0.to_string(), "name": m.1, "photo": m.2, "role": m.3, "last_active": m.4.map(format_datetime) })
     }).collect();
 
     Ok(Json(json!({ "members": results })))
@@ -4386,7 +4386,7 @@ pub async fn create_event(
     sqlx::query("INSERT INTO event_rsvps (event_id, user_id, status) VALUES ($1, $2, 'going')")
         .bind(id).bind(user_id).execute(&state.db).await?;
 
-    Ok(Json(json!({ "event_id": id })))
+    Ok(Json(json!({ "event_id": id.to_string() })))
 }
 
 /// GET /events — ML-ranked: nearby + interest match + friends going + urgency
@@ -4459,7 +4459,7 @@ pub async fn get_events_near_me(
         score += 0.1 * (e.10 as f64 / (e.10 as f64 + 5.0));
 
         let val = json!({
-            "id": e.0, "creator_id": e.1, "title": e.2, "description": e.3,
+            "id": e.0.to_string(), "creator_id": e.1.to_string(), "title": e.2, "description": e.3,
             "category": e.4, "location_name": e.5, "latitude": e.6, "longitude": e.7,
             "starts_at": format_datetime(e.8), "max_attendees": e.9,
             "rsvp_count": e.10, "friends_going": e.11,
