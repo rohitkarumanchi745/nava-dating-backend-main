@@ -606,6 +606,35 @@ async fn main() {
         user_events: Arc::new(RwLock::new(state::UserEventHub::new())),
     };
 
+    // Ensure user_event_outbox table exists (durable /ws/events delivery).
+    // Idempotent — matches migrations/024_user_event_outbox.sql.
+    let _ = sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS user_event_outbox (
+            id BIGSERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )"#
+    ).execute(&state.db).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_event_outbox_user_id ON user_event_outbox (user_id, id)")
+        .execute(&state.db).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_event_outbox_created_at ON user_event_outbox (created_at)")
+        .execute(&state.db).await;
+
+    // Hourly prune of outbox rows older than 7 days.
+    {
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                let _ = sqlx::query("DELETE FROM user_event_outbox WHERE created_at < NOW() - INTERVAL '7 days'")
+                    .execute(&db).await;
+            }
+        });
+    }
+
     // Start DLQ processor for payment retry handling
     if state.payment_service.is_some() {
         let dlq_runner = DlqProcessorRunner::new(Arc::new(state.clone()), DlqProcessorConfig::default());

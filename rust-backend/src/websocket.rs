@@ -403,9 +403,21 @@ pub async fn handle_call(socket: WebSocket, state: AppState, call_id: String, to
 // App-wide User Events WebSocket (/ws/events)
 // ============================================================================
 
-/// Handles /ws/events?token=JWT. One connection per device. Receives pushed
-/// events (e.g., reel_inbox_update) scoped to the authenticated user.
-pub async fn handle_events(socket: WebSocket, state: AppState, token: String) {
+/// Handles /ws/events?token=JWT&since=<last_event_id>. One connection per
+/// device. Receives pushed events scoped to the authenticated user.
+///
+/// Delivery guarantees:
+/// - Outbox: every event is persisted to user_event_outbox BEFORE broadcast.
+/// - Replay: on connect, we send all outbox rows with id > `since` (or the
+///   last 7 days if `since` is None), ordered by id ascending.
+/// - Dedup: client tracks max event_id seen and passes it as `since` next
+///   connect, so at-most-once isn't required on the transport — client can
+///   ignore event_id <= last_seen without harm.
+/// - Broadcast race: events that arrive while we're replaying are buffered
+///   by the broadcast channel (buffer_size=32). After replay we drain live
+///   events; any broadcast we missed during replay is covered by the fact
+///   that we INSERT before broadcast — we'll see it in the outbox next time.
+pub async fn handle_events(socket: WebSocket, state: AppState, token: String, since: Option<i64>) {
     let user_id = match decode_access_token(&token, &state.config.secret_key) {
         Ok(id) => id,
         Err(_) => {
@@ -414,7 +426,8 @@ pub async fn handle_events(socket: WebSocket, state: AppState, token: String) {
         }
     };
 
-    // Subscribe to this user's broadcast channel.
+    // Subscribe BEFORE replay so we don't miss events published during the
+    // replay window. Events that arrive are buffered in the broadcast channel.
     let mut rx = {
         let mut hub = state.user_events.write().await;
         hub.get_or_create(user_id).subscribe()
@@ -423,19 +436,47 @@ pub async fn handle_events(socket: WebSocket, state: AppState, token: String) {
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(Mutex::new(sender));
 
-    // Send initial unread reel messages count so the client gets a value
-    // immediately on connect (no race with polling fallback).
-    let initial_unread: i64 = sqlx::query_scalar(
+    // Replay durable outbox. Cap at 500 rows to protect slow clients.
+    let replay_rows: Vec<(i64, String, serde_json::Value)> = match since {
+        Some(last_id) => sqlx::query_as(
+            "SELECT id, event_type, payload FROM user_event_outbox \
+             WHERE user_id = $1 AND id > $2 ORDER BY id ASC LIMIT 500"
+        )
+        .bind(user_id).bind(last_id).fetch_all(&state.db).await.unwrap_or_default(),
+        None => sqlx::query_as(
+            "SELECT id, event_type, payload FROM user_event_outbox \
+             WHERE user_id = $1 AND created_at > NOW() - INTERVAL '7 days' \
+             ORDER BY id ASC LIMIT 500"
+        )
+        .bind(user_id).fetch_all(&state.db).await.unwrap_or_default(),
+    };
+
+    let mut max_replayed_id: i64 = since.unwrap_or(0);
+    {
+        let mut s = sender.lock().await;
+        for (id, event_type, mut payload) in replay_rows {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("event_id".to_string(), json!(id));
+                obj.entry("type").or_insert_with(|| json!(event_type));
+                obj.insert("replayed".to_string(), json!(true));
+            }
+            if s.send(Message::Text(payload.to_string().into())).await.is_err() {
+                return; // client disconnected during replay
+            }
+            if id > max_replayed_id { max_replayed_id = id; }
+        }
+    }
+
+    // After replay, always send fresh reel_inbox_update so the badge reflects
+    // current DB state (idempotent — client uses latest-wins on event_id).
+    let current_unread: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM reel_messages WHERE receiver_id = $1 AND is_read = FALSE"
     )
-    .bind(user_id)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
-
+    .bind(user_id).fetch_one(&state.db).await.unwrap_or(0);
     let initial = json!({
         "type": "reel_inbox_update",
-        "unread_count": initial_unread
+        "unread_count": current_unread,
+        "snapshot": true
     });
     let _ = sender.lock().await.send(Message::Text(initial.to_string().into())).await;
 
@@ -451,10 +492,20 @@ pub async fn handle_events(socket: WebSocket, state: AppState, token: String) {
         }
     });
 
-    // Forward events from the broadcast channel to the socket.
+    // Forward events from the broadcast channel to the socket. Drop any
+    // events whose event_id <= max_replayed_id (we already sent those).
     let fwd_sender = Arc::clone(&sender);
     let forward_task = tokio::spawn(async move {
         while let Ok(evt) = rx.recv().await {
+            // Best-effort dedup against replay window. Parsing failures fall
+            // through and deliver — dropping is worse than duplicating.
+            if max_replayed_id > 0 {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&evt.json) {
+                    if let Some(id) = v.get("event_id").and_then(|x| x.as_i64()) {
+                        if id <= max_replayed_id { continue; }
+                    }
+                }
+            }
             if fwd_sender.lock().await.send(Message::Text(evt.json.into())).await.is_err() {
                 break;
             }

@@ -5960,14 +5960,17 @@ pub async fn ws_call(
     ws.on_upgrade(move |socket| websocket::handle_call(socket, state, call_id, token))
 }
 
-/// App-wide user events socket: /ws/events?token=JWT
+/// App-wide user events socket: /ws/events?token=JWT&since=<last_event_id>
+/// `since` is optional — when omitted, the server replays the last 7 days of
+/// outbox events for this user.
 pub async fn ws_events(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let token = params.get("token").cloned().unwrap_or_default();
-    ws.on_upgrade(move |socket| websocket::handle_events(socket, state, token))
+    let since = params.get("since").and_then(|v| v.parse::<i64>().ok());
+    ws.on_upgrade(move |socket| websocket::handle_events(socket, state, token, since))
 }
 
 // ============================================================================
@@ -8426,8 +8429,42 @@ pub async fn mark_reel_message_read(
     Ok(Json(json!({ "marked_read": true })))
 }
 
-/// Recompute unread reel message count for a user and publish to their
-/// /ws/events subscribers. Fire-and-forget — never fails the caller.
+/// Publish a durable user event: writes to user_event_outbox AND broadcasts
+/// to any live /ws/events subscribers. On reconnect, the client replays
+/// outbox rows it hasn't seen (see websocket::handle_events).
+///
+/// The returned event_id is embedded in the JSON so clients can track
+/// last-seen-id for since-based replay on the next connect.
+///
+/// Fire-and-forget — never fails the caller.
+pub async fn publish_user_event(state: &AppState, user_id: i32, event_type: &str, mut payload: Value) {
+    // INSERT first so the event is durable even if broadcast drops it.
+    let event_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO user_event_outbox (user_id, event_type, payload) VALUES ($1, $2, $3) RETURNING id"
+    )
+    .bind(user_id)
+    .bind(event_type)
+    .bind(&payload)
+    .fetch_one(&state.db)
+    .await
+    .ok();
+
+    // Embed event_id + type into the outgoing JSON envelope so the client
+    // can drive since-id replay and type-discriminated handling.
+    if let Some(id) = event_id {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("event_id".to_string(), json!(id));
+            obj.entry("type").or_insert_with(|| json!(event_type));
+        }
+    }
+
+    let msg = payload.to_string();
+    state.user_events.read().await.publish(user_id, msg);
+}
+
+/// Recompute unread reel message count for a user and publish it as a
+/// durable event. Still self-healing: clients can fall back to the fresh
+/// state we send on /ws/events connect if they miss everything.
 pub async fn publish_reel_inbox_update(state: &AppState, user_id: i32) {
     let unread: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM reel_messages WHERE receiver_id = $1 AND is_read = FALSE"
@@ -8437,8 +8474,12 @@ pub async fn publish_reel_inbox_update(state: &AppState, user_id: i32) {
     .await
     .unwrap_or(0);
 
-    let payload = json!({ "type": "reel_inbox_update", "unread_count": unread }).to_string();
-    state.user_events.read().await.publish(user_id, payload);
+    publish_user_event(
+        state,
+        user_id,
+        "reel_inbox_update",
+        json!({ "unread_count": unread }),
+    ).await;
 }
 
 /// Get conversation thread
