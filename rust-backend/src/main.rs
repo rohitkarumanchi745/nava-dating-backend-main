@@ -119,6 +119,7 @@ use handlers::{
     get_fitness_stats, get_fitness_workouts, get_fitness_goals, get_fitness_leaderboard,
     // Outdoor Spots + Weather + Memories
     get_outdoor_spots, create_outdoor_spot, log_spot_visit, get_spot_memories, get_seasonal_guide, get_location_activity,
+    upload_banner,
     track_map_search, get_map_trending, get_map_user_interests,
     start_journey, log_journey_stop, recommend_next_place, get_journey_history,
     // Contacts
@@ -1068,6 +1069,7 @@ async fn main() {
         // Outdoor Spots + Weather + Memories
         .route("/outdoor/spots", get(get_outdoor_spots))
         .route("/outdoor/spots", post(create_outdoor_spot))
+        .route("/uploads/banner", post(upload_banner))
         .route("/outdoor/visit", post(log_spot_visit))
         .route("/outdoor/memories", get(get_spot_memories))
         .route("/outdoor/seasonal-guide", get(get_seasonal_guide))

@@ -3630,6 +3630,107 @@ async fn save_base64_banner(
     Ok(Some(format!("/uploads/banners/{}", filename)))
 }
 
+/// POST /uploads/banner
+/// Streaming multipart upload for banner images. Accepts up to 150MB raw.
+/// Returns {banner_url: "/uploads/banners/xxx.jpg"} which clients then pass
+/// to the create endpoints (events, playgrounds, outdoor_spots).
+///
+/// This is the preferred path for any banner above ~5MB. Small crops/filters
+/// can still use the base64 field on the create endpoints directly.
+pub async fn upload_banner(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, AppError> {
+    use image::codecs::jpeg::JpegEncoder;
+    use image::ColorType;
+
+    const MAX_UPLOAD_BYTES: usize = 150 * 1024 * 1024;
+    const TARGET_LONG_EDGE: u32   = 2560;
+    const MIN_DIM: u32            = 64;
+    const MAX_DIM: u32            = 16000;   // modern DSLR / panorama
+    const JPEG_QUALITY: u8        = 92;
+
+    let token = extract_bearer_token(&headers)?;
+    let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Stream the first image field. Collect bytes as they arrive (axum's
+    // multipart is chunked; no 200MB blob in memory at once during network IO).
+    let mut image_bytes: Option<Vec<u8>> = None;
+    while let Some(mut field) = multipart.next_field().await
+        .map_err(|_| AppError::bad_request("invalid multipart"))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        if name != "banner" && name != "file" && name != "image" { continue; }
+
+        let ct = field.content_type().map(|s| s.to_string()).unwrap_or_default();
+        if !ct.starts_with("image/") {
+            return Err(AppError::bad_request("banner must be an image"));
+        }
+
+        let mut buf: Vec<u8> = Vec::with_capacity(4 * 1024 * 1024);
+        while let Some(chunk) = field.chunk().await
+            .map_err(|_| AppError::bad_request("multipart read failed"))?
+        {
+            if buf.len() + chunk.len() > MAX_UPLOAD_BYTES {
+                return Err(AppError::bad_request("banner: max 150MB"));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        image_bytes = Some(buf);
+        break;
+    }
+
+    let bytes = image_bytes.ok_or_else(|| AppError::bad_request("missing 'banner' field"))?;
+    if bytes.is_empty() {
+        return Err(AppError::bad_request("banner: empty file"));
+    }
+
+    // Decode. image crate supports JPEG/PNG/GIF/WebP/TIFF/BMP/ICO out of the box.
+    // HEIC from iOS share sheet is NOT supported — client must convert to JPEG first.
+    let img = image::load_from_memory(&bytes)
+        .map_err(|_| AppError::bad_request("banner: unsupported/invalid image format"))?;
+    let (w, h) = (img.width(), img.height());
+    if w < MIN_DIM || h < MIN_DIM {
+        return Err(AppError::bad_request(format!("banner: min {}x{}px", MIN_DIM, MIN_DIM)));
+    }
+    if w > MAX_DIM || h > MAX_DIM {
+        return Err(AppError::bad_request(format!("banner: max {}x{}px", MAX_DIM, MAX_DIM)));
+    }
+
+    // Downscale only when necessary — preserve source quality for images already
+    // at or under our target resolution.
+    let img = if w.max(h) > TARGET_LONG_EDGE {
+        img.resize(TARGET_LONG_EDGE, TARGET_LONG_EDGE, image::imageops::FilterType::Lanczos3)
+    } else { img };
+
+    let rgb = img.to_rgb8();
+    let mut jpeg_bytes = Vec::with_capacity(2 * 1024 * 1024);
+    let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_bytes, JPEG_QUALITY);
+    encoder.encode(&rgb, rgb.width(), rgb.height(), ColorType::Rgb8.into())
+        .map_err(|_| AppError::internal("banner: jpeg encode failed"))?;
+
+    let banner_dir = Path::new(&state.config.upload_dir).join("banners");
+    fs::create_dir_all(&banner_dir).await
+        .map_err(|_| AppError::internal("banner: mkdir failed"))?;
+
+    let filename = format!(
+        "upload_{}_{}_{}.jpg",
+        user_id, Utc::now().timestamp(), Uuid::new_v4()
+    );
+    let path = banner_dir.join(&filename);
+    fs::write(&path, &jpeg_bytes).await
+        .map_err(|_| AppError::internal("banner: write failed"))?;
+
+    let url = format!("/uploads/banners/{}", filename);
+    Ok(Json(json!({
+        "banner_url": url,
+        "width": rgb.width(),
+        "height": rgb.height(),
+        "bytes": jpeg_bytes.len()
+    })))
+}
+
 /// Extract banner_url from a create payload: accept either `banner` (base64) or
 /// a pre-uploaded `banner_url`. Base64 wins if both provided.
 async fn extract_banner_url(
