@@ -4179,9 +4179,10 @@ pub async fn get_playgrounds(
     ).bind(user_id).fetch_all(&state.db).await?;
 
     // Get playgrounds with friends count (users who matched with me that are in each playground)
-    let playgrounds = sqlx::query_as::<_, (i64, String, Option<String>, String, Option<String>, i32, i32, Option<String>, Option<String>, Option<i64>)>(
+    let playgrounds = sqlx::query_as::<_, (i64, String, Option<String>, String, Option<String>, i32, i32, Option<String>, Option<String>, Option<i64>, Option<i32>)>(
         r#"SELECT p.id, p.name, p.description, p.playground_type, p.city,
-                  p.member_count, p.active_today, p.cover_image_url, p.icon_url, p.university_id
+                  p.member_count, p.active_today, p.cover_image_url, p.icon_url, p.university_id,
+                  p.max_members
            FROM playgrounds p
            WHERE p.is_active = true AND ($1::text IS NULL OR p.playground_type = $1)
            ORDER BY p.active_today DESC, p.member_count DESC LIMIT $2"#,
@@ -4217,7 +4218,8 @@ pub async fn get_playgrounds(
 
         let val = json!({
             "id": p.0.to_string(), "name": p.1, "description": p.2, "type": p.3, "city": p.4,
-            "member_count": p.5, "active_today": p.6, "cover_image_url": p.7, "icon_url": p.8,
+            "member_count": p.5, "max_members": p.10, "active_today": p.6,
+            "cover_image_url": p.7, "icon_url": p.8,
             "is_joined": is_joined, "relevance_score": (score * 100.0) as i32
         });
         (score, val)
@@ -4272,8 +4274,8 @@ pub async fn get_playground_detail(
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
 
-    let pg = sqlx::query_as::<_, (i64, String, Option<String>, String, Option<String>, i32, i32, bool, Option<String>)>(
-        "SELECT id, name, description, playground_type, city, member_count, active_today, is_public, banner_url FROM playgrounds WHERE id = $1"
+    let pg = sqlx::query_as::<_, (i64, String, Option<String>, String, Option<String>, i32, i32, bool, Option<String>, Option<i32>)>(
+        "SELECT id, name, description, playground_type, city, member_count, active_today, is_public, banner_url, max_members FROM playgrounds WHERE id = $1"
     ).bind(pg_id).fetch_optional(&state.db).await?
     .ok_or_else(|| AppError::not_found("Playground not found"))?;
 
@@ -4283,8 +4285,8 @@ pub async fn get_playground_detail(
 
     Ok(Json(json!({
         "id": pg.0.to_string(), "name": pg.1, "description": pg.2, "type": pg.3, "city": pg.4,
-        "member_count": pg.5, "active_today": pg.6, "is_public": pg.7, "is_member": is_member,
-        "banner_url": pg.8
+        "member_count": pg.5, "max_members": pg.9, "active_today": pg.6, "is_public": pg.7,
+        "is_member": is_member, "banner_url": pg.8
     })))
 }
 
@@ -4296,6 +4298,25 @@ pub async fn join_playground(
 ) -> Result<Json<Value>, AppError> {
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
+
+    // Enforce max_members cap (if set). Skip check for users who are
+    // already members being re-activated (ON CONFLICT path).
+    let (member_count, max_members): (i32, Option<i32>) = sqlx::query_as(
+        "SELECT member_count, max_members FROM playgrounds WHERE id = $1"
+    ).bind(pg_id).fetch_optional(&state.db).await?
+        .ok_or_else(|| AppError::not_found("Playground not found"))?;
+
+    let already_member = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM playground_members WHERE playground_id = $1 AND user_id = $2)"
+    ).bind(pg_id).bind(user_id).fetch_one(&state.db).await.unwrap_or(false);
+
+    if !already_member {
+        if let Some(cap) = max_members {
+            if member_count >= cap {
+                return Err(AppError::bad_request("This playground is full"));
+            }
+        }
+    }
 
     sqlx::query(
         "INSERT INTO playground_members (playground_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT (playground_id, user_id) DO UPDATE SET is_active = true, last_active_at = NOW()"
