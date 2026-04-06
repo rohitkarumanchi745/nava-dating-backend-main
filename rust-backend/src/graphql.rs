@@ -1423,10 +1423,19 @@ impl MutationRoot {
                 .await?;
         }
 
-        // Filter out placeholder strings from profile_photo_N (they start with # for multipart uploads)
-        let clean_photo_1 = profile_photo_1.filter(|p| !p.starts_with('#') && !p.is_empty());
-        let clean_photo_2 = profile_photo_2.filter(|p| !p.starts_with('#') && !p.is_empty());
-        let clean_photo_3 = profile_photo_3.filter(|p| !p.starts_with('#') && !p.is_empty());
+        // Filter out placeholder strings (start with #) and base64 data URIs.
+        // Only accept URL paths (/uploads/...) or full https:// URLs.
+        // If iOS accidentally sends base64 image data as a string, reject it here
+        // rather than storing a multi-MB data URI in the profile_photo_N column.
+        let is_valid_photo_url = |p: &str| -> bool {
+            !p.is_empty()
+                && !p.starts_with('#')
+                && !p.starts_with("data:")
+                && (p.starts_with('/') || p.starts_with("http"))
+        };
+        let clean_photo_1 = profile_photo_1.filter(|p| is_valid_photo_url(p));
+        let clean_photo_2 = profile_photo_2.filter(|p| is_valid_photo_url(p));
+        let clean_photo_3 = profile_photo_3.filter(|p| is_valid_photo_url(p));
 
         // Handle uploaded photo files — run full pipeline (resize, NSFW, EXIF strip, quality)
         let mut uploaded_urls: Vec<String> = Vec::new();
