@@ -93,7 +93,42 @@ Trigram indexes on name and short_name enable **fuzzy matching** — typos and p
 
 Only verified students (`student_verifications.status = 'approved'`) appear in search results. The system joins through `universities` → `student_verifications` → `users`, so unverified users are invisible.
 
-### 7. Scale without burning money — Rust performance with smart infrastructure
+### 7. Dating apps leave money on the table — ads monetization with regional intelligence
+
+Most dating apps rely solely on subscriptions. Free-tier users generate zero revenue, and ad integrations are generic with no location awareness.
+
+**Our approach:** A full **ads monetization engine** with multi-network support (AdMob, Facebook, Unity) and location-aware eCPM optimization:
+
+| Ad Type | Base eCPM | Use Case |
+|---------|-----------|----------|
+| **Rewarded** | $15.00 | Watch ad → earn Boost, SuperLike, PremiumHours, ExtraLikes, ProfileView |
+| **Interstitial** | $4.00 | Between screens |
+| **Native** | $3.00 | In-feed placements |
+| **Banner** | $0.50 | Persistent display |
+
+**Regional targeting:** Ads are served with country, state, city, and language context. Metro areas get a **1.5× eCPM multiplier** (higher advertiser demand), while other regions use adjusted base rates. Analytics aggregate revenue by language, state, city, and metro — so we know exactly which regions monetize best.
+
+**Impression tracking:** Every ad logs `revenue_usd_micro`, `clicked`, `completed`, placement, network, and geo — giving full visibility into per-impression economics.
+
+**Rewarded ads drive engagement:** Free users can earn premium features (boosts, super-likes, extra profile views) by completing rewarded ads — converting non-paying users into engaged, monetized users without forcing a paywall.
+
+Premium users see **zero ads** — placements are filtered by subscription status.
+
+### 8. Spots turn local businesses into date destinations — hyperlocal content that drives foot traffic
+
+Dating apps are disconnected from the real world. Users match online but have nowhere to go. Local businesses (cafes, bars, restaurants) want to reach couples but have no channel.
+
+**Our approach:** **Spots** are location-tagged short videos and audio clips tied to real places. Users create Spots at venues — a coffee shop, a rooftop bar, a park — and they appear in the Spots feed for other users nearby.
+
+**How Spots drive local business revenue:**
+- **City-matched discovery:** The Spots feed (`GET /spots/feed`) ranks by city match first, then shared interests, then recency — so a Spot filmed at a local cafe surfaces to users in that city
+- **Engagement loop:** Users can react to Spots and message on them (`POST /spots/:id/messages`, `POST /spots/:id/react`), turning venues into conversation starters
+- **Built-in scarcity:** Free users get 5 active Spots that expire after 30 days. Premium removes limits — incentivizing upgrades while keeping the feed fresh
+- **Global + local:** Spots can be flagged `is_global` for platform-wide visibility or stay local for hyperlocal discovery
+
+The path to business monetization: venues create Spots showcasing their space → users discover them as date ideas → foot traffic increases. Future promoted Spots give businesses paid placement in the feed, turning Nava into a **local discovery platform** alongside dating.
+
+### 9. Scale without burning money — Rust performance with smart infrastructure
 
 Node.js and Python backends hit CPU walls at scale. Spinning up more instances costs money.
 
