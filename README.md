@@ -1,6 +1,97 @@
-# Nava - High-Performance Dating Platform Backend
+# Nava — High-Performance Dating Platform Backend
 
-Production backend powering the Nava dating apps (SwiftUI iOS + React Native cross-platform). Built as a Rust/Axum modular monolith with in-process event bus, DataFusion SQL analytics, real-time WebSocket chat & calling, and ML-powered matching.
+> Production backend powering the Nava dating apps (SwiftUI iOS + React Native). Built as a Rust/Axum modular monolith with in-process event bus, DataFusion SQL analytics, real-time WebSocket chat & calling, and ML-powered matching.
+
+---
+
+## The Problems We Solved
+
+### 1. Bad matches kill retention — so we replaced rules with learning systems
+
+Most dating apps match on static filters: age, distance, a few preferences. Users get bored fast because the recommendations don't improve.
+
+**Our approach:** We built a **reinforcement learning agent** (Q-learning + LinUCB contextual bandits) that learns from every swipe in real-time. The system models each user-candidate pair as a 28-dimensional state vector and computes a Q-value for the "like" action. Super-likes give a +3.0 reward signal, likes +1.0, passes -0.5. After every 10 swipes, the agent retrains from an experience replay buffer.
+
+LinUCB runs alongside — each candidate is an "arm" with an uncertainty-aware UCB score. New profiles get an exploration bonus (α=0.6) so they're not buried. Well-explored profiles rely on learned preferences.
+
+The final ranking blends **55% RL score + 20% geo proximity + 20% affinity + churn boost** — a living system that gets smarter with every interaction.
+
+### 2. Personalization without surveillance — federated learning on-device
+
+Centralizing user behavior data is a privacy liability. We didn't want a server that knows everyone's swipe patterns.
+
+**Our approach:** The iOS client trains a small **personalization head** (33 parameters) locally via SGD on the user's own swipe outcomes. Only weight deltas are sent to the server — never raw data, never embeddings, never photos, never GPS.
+
+The server runs **FedAvg** aggregation across all client deltas, weighted by sample count, then injects **Laplace noise** (ε-differential privacy, scale 0.1) so no single user's contribution is recoverable. Updated global weights are downloaded next session.
+
+Three models train on-device:
+- **Personalization head** (33 params) — learns your taste from swipe binary classification
+- **Cold-start bias** (5 params) — bootstraps new users by intent cohort (relationship/casual/unknown)
+- **Notification click predictor** (6 params) — learns *when* to send push notifications from open/ignore outcomes
+
+The result: deeply personalized rankings with zero centralized behavior data.
+
+### 3. Fake profiles and catfishing destroy trust — so we verify every photo automatically
+
+Users don't trust platforms full of stolen photos, face-tuned selfies, and bots. Manual review doesn't scale.
+
+**Our approach:** Every photo upload runs through a **5-model ONNX vision pipeline** in-process (via tract-onnx, no external API calls, ~2 second total):
+
+| Model | Input | What it does |
+|-------|-------|-------------|
+| **NSFW Detection** | 224×224 | Flags inappropriate content (≥0.7 reject, ≥0.4 review) |
+| **NIMA Aesthetics** | 224×224 | 10-class Mean Opinion Score for photo quality |
+| **Facial Emotion (FER)** | 64×64 grayscale | Extracts smile intensity from 8 emotion classes |
+| **ArcFace Embeddings** | 112×112 | 128-dim L2-normalized face vector for identity matching |
+| **Liveness Detection** | 80×80 | Real vs. spoof classification (anti-screenshot, anti-printout) |
+
+**Selfie verification:** User takes a selfie → ArcFace extracts a 128-dim face embedding → cosine similarity is compared against all their profile photos → must exceed the match threshold. This proves the person in the photos is the person holding the phone.
+
+**Duplicate/catfish detection:** Every face embedding is compared against the global user pool. Cosine similarity >0.85 with another user's photos = flagged as duplicate.
+
+Composite quality score = 40% aesthetic + 25% blur detection + 15% low-light check + 20% face-ratio. Photos below 0.45 go to review. The verdict (Approved / NeedsReview / Rejected) is fully automated.
+
+### 4. People connect through people, not algorithms alone — social graph discovery
+
+Algorithmic feeds feel impersonal. Users trust recommendations that come through mutual connections.
+
+**Our approach:** We built a **social graph** stored as PostgreSQL adjacency lists (forward + reverse indexes for O(1) lookups) with 8 edge types: `MatchedWith`, `Liked`, `Passed`, `Messaged`, `Attends` (university), `Viewed`, `Created` (reels), and `Uses` (device — for fraud).
+
+**Friend-of-friend discovery** runs a 2-hop CTE query: get my matches → get their matches → deduplicate → score by `mutual_connection_count × 10`. Four recommendation paths merge into a combined endpoint:
+- `/recommendations/fof` — friend-of-friend
+- `/recommendations/university` — same school network
+- `/recommendations/interests` — shared interest overlap
+- `/recommendations/combined` — merged and deduplicated
+
+The graph also powers **fraud detection** — users with 50+ likes/hour or multiple accounts sharing a device are automatically flagged.
+
+### 5. Real-time or nothing — chat, calls, and live events over WebSockets
+
+HTTP polling for chat is laggy. Users expect messages and call signals instantly.
+
+**Our approach:** Three dedicated WebSocket channels run on Axum with Tokio broadcast:
+- **`/ws/chat`** — match-based direct messaging (500-message buffer)
+- **`/ws/call`** — audio/video call signaling (200-event buffer)
+- **`/ws/events`** — live push notifications, playground group chat fan-out
+
+Each connection is JWT-authenticated per-socket. Messages fan out via Tokio broadcast channels. Redis pub/sub backs cross-instance delivery for horizontal scaling.
+
+### 6. Scale without burning money — Rust performance with smart infrastructure
+
+Node.js and Python backends hit CPU walls at scale. Spinning up more instances costs money.
+
+**Our approach:** The core is **Rust + Axum** — async, zero-cost abstractions, no garbage collector. A single instance handles thousands of concurrent connections.
+
+Infrastructure is Kubernetes-native:
+- **PostgreSQL** with hash partitioning on the `swipes` table by `user_id`, PgBouncer connection pooling for 10k+ concurrent users, read replicas for query scaling
+- **Redis** for caching (LRU eviction), OTP storage (5-min TTL), rate limiting state, and pub/sub
+- **DataFusion** for in-process SQL analytics — no separate analytics database needed for most queries
+- **Cadence** for workflow orchestration across microservices
+- **CI/CD** with cargo fmt + clippy + tests → multi-stage Docker build → EKS deploy with 300s rollout timeout and automatic rollback on failure
+
+Rate limiting is tier-aware — premium users get higher RPM via a configurable multiplier. Security headers (CSP, HSTS, X-Frame-Options) are applied as middleware. SQLx compile-time query validation eliminates SQL injection at the type system level.
+
+---
 
 ## Architecture
 
