@@ -126,7 +126,7 @@ Dating apps are disconnected from the real world. Users match online but have no
 - **Built-in scarcity:** Free users get 5 active Spots that expire after 30 days. Premium removes limits — incentivizing upgrades while keeping the feed fresh
 - **Global + local:** Spots can be flagged `is_global` for platform-wide visibility or stay local for hyperlocal discovery
 
-The path to business monetization: venues create Spots showcasing their space → users discover them as date ideas → foot traffic increases. Future promoted Spots give businesses paid placement in the feed, turning Nava into a **local discovery platform** alongside dating.
+The path to business monetization: venues create Spots showcasing their space → users discover them as date ideas → foot traffic increases. The organic discovery loop is fully built — promoted Spots for paid business placement is the natural next step.
 
 ### 9. Scale without burning money — Rust performance with smart infrastructure
 
