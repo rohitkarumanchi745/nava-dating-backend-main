@@ -76,7 +76,24 @@ HTTP polling for chat is laggy. Users expect messages and call signals instantly
 
 Each connection is JWT-authenticated per-socket. Messages fan out via Tokio broadcast channels. Redis pub/sub backs cross-instance delivery for horizontal scaling.
 
-### 6. Scale without burning money — Rust performance with smart infrastructure
+### 6. Campus dating needs identity without exposing identity — university search with real name vs display name
+
+On campus platforms, people want to find someone by name — but publishing legal names creates safety and impersonation risks.
+
+**Our approach:** Two-layer name system:
+- **`users.name`** — verified legal name, immutable after student verification. Indexed with `LOWER()` for search. Always used for search matching.
+- **`users.display_name`** — mutable, UI-facing alias shown in chat and profiles. **Not indexed** to prevent impersonation. Only appears in search results if the user explicitly opts in via `show_display_name_in_search = TRUE`.
+
+**University search** (`GET /search/students`, `GET /search/unified`) uses PostgreSQL `pg_trgm` + GIN full-text indexing with weighted fields:
+- Weight A: university name + short name
+- Weight B: city
+- Weight C: state
+
+Trigram indexes on name and short_name enable **fuzzy matching** — typos and partial names still return results. An auto-update trigger maintains the `search_vector` on every INSERT/UPDATE so the index is always fresh.
+
+Only verified students (`student_verifications.status = 'approved'`) appear in search results. The system joins through `universities` → `student_verifications` → `users`, so unverified users are invisible.
+
+### 7. Scale without burning money — Rust performance with smart infrastructure
 
 Node.js and Python backends hit CPU walls at scale. Spinning up more instances costs money.
 
