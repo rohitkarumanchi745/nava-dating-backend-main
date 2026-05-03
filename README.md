@@ -143,6 +143,23 @@ Infrastructure is Kubernetes-native:
 
 Rate limiting is tier-aware — premium users get higher RPM via a configurable multiplier. Security headers (CSP, HSTS, X-Frame-Options) are applied as middleware. SQLx compile-time query validation eliminates SQL injection at the type system level.
 
+### 10. Iterating on ranking models shouldn't mean redeploying — in-process model router
+
+Every ranking surface (Spots feed, nearby places, search) needs to evolve: try a new scoring formula, A/B test it, ramp it to 5% then 50% then 100%, and roll back instantly when a regression appears. The default approach — wiring a new branch into a handler and shipping a binary — makes every experiment a deploy and every rollback a deploy.
+
+**Our approach:** an in-process **ranking router** under `rust-backend/src/ml/router.rs` inspired by Netflix's Switchboard pattern, scoped to a single binary. Each ranking surface is an `Objective`; each candidate scoring strategy implements a small trait (e.g. `SpotsFeedRanker`); a JSON rules file decides which strategy serves which user.
+
+The selector runs three checks in order:
+1. **Active experiments** — `(user_id, experiment_id)` is hashed via Splitmix64 into a stable cell assignment so the same user always sees the same variant.
+2. **Canary ramp** — `(user_id, "canary")` hashed into 0–100; below the configured percent, the user gets the canary ranker.
+3. **Default** — falls through to the named default ranker.
+
+A separate **shadow ranker** runs concurrently in a `tokio::spawn` task: it scores the same candidates, its result is logged for divergence analysis, and it never affects the response. That gives us a free production sandbox for any new ranker before it ever touches a real user.
+
+Switching from a heuristic ranker to an A/B test, ramping a canary, or rolling back is a JSON file edit — no redeploy, no handler change, no client coordination. Researchers iterate on rankers in isolation; the handler only formats the response.
+
+The `Spots` feed is the first surface routed through it; `recommend_next_place`, `unified_search`, and `ml_rank_candidates` are the planned next adopters.
+
 ---
 
 ## Architecture

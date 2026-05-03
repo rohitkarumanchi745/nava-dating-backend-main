@@ -580,6 +580,30 @@ async fn main() {
     // Create event bus early so it can be shared with AppState
     let event_bus = Arc::new(modules::events::EventBus::new(4096));
 
+    // Build the in-process ranking router.
+    // Add new rankers here; register them in the JSON rules to take effect.
+    let ranking_router = {
+        use ml::rankers::{SpotsFeedHeuristic, SpotsFeedRecencyOnly};
+        use ml::router::{RankingRouter, RoutingRules, SpotsFeedRanker};
+
+        let spots_rankers: Vec<Arc<dyn SpotsFeedRanker>> = vec![
+            Arc::new(SpotsFeedHeuristic),
+            Arc::new(SpotsFeedRecencyOnly),
+        ];
+        let router = Arc::new(RankingRouter::new(spots_rankers, RoutingRules::default()));
+
+        // Optional config file. Path is relative to the crate root by default;
+        // set RANKING_RULES_PATH to override (e.g. for k8s ConfigMap mounts).
+        let rules_path = std::env::var("RANKING_RULES_PATH")
+            .unwrap_or_else(|_| "config/ranking_rules.json".to_string());
+        match router.load_rules_from_file(std::path::Path::new(&rules_path)).await {
+            Ok(true) => {}
+            Ok(false) => info!("ranking router: no rules file at {}, using defaults", rules_path),
+            Err(e) => warn!("ranking router: failed to load rules from {}: {}", rules_path, e),
+        }
+        router
+    };
+
     let state = AppState {
         db,
         db_read: db_read_replica,
@@ -596,6 +620,7 @@ async fn main() {
         payment_service,
         ads_service,
         ml: Arc::new(RwLock::new(ml_service)),
+        ranking_router,
         trust_safety,
         moderation,
         event_bus: event_bus.clone(),

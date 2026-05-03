@@ -5,7 +5,9 @@ pub mod federated;
 pub mod geo;
 pub mod linucb;
 pub mod math;
+pub mod rankers;
 pub mod rl_agent;
+pub mod router;
 
 use sqlx::PgPool;
 use tracing::{info, warn};

@@ -72,6 +72,7 @@ use crate::services::trust_safety::TrustSafetyService;
 use crate::services::moderation::ModerationPipeline;
 use crate::middleware::dual_write::DualWriteManager;
 use crate::ml::MlService;
+use crate::ml::router::RankingRouter;
 use crate::modules::events::EventBus;
 
 /// Shared application state
@@ -97,6 +98,9 @@ pub struct AppState {
     pub ads_service: Option<Arc<AdsService>>,
     // ML service (RL, LinUCB, Federated Learning)
     pub ml: Arc<RwLock<MlService>>,
+    // In-process ranking router: routes objectives (e.g. SpotsFeed) to a
+    // concrete ranker per request based on JSON-driven rules.
+    pub ranking_router: Arc<RankingRouter>,
     // Trust & Safety service
     pub trust_safety: Option<Arc<TrustSafetyService>>,
     // Content moderation pipeline

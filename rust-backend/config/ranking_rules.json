@@ -1,0 +1,8 @@
+{
+  "spots_feed": {
+    "default": "spots_feed_heuristic",
+    "experiments": [],
+    "canary": null,
+    "shadow": "spots_feed_recency_only"
+  }
+}

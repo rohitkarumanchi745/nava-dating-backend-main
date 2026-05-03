@@ -3993,7 +3993,7 @@ pub async fn get_spots_feed(
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
     let limit = params.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(20);
 
-    // Fetch spots with creator info for scoring
+    // Over-fetch by 3× so the ranker has headroom to reorder before truncation.
     let spots = sqlx::query_as::<_, SpotFullRow>(
         r#"SELECT s.id, s.user_id, s.title, s.original_url, s.poster_url, s.mime_type,
                   s.duration_sec, s.renditions, s.tags, s.city, s.is_global,
@@ -4004,57 +4004,55 @@ pub async fn get_spots_feed(
            ORDER BY s.created_at DESC LIMIT $2"#,
     )
     .bind(user_id)
-    .bind(limit * 3) // over-fetch for re-ranking
+    .bind(limit * 3)
     .fetch_all(&state.db)
     .await?;
 
-    // Get user's city and interests for scoring
     let user_info = sqlx::query_as::<_, (Option<String>, Option<serde_json::Value>)>(
         "SELECT ul.city, u.interests FROM users u LEFT JOIN user_locations ul ON ul.user_id = u.id WHERE u.id = $1"
     ).bind(user_id).fetch_optional(&state.db).await?.unwrap_or((None, None));
 
-    let user_city = user_info.0.unwrap_or_default().to_lowercase();
+    let user_city = user_info.0.unwrap_or_default();
     let user_interests: Vec<String> = user_info.1
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
 
-    // Score and rank spots
-    let mut scored: Vec<(f64, Value)> = spots.into_iter().map(|s| {
-        let mut score = 0.0;
+    let candidates: Vec<crate::ml::router::SpotCandidate> =
+        spots.into_iter().map(Into::into).collect();
+    let ctx = crate::ml::router::SpotsFeedCtx {
+        user_id,
+        user_city,
+        user_interests,
+        limit: limit as usize,
+    };
 
-        // Same city bonus (+40%)
-        if let Some(ref city) = s.city {
-            if city.to_lowercase() == user_city { score += 0.4; }
-        }
+    let result = state.ranking_router.rank_spots_feed(&ctx, candidates).await?;
 
-        // Shared interest tags bonus (+30%)
-        if let Some(ref tags) = s.tags {
-            if let Ok(tag_list) = serde_json::from_value::<Vec<String>>(tags.clone()) {
-                let overlap = tag_list.iter().filter(|t| user_interests.contains(t)).count();
-                score += 0.3 * (overlap as f64 / tag_list.len().max(1) as f64);
-            }
-        }
+    let results: Vec<Value> = result
+        .ranked
+        .into_iter()
+        .map(|s| {
+            json!({
+                "id": s.spot.id.to_string(),
+                "user_id": s.spot.user_id.to_string(),
+                "title": s.spot.title,
+                "poster_url": s.spot.poster_url,
+                "original_url": s.spot.original_url,
+                "city": s.spot.city,
+                "tags": s.spot.tags,
+                "relevance_score": (s.score * 100.0) as i32,
+                "created_at": s.spot.created_at.map(format_datetime),
+                "expires_at": s.spot.expires_at.map(format_datetime),
+            })
+        })
+        .collect();
 
-        // Recency bonus (+30%) — newer spots score higher
-        if let Some(created) = s.created_at {
-            let age_hours = (chrono::Utc::now().naive_utc() - created).num_hours() as f64;
-            score += 0.3 * (1.0 / (1.0 + age_hours / 6.0)); // half-life of 6 hours
-        }
-
-        let val = json!({
-            "id": s.id.to_string(), "user_id": s.user_id.to_string(), "title": s.title,
-            "poster_url": s.poster_url, "original_url": s.original_url,
-            "city": s.city, "tags": s.tags, "relevance_score": (score * 100.0) as i32,
-            "created_at": s.created_at.map(format_datetime),
-            "expires_at": s.expires_at.map(format_datetime),
-        });
-        (score, val)
-    }).collect();
-
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    let results: Vec<Value> = scored.into_iter().take(limit as usize).map(|(_, v)| v).collect();
-
-    Ok(Json(json!({ "spots": results })))
+    Ok(Json(json!({
+        "spots": results,
+        "model_id": result.model_id,
+        "experiment_id": result.experiment_id,
+        "experiment_cell": result.experiment_cell,
+    })))
 }
 
 /// GET /spots/:id/messages?since=2024-01-01T00:00:00
