@@ -91,10 +91,15 @@ default = []
 otel = ["tracing-opentelemetry", "opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "opentelemetry-semantic-conventions"]
 
 [profile.release]
-lto = "thin"
-codegen-units = 16
-opt-level = 2
+# Tuned for runtime throughput, not build speed. cargo build --release will be
+# noticeably slower (fat LTO + single codegen unit); cargo build is unaffected.
+# If iteration speed becomes a problem, move these into a dedicated
+# [profile.release-prod] and have CI/Docker use --profile release-prod.
+lto = "fat"
+codegen-units = 1
+opt-level = 3
 strip = true
+debug = false
 
 [profile.dev]
 opt-level = 0
