@@ -5141,8 +5141,12 @@ pub async fn get_fitness_workouts(
     let limit: i64 = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(20).clamp(1, 100);
     let offset: i64 = params.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0).max(0);
 
-    let rows = sqlx::query_as::<_, (i64, String, Option<f64>, Option<f64>, Option<f64>, Option<String>, chrono::NaiveDateTime, Option<String>)>(
-        r#"SELECT id, activity_type, calories_burned, duration_min, distance_km, location_name, started_at, source
+    let rows = sqlx::query_as::<_, (
+        i64, String, Option<f64>, Option<f64>, Option<f64>, Option<String>,
+        chrono::NaiveDateTime, Option<String>, Option<f64>, Option<f64>,
+    )>(
+        r#"SELECT id, activity_type, calories_burned, duration_min, distance_km, location_name,
+                  started_at, source, latitude, longitude
            FROM user_fitness_activities WHERE user_id = $1
            ORDER BY started_at DESC LIMIT $2 OFFSET $3"#,
     ).bind(user_id).bind(limit).bind(offset).fetch_all(&state.db).await?;
@@ -5155,7 +5159,9 @@ pub async fn get_fitness_workouts(
         "distance_km": r.4.unwrap_or(0.0),
         "location": r.5,
         "started_at": format_datetime(r.6),
-        "source": r.7
+        "source": r.7,
+        "latitude": r.8,
+        "longitude": r.9,
     })).collect();
 
     Ok(Json(json!({ "workouts": workouts, "limit": limit, "offset": offset })))
