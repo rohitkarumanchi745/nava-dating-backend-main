@@ -5175,23 +5175,6 @@ pub async fn get_fitness_goals(
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)? as i64;
 
-    // Ensure table exists — idempotent, cheap.
-    let _ = sqlx::query(
-        r#"CREATE TABLE IF NOT EXISTS user_fitness_goals (
-            id BIGSERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            goal_type TEXT NOT NULL,
-            target_value DOUBLE PRECISION NOT NULL,
-            unit TEXT NOT NULL,
-            period TEXT NOT NULL DEFAULT 'weekly',
-            is_active BOOLEAN NOT NULL DEFAULT TRUE,
-            created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-        )"#,
-    ).execute(&state.db).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_fitness_goals_user ON user_fitness_goals(user_id, is_active)")
-        .execute(&state.db).await;
-
     let goals = sqlx::query_as::<_, (i64, String, f64, String, String, bool)>(
         "SELECT id, goal_type, target_value, unit, period, is_active FROM user_fitness_goals WHERE user_id = $1 ORDER BY created_at DESC"
     ).bind(user_id).fetch_all(&state.db).await.unwrap_or_default();

@@ -633,50 +633,11 @@ async fn main() {
         user_events: Arc::new(RwLock::new(state::UserEventHub::new())),
     };
 
-    // Ensure display_name column exists (mutable UI name, vs immutable users.name).
-    // Matches migrations/025_display_name.sql.
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT")
-        .execute(&state.db).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_users_name_lower ON users (LOWER(name))")
-        .execute(&state.db).await;
-    // Matches migrations/026_show_display_name_in_search.sql.
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS show_display_name_in_search BOOLEAN NOT NULL DEFAULT FALSE")
-        .execute(&state.db).await;
-    // Matches migrations/027_show_verified_name.sql.
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS show_verified_name BOOLEAN NOT NULL DEFAULT TRUE")
-        .execute(&state.db).await;
-    // Matches migrations/028_banner_urls.sql.
-    let _ = sqlx::query("ALTER TABLE events ADD COLUMN IF NOT EXISTS banner_url TEXT").execute(&state.db).await;
-    let _ = sqlx::query("ALTER TABLE playgrounds ADD COLUMN IF NOT EXISTS banner_url TEXT").execute(&state.db).await;
-    let _ = sqlx::query("ALTER TABLE outdoor_spots ADD COLUMN IF NOT EXISTS banner_url TEXT").execute(&state.db).await;
-    // Matches migrations/029_playground_messages.sql.
-    let _ = sqlx::query(
-        r#"CREATE TABLE IF NOT EXISTS playground_messages (
-            id BIGSERIAL PRIMARY KEY,
-            playground_id BIGINT NOT NULL REFERENCES playgrounds(id) ON DELETE CASCADE,
-            sender_id BIGINT NOT NULL REFERENCES users(id),
-            content TEXT NOT NULL CHECK (char_length(content) BETWEEN 1 AND 2000),
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )"#
-    ).execute(&state.db).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_playground_messages_playground_time ON playground_messages (playground_id, created_at DESC)")
-        .execute(&state.db).await;
-
-    // Ensure user_event_outbox table exists (durable /ws/events delivery).
-    // Idempotent — matches migrations/024_user_event_outbox.sql.
-    let _ = sqlx::query(
-        r#"CREATE TABLE IF NOT EXISTS user_event_outbox (
-            id BIGSERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            event_type TEXT NOT NULL,
-            payload JSONB NOT NULL,
-            created_at TIMESTAMP NOT NULL DEFAULT NOW()
-        )"#
-    ).execute(&state.db).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_event_outbox_user_id ON user_event_outbox (user_id, id)")
-        .execute(&state.db).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_user_event_outbox_created_at ON user_event_outbox (created_at)")
-        .execute(&state.db).await;
+    // Schema is owned by migrations/ — apply them out-of-band before boot.
+    // Tables referenced below: users (display_name, show_display_name_in_search,
+    // show_verified_name; idx_users_name_lower); events / playgrounds /
+    // outdoor_spots (banner_url); playground_messages; user_event_outbox.
+    // See migrations 024-029.
 
     // Hourly prune of outbox rows older than 7 days.
     {
