@@ -82,6 +82,8 @@ mod tests {
             tags: tags.map(|t| json!(t)),
             created_at: Some(chrono::Utc::now().naive_utc() - chrono::Duration::hours(age_hours)),
             expires_at: None,
+            hls_url: None,
+            hls_state: None,
         }
     }
 

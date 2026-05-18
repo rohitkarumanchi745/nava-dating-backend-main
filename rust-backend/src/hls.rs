@@ -6,11 +6,14 @@
 //!   2. normalize_and_hls()  — single FFmpeg pass: trim + scale + HLS output (no double-encode)
 //!   Fallback: normalize_video() + transcode_to_hls() when single-pass isn't viable
 //!
-//! Output layout under `{upload_dir}/reels/hls/{reel_id}/`:
+//! Output layout under `{upload_dir}/{subdir}/hls/{id}/`:
 //!   master.m3u8      ← master playlist (returned as the stored hls_url)
 //!   360p/playlist.m3u8 + seg*.ts
 //!   720p/playlist.m3u8 + seg*.ts
 //!   1080p/playlist.m3u8 + seg*.ts
+//!
+//! `subdir` is "reels" for reels, "spots" for spots — both share the ladder
+//! and pipeline, only the on-disk + URL prefix differs.
 //!
 //! AVPlayer on iOS speaks HLS natively — no client code change needed.
 
@@ -64,11 +67,12 @@ pub async fn probe_video(input_path: &str) -> Result<ProbeResult, String> {
 /// Trims to 30s, scales to 3 variants, outputs HLS directly.
 /// ~3x faster than the old normalize-then-transcode pipeline.
 pub async fn normalize_and_hls(
-    reel_id: i64,
+    id: i64,
     input_path: &str,
     upload_dir: &str,
+    subdir: &str,
 ) -> Result<String, String> {
-    let out = format!("{}/reels/hls/{}", upload_dir, reel_id);
+    let out = format!("{}/{}/hls/{}", upload_dir, subdir, id);
 
     for sub in &["360p", "720p", "1080p"] {
         fs::create_dir_all(format!("{}/{}", out, sub))
@@ -125,7 +129,7 @@ pub async fn normalize_and_hls(
     }
 
     write_master_playlist(&out).await?;
-    Ok(format!("/uploads/reels/hls/{}/master.m3u8", reel_id))
+    Ok(format!("/uploads/{}/hls/{}/master.m3u8", subdir, id))
 }
 
 /// Normalize an uploaded video (fallback path for oversized files):
@@ -220,11 +224,12 @@ async fn replace_original(normalized: &str, original: &str) -> Result<(), String
 
 /// Transcode `input_path` to 3-variant HLS (standalone, used as fallback).
 pub async fn transcode_to_hls(
-    reel_id: i64,
+    id: i64,
     input_path: &str,
     upload_dir: &str,
+    subdir: &str,
 ) -> Result<String, String> {
-    let out = format!("{}/reels/hls/{}", upload_dir, reel_id);
+    let out = format!("{}/{}/hls/{}", upload_dir, subdir, id);
 
     for sub in &["360p", "720p", "1080p"] {
         fs::create_dir_all(format!("{}/{}", out, sub))
@@ -275,7 +280,7 @@ pub async fn transcode_to_hls(
     }
 
     write_master_playlist(&out).await?;
-    Ok(format!("/uploads/reels/hls/{}/master.m3u8", reel_id))
+    Ok(format!("/uploads/{}/hls/{}/master.m3u8", subdir, id))
 }
 
 async fn write_master_playlist(out_dir: &str) -> Result<(), String> {

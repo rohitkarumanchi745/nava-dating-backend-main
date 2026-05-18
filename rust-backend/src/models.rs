@@ -359,6 +359,8 @@ pub struct SpotFullRow {
     pub expires_at: Option<NaiveDateTime>,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
+    pub hls_url: Option<String>,
+    pub hls_state: Option<String>,
 }
 
 #[derive(Debug, FromRow, Serialize)]

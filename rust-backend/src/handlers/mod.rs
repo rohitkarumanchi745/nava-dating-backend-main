@@ -3923,7 +3923,7 @@ pub async fn create_spot(
         Some(Utc::now().naive_utc() + chrono::Duration::days(state.config.spot_expiry_days as i64))
     };
 
-    // Insert spot record
+    // Insert spot record. hls_state defaults to 'pending' from migration 031.
     let spot_id = sqlx::query_scalar::<_, i64>(
         r#"
         INSERT INTO spots (user_id, title, original_url, mime_type, tags, city, is_global, expires_at, created_at, updated_at)
@@ -3941,6 +3941,73 @@ pub async fn create_spot(
     .bind(expires_at)
     .fetch_one(&state.db)
     .await?;
+
+    // Kick off HLS transcoding in the background. Mirrors the reels path
+    // (handlers/mod.rs:8095). iOS prefers hls_url when ready, falls back to
+    // original_url while hls_state is 'pending' / 'failed'.
+    if mime.starts_with("video/") {
+        let db_clone = state.db.clone();
+        let upload_dir_clone = state.config.upload_dir.clone();
+        let disk_path_clone = path.clone();
+        tokio::spawn(async move {
+            let _ = sqlx::query("UPDATE spots SET hls_state = 'processing' WHERE id = $1")
+                .bind(spot_id)
+                .execute(&db_clone)
+                .await;
+
+            let start = std::time::Instant::now();
+            let probe = crate::hls::probe_video(&disk_path_clone).await;
+            let needs_normalize = match &probe {
+                Ok(p) => {
+                    let dominated = p.duration_secs <= 31.0 && p.codec == "h264";
+                    tracing::info!(
+                        "Spot {} probe: {:.1}s, codec={}, {}px wide, skip_normalize={}",
+                        spot_id, p.duration_secs, p.codec, p.width, dominated
+                    );
+                    !dominated
+                }
+                Err(e) => {
+                    tracing::warn!("ffprobe failed for spot {}: {} — will normalize", spot_id, e);
+                    true
+                }
+            };
+
+            let result = if needs_normalize {
+                if let Err(e) = crate::hls::normalize_video(&disk_path_clone).await {
+                    tracing::warn!("Normalization failed for spot {} (proceeding with original): {}", spot_id, e);
+                }
+                crate::hls::transcode_to_hls(spot_id, &disk_path_clone, &upload_dir_clone, "spots").await
+            } else {
+                crate::hls::normalize_and_hls(spot_id, &disk_path_clone, &upload_dir_clone, "spots").await
+            };
+
+            match result {
+                Ok(hls_url) => {
+                    let _ = sqlx::query(
+                        "UPDATE spots SET hls_url = $1, hls_state = 'ready' WHERE id = $2",
+                    )
+                    .bind(&hls_url)
+                    .bind(spot_id)
+                    .execute(&db_clone)
+                    .await;
+                    tracing::info!("HLS ready for spot {} in {:.1}s: {}", spot_id, start.elapsed().as_secs_f64(), hls_url);
+                }
+                Err(e) => {
+                    let _ = sqlx::query("UPDATE spots SET hls_state = 'failed' WHERE id = $1")
+                        .bind(spot_id)
+                        .execute(&db_clone)
+                        .await;
+                    tracing::warn!("HLS failed for spot {}: {}", spot_id, e);
+                }
+            }
+        });
+    } else {
+        // Audio-only spots: skip transcoding entirely, mark failed so iOS reads original_url.
+        let _ = sqlx::query("UPDATE spots SET hls_state = 'failed' WHERE id = $1")
+            .bind(spot_id)
+            .execute(&state.db)
+            .await;
+    }
 
     Ok(Json(json!({
         "message": "Spot created successfully",
@@ -3997,7 +4064,7 @@ pub async fn get_spots_feed(
     let spots = sqlx::query_as::<_, SpotFullRow>(
         r#"SELECT s.id, s.user_id, s.title, s.original_url, s.poster_url, s.mime_type,
                   s.duration_sec, s.renditions, s.tags, s.city, s.is_global,
-                  s.expires_at, s.created_at, s.updated_at
+                  s.expires_at, s.created_at, s.updated_at, s.hls_url, s.hls_state
            FROM spots s
            WHERE s.user_id != $1
              AND (s.expires_at IS NULL OR s.expires_at > NOW())
@@ -4038,6 +4105,8 @@ pub async fn get_spots_feed(
                 "title": s.spot.title,
                 "poster_url": s.spot.poster_url,
                 "original_url": s.spot.original_url,
+                "hls_url": s.spot.hls_url,
+                "hls_state": s.spot.hls_state,
                 "city": s.spot.city,
                 "tags": s.spot.tags,
                 "relevance_score": (s.score * 100.0) as i32,
@@ -8126,7 +8195,7 @@ pub async fn create_reel(
                 if let Err(e) = crate::hls::normalize_video(&disk_path_clone).await {
                     tracing::warn!("Normalization failed for reel {} (proceeding with original): {}", reel_id, e);
                 }
-                match crate::hls::transcode_to_hls(reel_id, &disk_path_clone, &upload_dir_clone).await {
+                match crate::hls::transcode_to_hls(reel_id, &disk_path_clone, &upload_dir_clone, "reels").await {
                     Ok(hls_url) => {
                         let _ = sqlx::query(
                             "UPDATE reels SET hls_url = $1, hls_state = 'ready' WHERE id = $2",
@@ -8147,7 +8216,7 @@ pub async fn create_reel(
                 }
             } else {
                 // Fast path: single-pass normalize + HLS (no double encode)
-                match crate::hls::normalize_and_hls(reel_id, &disk_path_clone, &upload_dir_clone).await {
+                match crate::hls::normalize_and_hls(reel_id, &disk_path_clone, &upload_dir_clone, "reels").await {
                     Ok(hls_url) => {
                         let _ = sqlx::query(
                             "UPDATE reels SET hls_url = $1, hls_state = 'ready' WHERE id = $2",

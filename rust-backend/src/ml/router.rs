@@ -44,6 +44,8 @@ pub struct SpotCandidate {
     pub tags: Option<JsonValue>,
     pub created_at: Option<chrono::NaiveDateTime>,
     pub expires_at: Option<chrono::NaiveDateTime>,
+    pub hls_url: Option<String>,
+    pub hls_state: Option<String>,
 }
 
 /// Per-request context for SpotsFeed ranking.
@@ -356,6 +358,8 @@ impl From<crate::models::SpotFullRow> for SpotCandidate {
             tags: r.tags,
             created_at: r.created_at,
             expires_at: r.expires_at,
+            hls_url: r.hls_url,
+            hls_state: r.hls_state,
         }
     }
 }
