@@ -12,6 +12,8 @@ pub mod lora;
 pub mod matchmaker;
 // GNN embedding worker endpoints
 pub mod gnn;
+// Visual embedding worker endpoints
+pub mod visual;
 
 use std::collections::HashMap;
 use std::path::Path;

@@ -36,6 +36,9 @@ pub struct MatchmakerConfig {
     /// score, in [0,1]. 0 = off (default; no GNN lookups happen). This flag is
     /// actually checked — blending only runs when > 0.
     pub gnn_weight: f64,
+    /// Weight of the visual (photo) compatibility score blended in, [0,1].
+    /// 0 = off (default). Checked — no lookups happen when 0.
+    pub visual_weight: f64,
 }
 
 impl Default for MatchmakerConfig {
@@ -49,6 +52,7 @@ impl Default for MatchmakerConfig {
             top_k_reciprocal: 20,
             max_proposals_per_user: 5,
             gnn_weight: 0.0,
+            visual_weight: 0.0,
         }
     }
 }
@@ -68,6 +72,7 @@ impl MatchmakerConfig {
             top_k_reciprocal: i("AUTO_MATCH_TOP_K", d.top_k_reciprocal as i64) as usize,
             max_proposals_per_user: i("AUTO_MATCH_MAX_PROPOSALS", d.max_proposals_per_user),
             gnn_weight: f("GNN_SCORE_WEIGHT", d.gnn_weight).clamp(0.0, 1.0),
+            visual_weight: f("VISUAL_SCORE_WEIGHT", d.visual_weight).clamp(0.0, 1.0),
         }
     }
 }
@@ -80,6 +85,18 @@ async fn blend_gnn(state: &AppState, a: i64, b: i64, base: f64, weight: f64) -> 
     }
     match crate::services::gnn::score(&state.db, a, b).await {
         Some(g) => (1.0 - weight) * base + weight * g,
+        None => base,
+    }
+}
+
+/// Blend a visual (photo) compatibility score into a base score.
+/// No-op (and no DB lookup) when `weight <= 0` or the pair has no photo embedding.
+async fn blend_visual(state: &AppState, a: i64, b: i64, base: f64, weight: f64) -> f64 {
+    if weight <= 0.0 {
+        return base;
+    }
+    match crate::services::visual::score(&state.db, a, b).await {
+        Some(v) => (1.0 - weight) * base + weight * v,
         None => base,
     }
 }
@@ -169,8 +186,10 @@ pub async fn run_round(state: &AppState, cfg: &MatchmakerConfig, user_limit: i64
             let rscore = forward_scores(state, b, &[a]).await
                 .first().map(|x| x.1).unwrap_or(0.0);
             let base = reciprocal(fscore, rscore);
-            // Blend in higher-order graph structure (no-op unless GNN_SCORE_WEIGHT > 0).
-            let mutual = blend_gnn(state, a_i64, b as i64, base, cfg.gnn_weight).await;
+            // Blend in graph structure + visual compatibility (each a no-op unless
+            // its weight > 0).
+            let with_gnn = blend_gnn(state, a_i64, b as i64, base, cfg.gnn_weight).await;
+            let mutual = blend_visual(state, a_i64, b as i64, with_gnn, cfg.visual_weight).await;
             if mutual < cfg.propose_threshold { continue; }
 
             let auto = mutual >= cfg.auto_confirm_threshold
@@ -220,16 +239,19 @@ pub async fn create_auto_match(state: &AppState, a: i64, b: i64, score: f64, fwd
     let (u1, u2) = if a < b { (a, b) } else { (b, a) };
     let match_id = Uuid::new_v4().to_string();
 
+    // Fill visual_compatibility_score from photo embeddings if available.
+    let visual = crate::services::visual::score(&state.db, a, b).await;
+
     let inserted = sqlx::query(
         r#"
         INSERT INTO matches
             (id, user1_id, user2_id, user1_liked, user2_liked, is_mutual_match,
-             ai_compatibility_score, match_reason, status, can_send_text)
-        VALUES ($1,$2,$3,TRUE,TRUE,TRUE,$4,'ai_auto','active',TRUE)
+             ai_compatibility_score, visual_compatibility_score, match_reason, status, can_send_text)
+        VALUES ($1,$2,$3,TRUE,TRUE,TRUE,$4,$5,'ai_auto','active',TRUE)
         ON CONFLICT (user1_id, user2_id) DO NOTHING
         "#,
     )
-    .bind(&match_id).bind(u1).bind(u2).bind(score)
+    .bind(&match_id).bind(u1).bind(u2).bind(score).bind(visual)
     .execute(&state.db)
     .await
     .map(|r| r.rows_affected() > 0)
@@ -412,15 +434,16 @@ pub async fn agent_query(state: &AppState, user_id: i32, filters: &AgentFilters)
     forward.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     forward.truncate(limit as usize);
 
-    // Read the GNN blend weight once per request (0 = off).
-    let gnn_weight = MatchmakerConfig::from_env().gnn_weight;
+    // Read blend weights once per request (0 = off).
+    let cfg = MatchmakerConfig::from_env();
 
     let mut out = Vec::with_capacity(forward.len());
     for (b, f) in forward {
         let r = forward_scores(state, b, &[user_id]).await
             .first().map(|x| x.1).unwrap_or(0.0);
         let base = reciprocal(f, r);
-        let m = blend_gnn(state, user_id as i64, b as i64, base, gnn_weight).await;
+        let with_gnn = blend_gnn(state, user_id as i64, b as i64, base, cfg.gnn_weight).await;
+        let m = blend_visual(state, user_id as i64, b as i64, with_gnn, cfg.visual_weight).await;
         if filters.propose && m >= 0.5 {
             let _ = insert_proposal(state, user_id as i64, b as i64, m, f, r).await;
         }

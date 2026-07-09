@@ -65,6 +65,10 @@ pub struct Config {
     pub vision_nima_model: String,
     pub vision_arcface_model: String,
     pub vision_liveness_model: String,
+    /// General visual embedding backbone (ImageNet-pretrained, e.g. MobileNet/
+    /// ResNet exported to ONNX). Optional — if the file is absent, visual
+    /// embeddings are simply not produced.
+    pub vision_embed_model: String,
     pub selfie_match_threshold: f32,
     pub selfie_liveness_threshold: f32,
 
@@ -233,6 +237,8 @@ impl Config {
             env::var("VISION_ARCFACE_MODEL").unwrap_or_else(|_| "arcface.onnx".to_string());
         let vision_liveness_model =
             env::var("VISION_LIVENESS_MODEL").unwrap_or_else(|_| "minifasnet.onnx".to_string());
+        let vision_embed_model =
+            env::var("VISION_EMBED_MODEL").unwrap_or_else(|_| "visual_embed.onnx".to_string());
         let selfie_match_threshold = env::var("SELFIE_MATCH_THRESHOLD")
             .ok()
             .and_then(|value| value.parse::<f32>().ok())
@@ -655,6 +661,7 @@ impl Config {
             vision_nima_model,
             vision_arcface_model,
             vision_liveness_model,
+            vision_embed_model,
             selfie_match_threshold,
             selfie_liveness_threshold,
             max_photo_bytes,

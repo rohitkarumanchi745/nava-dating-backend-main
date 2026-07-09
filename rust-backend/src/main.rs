@@ -183,6 +183,8 @@ use handlers::{
     },
     // GNN embedding worker
     gnn::{export_edges as gnn_export_edges, upsert_embeddings as gnn_upsert_embeddings},
+    // Visual embedding worker
+    visual::{recompute_embeddings as visual_recompute, upsert_embeddings as visual_upsert},
 };
 
 async fn metrics_middleware(
@@ -1265,6 +1267,9 @@ async fn main() {
         // GNN embedding worker (offline-trained graph embeddings)
         .route("/admin/gnn/edges", get(gnn_export_edges))
         .route("/admin/gnn/embeddings", post(gnn_upsert_embeddings))
+        // Visual (photo) embedding worker
+        .route("/admin/visual/recompute", post(visual_recompute))
+        .route("/admin/visual/embeddings", post(visual_upsert))
         // ML Computation Endpoints
         .route("/ml/rl/rank", post(handlers::ml_rank_candidates))
         .route("/ml/linucb/score", post(handlers::ml_linucb_score))

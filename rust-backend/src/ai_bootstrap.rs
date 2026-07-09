@@ -75,6 +75,14 @@ pub async fn ensure_ai_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
             model_version INTEGER NOT NULL DEFAULT 1,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
         "CREATE INDEX IF NOT EXISTS idx_gnn_emb_version ON user_graph_embeddings(model_version)",
+        // --- Visual embeddings (035) ---
+        "CREATE TABLE IF NOT EXISTS user_visual_embeddings (
+            user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            embedding DOUBLE PRECISION[] NOT NULL,
+            dim INTEGER NOT NULL,
+            model_version INTEGER NOT NULL DEFAULT 1,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+        "CREATE INDEX IF NOT EXISTS idx_visual_emb_version ON user_visual_embeddings(model_version)",
     ];
 
     for stmt in STATEMENTS {

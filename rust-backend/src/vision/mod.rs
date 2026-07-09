@@ -16,6 +16,10 @@ const NIMA_SIZE: u32 = 224;
 const FER_SIZE: u32 = 64;
 const ARCFACE_SIZE: u32 = 112;
 const LIVENESS_SIZE: u32 = 80;
+const EMBED_SIZE: u32 = 224;
+// Standard ImageNet normalization for the general visual-embedding backbone.
+const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 #[derive(Debug)]
 pub struct VisionError {
@@ -56,6 +60,9 @@ pub struct VisionAnalyzer {
     nima: OnnxModel,
     arcface: OnnxModel,
     liveness: OnnxModel,
+    /// General visual-embedding backbone (ImageNet-pretrained). Optional: only
+    /// loaded when the model file is present.
+    embed: Option<OnnxModel>,
 }
 
 #[derive(Serialize)]
@@ -83,6 +90,14 @@ impl VisionAnalyzer {
         let nima_path = model_path(&base, &config.vision_nima_model);
         let arcface_path = model_path(&base, &config.vision_arcface_model);
         let liveness_path = model_path(&base, &config.vision_liveness_model);
+        let embed_path = model_path(&base, &config.vision_embed_model);
+
+        // The general visual-embedding backbone is optional.
+        let embed = if embed_path.exists() {
+            Some(OnnxModel::new(&embed_path, [1, 3, EMBED_SIZE as usize, EMBED_SIZE as usize])?)
+        } else {
+            None
+        };
 
         Ok(Self {
             nsfw: OnnxModel::new(&nsfw_path, [1, 3, NSFW_SIZE as usize, NSFW_SIZE as usize])?,
@@ -90,7 +105,20 @@ impl VisionAnalyzer {
             nima: OnnxModel::new(&nima_path, [1, 3, NIMA_SIZE as usize, NIMA_SIZE as usize])?,
             arcface: OnnxModel::new(&arcface_path, [1, 3, ARCFACE_SIZE as usize, ARCFACE_SIZE as usize])?,
             liveness: OnnxModel::new(&liveness_path, [1, 3, LIVENESS_SIZE as usize, LIVENESS_SIZE as usize])?,
+            embed,
         })
+    }
+
+    /// Produce a general visual embedding (ImageNet-normalized backbone) for a
+    /// whole photo. Returns None if no embedding model is configured. Used to
+    /// fill `visual_compatibility_score` and feed the matcher.
+    pub fn embed_image(&self, image: &DynamicImage) -> Option<Vec<f32>> {
+        let model = self.embed.as_ref()?;
+        let rgb = image.to_rgb8();
+        let resized = resize_rgb(&rgb, EMBED_SIZE, EMBED_SIZE);
+        let input = chw_mean_std(&resized, IMAGENET_MEAN, IMAGENET_STD);
+        let output = model.run(input).ok()?;
+        Some(l2_normalize(flatten_all(&output)))
     }
 
     #[allow(dead_code)]
