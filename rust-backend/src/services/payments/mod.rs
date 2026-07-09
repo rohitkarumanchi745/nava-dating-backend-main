@@ -11,6 +11,7 @@
 //! - Dead letter queue for failed payments
 //! - Idempotent operations
 
+pub mod apple;
 pub mod razorpay;
 pub mod retry;
 pub mod stripe;
@@ -300,6 +301,7 @@ pub trait PaymentProvider: Send + Sync {
 pub struct PaymentService {
     razorpay: Option<razorpay::RazorpayClient>,
     stripe: Option<stripe::StripeClient>,
+    apple: Option<apple::AppleClient>,
 }
 
 impl PaymentService {
@@ -309,6 +311,8 @@ impl PaymentService {
         stripe_secret_key: Option<String>,
         stripe_publishable_key: Option<String>,
         stripe_webhook_secret: Option<String>,
+        apple_shared_secret: Option<String>,
+        apple_bundle_id: Option<String>,
     ) -> Self {
         let razorpay = match (razorpay_key_id, razorpay_key_secret) {
             (Some(key_id), Some(key_secret)) => {
@@ -324,7 +328,13 @@ impl PaymentService {
             _ => None,
         };
 
-        Self { razorpay, stripe }
+        // Apple only needs the shared secret to verify receipts. The bundle id
+        // is an optional extra guard (defaults to empty = no bundle check).
+        let apple = apple_shared_secret.map(|secret| {
+            apple::AppleClient::new(secret, apple_bundle_id.unwrap_or_default())
+        });
+
+        Self { razorpay, stripe, apple }
     }
 
     /// Get the appropriate provider for a gateway
@@ -383,6 +393,25 @@ impl PaymentService {
     /// Check if Stripe is available
     pub fn has_stripe(&self) -> bool {
         self.stripe.is_some()
+    }
+
+    /// Check if Apple receipt verification is configured
+    pub fn has_apple(&self) -> bool {
+        self.apple.is_some()
+    }
+
+    /// Verify an Apple App Store receipt server-side. Returns the transactions
+    /// Apple considers valid, or an error if Apple is not configured or the
+    /// receipt fails verification.
+    pub async fn verify_apple_receipt(
+        &self,
+        receipt_b64: &str,
+    ) -> Result<Vec<apple::VerifiedTransaction>, AppError> {
+        let apple = self
+            .apple
+            .as_ref()
+            .ok_or_else(|| AppError::internal("Apple receipt verification not configured"))?;
+        apple.verify_receipt(receipt_b64).await
     }
 }
 

@@ -42,7 +42,10 @@ impl RazorpayClient {
         &self.key_id
     }
 
-    /// Verify Razorpay signature
+    /// Verify Razorpay signature.
+    ///
+    /// Uses `Mac::verify_slice`, which performs a constant-time comparison
+    /// internally — avoids the timing side-channel of `expected == signature`.
     fn verify_signature(&self, order_id: &str, payment_id: &str, signature: &str) -> bool {
         let data = format!("{}|{}", order_id, payment_id);
 
@@ -50,18 +53,24 @@ impl RazorpayClient {
             .expect("HMAC can take key of any size");
         mac.update(data.as_bytes());
 
-        let expected = hex::encode(mac.finalize().into_bytes());
-        expected == signature
+        // Razorpay sends the signature as lowercase hex. Decode it and let the
+        // MAC verify in constant time; a malformed hex string simply fails.
+        match hex::decode(signature) {
+            Ok(sig_bytes) => mac.verify_slice(&sig_bytes).is_ok(),
+            Err(_) => false,
+        }
     }
 
-    /// Verify webhook signature
+    /// Verify webhook signature (constant-time via `Mac::verify_slice`).
     fn verify_webhook_signature(&self, payload: &[u8], signature: &str) -> bool {
         let mut mac = Hmac::<Sha256>::new_from_slice(self.key_secret.as_bytes())
             .expect("HMAC can take key of any size");
         mac.update(payload);
 
-        let expected = hex::encode(mac.finalize().into_bytes());
-        expected == signature
+        match hex::decode(signature) {
+            Ok(sig_bytes) => mac.verify_slice(&sig_bytes).is_ok(),
+            Err(_) => false,
+        }
     }
 }
 

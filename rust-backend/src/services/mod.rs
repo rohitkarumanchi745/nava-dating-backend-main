@@ -24,3 +24,5 @@ pub mod swipe_service;
 pub mod behavior_service;
 pub mod graph_replay;
 pub mod shadow_scoring;
+// Agentic auto-matcher (reciprocal scoring + auto-match policy)
+pub mod matchmaker;

@@ -66,8 +66,12 @@ impl StripeClient {
             .expect("HMAC can take key of any size");
         mac.update(signed_payload.as_bytes());
 
-        let expected = hex::encode(mac.finalize().into_bytes());
-        expected == v1_signature
+        // Constant-time comparison via `Mac::verify_slice` (Stripe sends the
+        // v1 signature as lowercase hex).
+        match hex::decode(v1_signature) {
+            Ok(sig_bytes) => mac.verify_slice(&sig_bytes).is_ok(),
+            Err(_) => false,
+        }
     }
 
     /// Make authenticated request to Stripe with retry and jitter
@@ -395,6 +399,15 @@ impl PaymentProvider for StripeClient {
         let timestamp: i64 = parts.get("t")
             .and_then(|t| t.parse().ok())
             .ok_or_else(|| AppError::bad_request("Missing timestamp in signature"))?;
+
+        // Replay protection: reject events whose signed timestamp is outside a
+        // tolerance window. Without this, a captured valid webhook could be
+        // replayed indefinitely. Stripe's SDKs default to a 5-minute tolerance.
+        const TOLERANCE_SECS: i64 = 300;
+        let now = chrono::Utc::now().timestamp();
+        if (now - timestamp).abs() > TOLERANCE_SECS {
+            return Err(AppError::unauthorized("Webhook timestamp outside tolerance window"));
+        }
 
         // Verify signature
         if !self.verify_webhook_signature(payload, signature, timestamp) {
