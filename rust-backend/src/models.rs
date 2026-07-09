@@ -462,7 +462,7 @@ pub struct InteractionEventRow {
 // Call Sessions
 // ============================================================================
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CallSession {
     pub call_id: String,
     pub match_id: String,

@@ -6,6 +6,10 @@ pub mod payments;
 pub mod ads;
 // Ambassador program module
 pub mod ambassador;
+// Per-user LoRA adapter lifecycle (FedLoRA orchestration)
+pub mod lora;
+// Agentic auto-match endpoints
+pub mod matchmaker;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -2478,10 +2482,20 @@ pub async fn revenuecat_webhook(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    // In production, verify this matches your RevenueCat webhook secret
+    // In production, verify this matches your RevenueCat webhook secret.
+    // Constant-time compare so a rejected request's timing doesn't leak how
+    // many leading bytes of the secret were guessed correctly.
     let expected_secret = state.config.revenuecat_webhook_secret.as_deref().unwrap_or("");
-    if !expected_secret.is_empty() && auth_header != format!("Bearer {}", expected_secret) {
-        return Err(AppError::unauthorized("Invalid webhook authorization"));
+    if !expected_secret.is_empty() {
+        let expected_header = format!("Bearer {}", expected_secret);
+        let matches: bool = subtle::ConstantTimeEq::ct_eq(
+            auth_header.as_bytes(),
+            expected_header.as_bytes(),
+        )
+        .into();
+        if !matches {
+            return Err(AppError::unauthorized("Invalid webhook authorization"));
+        }
     }
 
     let event = &payload.event;
@@ -3527,6 +3541,9 @@ pub async fn create_call(
         ended_at: None,
     };
 
+    // Persist to shared Redis storage first so a callee whose WebSocket lands on
+    // a different pod can still find and join this call, then register locally.
+    crate::realtime::store_call_session(&state, &session).await;
     {
         let mut sessions = state.call_sessions.write().await;
         sessions.create(session);
@@ -9089,6 +9106,10 @@ pub async fn publish_user_event(state: &AppState, user_id: i32, event_type: &str
     }
 
     let msg = payload.to_string();
+    // Fan out to other pods first (borrows msg), then deliver to this pod's
+    // local subscribers (consumes msg). A user's devices may be connected to
+    // different instances, so both paths are needed.
+    crate::realtime::publish_user_event(&state, user_id, &msg).await;
     state.user_events.read().await.publish(user_id, msg);
 }
 

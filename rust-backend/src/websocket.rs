@@ -169,7 +169,8 @@ pub async fn handle_chat(socket: WebSocket, state: AppState, match_id: String, t
                                 auto_queue_for_labeling(state.db.clone(), state.config.llm_enabled, "message", mid as i64, 3);
                             }
 
-                            // Broadcast to room
+                            // Broadcast to room (local subscribers) + fan out to
+                            // other pods over Redis for cross-instance delivery.
                             let chat_msg = ChatMessage {
                                 message_type: "message".to_string(),
                                 sender_id: user_id,
@@ -177,6 +178,7 @@ pub async fn handle_chat(socket: WebSocket, state: AppState, match_id: String, t
                                 message_id,
                                 timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
                             };
+                            crate::realtime::publish_chat(&state, &match_id, &chat_msg).await;
                             let _ = tx.send(chat_msg);
                         }
                     }
@@ -188,6 +190,7 @@ pub async fn handle_chat(socket: WebSocket, state: AppState, match_id: String, t
                             message_id: None,
                             timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
                         };
+                        crate::realtime::publish_chat(&state, &match_id, &chat_msg).await;
                         let _ = tx.send(chat_msg);
                     }
                     "read" => {
@@ -212,6 +215,7 @@ pub async fn handle_chat(socket: WebSocket, state: AppState, match_id: String, t
                                 message_id: Some(message_id),
                                 timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
                             };
+                            crate::realtime::publish_chat(&state, &match_id, &chat_msg).await;
                             let _ = tx.send(chat_msg);
                         }
                     }
@@ -289,25 +293,32 @@ pub async fn handle_call(socket: WebSocket, state: AppState, call_id: String, to
         }
     };
 
-    // Get call session and verify user is participant
+    // Get call session. If it was created on another pod, load it from shared
+    // Redis storage and materialize it locally so this pod has a signal channel.
     let session = {
         let sessions = state.call_sessions.read().await;
         sessions.get(&call_id).cloned()
     };
-
     let session = match session {
-        Some(s) => {
-            if s.caller_id != user_id && s.callee_id != user_id {
-                tracing::warn!("User {} not authorized for call {}", user_id, call_id);
+        Some(s) => s,
+        None => match crate::realtime::load_call_session(&state, &call_id).await {
+            Some(s) => {
+                let mut sessions = state.call_sessions.write().await;
+                sessions.ensure(s.clone());
+                s
+            }
+            None => {
+                tracing::warn!("Call session {} not found", call_id);
                 return;
             }
-            s
-        }
-        None => {
-            tracing::warn!("Call session {} not found", call_id);
-            return;
-        }
+        },
     };
+
+    // Authorize: only the caller or callee may join.
+    if session.caller_id != user_id && session.callee_id != user_id {
+        tracing::warn!("User {} not authorized for call {}", user_id, call_id);
+        return;
+    }
 
     // Get signal channel
     let tx = match {
@@ -335,6 +346,7 @@ pub async fn handle_call(socket: WebSocket, state: AppState, call_id: String, to
             "callee_id": session.callee_id,
         }).to_string(),
     };
+    crate::realtime::publish_call(&state, &call_id, &join_signal).await;
     let _ = tx.send(join_signal);
 
     // Forward signals to this client
@@ -365,6 +377,7 @@ pub async fn handle_call(socket: WebSocket, state: AppState, call_id: String, to
                     sender_id: user_id,
                     payload: payload.payload.unwrap_or_default(),
                 };
+                crate::realtime::publish_call(&state, &call_id, &signal).await;
                 let _ = tx.send(signal);
             }
         } else if let Message::Close(_) = msg {
@@ -378,6 +391,7 @@ pub async fn handle_call(socket: WebSocket, state: AppState, call_id: String, to
         sender_id: user_id,
         payload: String::new(),
     };
+    crate::realtime::publish_call(&state, &call_id, &leave_signal).await;
     let _ = tx.send(leave_signal);
 
     // Cleanup

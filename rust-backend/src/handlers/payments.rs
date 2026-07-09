@@ -698,6 +698,10 @@ pub struct VerifyApplePayload {
     pub transaction_id: String,
     pub product_id: String,
     pub original_transaction_id: Option<String>,
+    /// Base64-encoded App Store receipt, used for server-side verification with
+    /// Apple. Required in production; only omittable in non-production test
+    /// builds (where the server falls back to trusting the client).
+    pub receipt_data: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -732,10 +736,66 @@ pub async fn verify_apple_payment(
         }));
     }
 
-    // Look up product by store product ID (e.g. "com.nava.gold_monthly" -> backend product)
+    // --- Server-side verification with Apple --------------------------------
+    // Establish that this transaction actually happened before granting anything.
+    // Without this, a client could grant itself any product by inventing a
+    // transaction id. The product id we grant is taken from Apple's verified
+    // receipt (not the client), so a client can't claim a different/pricier SKU
+    // than it actually bought.
+    let apple_ready = state
+        .payment_service
+        .as_ref()
+        .map(|s| s.has_apple())
+        .unwrap_or(false);
+
+    let verified_product_id: String = match (&payload.receipt_data, apple_ready) {
+        (Some(receipt), true) => {
+            // Safe: apple_ready == true implies payment_service is Some.
+            let service = state.payment_service.as_ref().unwrap();
+            let txns = service.verify_apple_receipt(receipt).await?;
+            let matched = txns.into_iter().find(|t| {
+                t.transaction_id == payload.transaction_id
+                    || (!t.original_transaction_id.is_empty()
+                        && payload.original_transaction_id.as_deref()
+                            == Some(t.original_transaction_id.as_str()))
+            });
+            match matched {
+                Some(t) => t.product_id,
+                None => {
+                    tracing::warn!(
+                        user_id,
+                        txn = %payload.transaction_id,
+                        "Apple verify: transaction not present in verified receipt"
+                    );
+                    return Err(AppError::forbidden("Transaction not found in Apple receipt"));
+                }
+            }
+        }
+        _ => {
+            // No receipt supplied, or Apple verification isn't configured.
+            if state.config.is_production() {
+                tracing::error!(
+                    user_id,
+                    "Apple verify rejected: receipt_data + APPLE_SHARED_SECRET are required in production"
+                );
+                return Err(AppError::bad_request(
+                    "receipt_data is required for Apple purchase verification",
+                ));
+            }
+            // Non-production only: keep local/testing flows working, but make the
+            // trust-the-client bypass loud so it can never be mistaken for prod.
+            tracing::warn!(
+                user_id,
+                "Apple verify: UNVERIFIED (no receipt / Apple not configured) — accepting in non-production only"
+            );
+            payload.product_id.clone()
+        }
+    };
+
+    // Look up product by the VERIFIED store product ID (e.g. "com.nava.gold_monthly")
     let product = sqlx::query!(
         "SELECT id, product_type FROM products WHERE product_id = $1 AND is_active = true",
-        payload.product_id
+        verified_product_id
     )
     .fetch_optional(&state.db)
     .await?;
@@ -743,10 +803,10 @@ pub async fn verify_apple_payment(
     let product = match product {
         Some(p) => p,
         None => {
-            tracing::warn!("Apple verify: unknown product_id={}", payload.product_id);
+            tracing::warn!("Apple verify: unknown product_id={}", verified_product_id);
             return Ok(Json(VerifyAppleResponse {
                 success: false,
-                message: format!("Unknown product: {}", payload.product_id),
+                message: format!("Unknown product: {}", verified_product_id),
             }));
         }
     };

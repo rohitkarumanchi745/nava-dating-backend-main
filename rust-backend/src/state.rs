@@ -413,6 +413,13 @@ impl ChatRooms {
         }
     }
 
+    /// Get an existing room's sender without creating one. Used by the
+    /// cross-instance fanout to inject remote messages only when this pod
+    /// actually has local subscribers for the match.
+    pub fn get_existing(&self, match_id: &str) -> Option<broadcast::Sender<ChatMessage>> {
+        self.rooms.get(match_id).cloned()
+    }
+
     /// Remove a room if no subscribers remain
     pub fn cleanup(&mut self, match_id: &str) {
         if let Some(sender) = self.rooms.get(match_id) {
@@ -498,6 +505,24 @@ impl CallSessions {
         let (sender, _) = broadcast::channel(self.buffer_size);
         self.signals.insert(call_id, sender.clone());
         sender
+    }
+
+    /// Materialize a session that was created on another pod (loaded from shared
+    /// Redis storage). Unlike `create`, this is idempotent: it never overwrites
+    /// an existing session or orphans an already-created signal channel, so two
+    /// participants landing on the same pod won't clobber each other's channel.
+    pub fn ensure(&mut self, session: CallSession) -> broadcast::Sender<CallSignal> {
+        let call_id = session.call_id.clone();
+        self.user_to_call.entry(session.caller_id).or_insert_with(|| call_id.clone());
+        self.user_to_call.entry(session.callee_id).or_insert_with(|| call_id.clone());
+        self.sessions.entry(call_id.clone()).or_insert(session);
+        if let Some(sender) = self.signals.get(&call_id) {
+            sender.clone()
+        } else {
+            let (sender, _) = broadcast::channel(self.buffer_size);
+            self.signals.insert(call_id, sender.clone());
+            sender
+        }
     }
 
     /// Get an existing call session

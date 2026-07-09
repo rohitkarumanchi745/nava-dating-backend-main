@@ -9,6 +9,7 @@ mod jobs;
 mod middleware;
 mod models;
 mod hls;
+mod realtime;
 mod redis_service;
 mod services;
 mod state;
@@ -168,6 +169,16 @@ use handlers::{
         ambassador_login, get_ambassador_profile, get_performance, get_daily_breakdown,
         get_hourly_breakdown, get_leaderboard, get_subscribers, get_active_subscribers,
         admin_get_daily_signups, record_referral, verify_referral, get_my_referral_code,
+    },
+    // Per-user LoRA adapters (FedLoRA)
+    lora::{
+        get_current_adapter, submit_lora_signal, admin_enqueue_training,
+        worker_next_job, worker_register_adapter, worker_fail_job,
+    },
+    // Agentic auto-matcher
+    matchmaker::{
+        get_auto_suggestions, accept_auto_match, decline_auto_match, admin_run_matchmaker,
+        agent_matchmaker_prompt,
     },
 };
 
@@ -522,6 +533,16 @@ async fn main() {
         } else {
             None
         };
+        let apple_shared_secret = if !config.apple_shared_secret.is_empty() {
+            Some(config.apple_shared_secret.clone())
+        } else {
+            None
+        };
+        let apple_bundle_id = if !config.apple_bundle_id.is_empty() {
+            Some(config.apple_bundle_id.clone())
+        } else {
+            None
+        };
 
         let service = PaymentService::new(
             razorpay_key_id,
@@ -529,13 +550,16 @@ async fn main() {
             stripe_secret,
             stripe_publishable,
             stripe_webhook,
+            apple_shared_secret,
+            apple_bundle_id,
         );
 
-        if service.has_razorpay() || service.has_stripe() {
+        if service.has_razorpay() || service.has_stripe() || service.has_apple() {
             info!(
-                "Payment service initialized (Razorpay: {}, Stripe: {})",
+                "Payment service initialized (Razorpay: {}, Stripe: {}, Apple: {})",
                 service.has_razorpay(),
-                service.has_stripe()
+                service.has_stripe(),
+                service.has_apple()
             );
             Some(Arc::new(service))
         } else {
@@ -699,6 +723,11 @@ async fn main() {
         });
         info!("Instance heartbeat started (id: {})", state.config.instance_id);
     }
+
+    // Start cross-instance real-time fanout (chat / calls / user events).
+    // Bridges per-pod WebSocket rooms over Redis Pub/Sub so users on different
+    // pods can see each other's messages. No-op without Redis.
+    realtime::spawn_subscriber(state.clone());
 
     // Start replica lag monitor (if read replica is configured)
     if state.db_read.is_some() {
@@ -1156,6 +1185,19 @@ async fn main() {
         .route("/fl/model", get(get_active_fl_model))
         .route("/fl/local-data", post(report_local_data))
         .route("/fl/training-data", get(get_fl_training_data))
+        // Per-user LoRA adapters (FedLoRA)
+        .route("/suggestions/adapter", get(get_current_adapter))
+        .route("/fl/lora/signal", post(submit_lora_signal))
+        .route("/admin/lora/train", post(admin_enqueue_training))
+        .route("/admin/lora/jobs/next", get(worker_next_job))
+        .route("/admin/lora/adapter", post(worker_register_adapter))
+        .route("/admin/lora/jobs/{id}/fail", post(worker_fail_job))
+        // Agentic auto-matcher
+        .route("/matches/auto/suggestions", get(get_auto_suggestions))
+        .route("/matches/auto/accept", post(accept_auto_match))
+        .route("/matches/auto/decline", post(decline_auto_match))
+        .route("/agent/matchmaker/prompt", post(agent_matchmaker_prompt))
+        .route("/admin/matches/auto/run", post(admin_run_matchmaker))
         // ML Computation Endpoints
         .route("/ml/rl/rank", post(handlers::ml_rank_candidates))
         .route("/ml/linucb/score", post(handlers::ml_linucb_score))

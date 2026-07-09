@@ -133,6 +133,10 @@ pub struct Config {
     // RevenueCat (In-App Purchases)
     pub revenuecat_webhook_secret: Option<String>,
 
+    // Apple App Store receipt verification (server-side)
+    pub apple_shared_secret: String,
+    pub apple_bundle_id: String,
+
     // Payment Gateways
     // Razorpay (India)
     pub razorpay_key_id: String,
@@ -484,6 +488,13 @@ impl Config {
         // RevenueCat
         let revenuecat_webhook_secret = env::var("REVENUECAT_WEBHOOK_SECRET").ok();
 
+        // Apple App Store receipt verification — shared secret supports file-based
+        // secrets for rotation, same as the payment gateway keys.
+        let apple_shared_secret = secret_from_file_or_env(
+            "APPLE_SHARED_SECRET_FILE", "APPLE_SHARED_SECRET", "",
+        );
+        let apple_bundle_id = env::var("APPLE_BUNDLE_ID").unwrap_or_default();
+
         // Payment Gateways - Razorpay (India) — supports file-based secrets for rotation
         let razorpay_key_id = env::var("RAZORPAY_KEY_ID").unwrap_or_default();
         let razorpay_key_secret = secret_from_file_or_env(
@@ -686,6 +697,8 @@ impl Config {
             smtp_password,
             smtp_from,
             revenuecat_webhook_secret,
+            apple_shared_secret,
+            apple_bundle_id,
             razorpay_key_id,
             razorpay_key_secret,
             razorpay_webhook_secret,
