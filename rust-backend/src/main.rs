@@ -10,6 +10,7 @@ mod middleware;
 mod models;
 mod hls;
 mod realtime;
+mod ai_bootstrap;
 mod redis_service;
 mod services;
 mod state;
@@ -180,6 +181,8 @@ use handlers::{
         get_auto_suggestions, accept_auto_match, decline_auto_match, admin_run_matchmaker,
         agent_matchmaker_prompt,
     },
+    // GNN embedding worker
+    gnn::{export_edges as gnn_export_edges, upsert_embeddings as gnn_upsert_embeddings},
 };
 
 async fn metrics_middleware(
@@ -729,6 +732,67 @@ async fn main() {
     // pods can see each other's messages. No-op without Redis.
     realtime::spawn_subscriber(state.clone());
 
+    // Ensure AI feature tables exist (idempotent; independent of external
+    // migrations). Without this the LoRA / auto-match / GNN endpoints 500.
+    if let Err(e) = ai_bootstrap::ensure_ai_schema(&state.db).await {
+        warn!("Failed to ensure AI schema: {e}");
+    } else {
+        info!("AI feature schema ensured (lora / auto-match / gnn)");
+    }
+
+    // Auto-match scheduler — runs reciprocal matchmaking rounds periodically.
+    // Honors AUTO_MATCH_ENABLED (default off): nothing runs unless enabled.
+    {
+        let mm_cfg = services::matchmaker::MatchmakerConfig::from_env();
+        if mm_cfg.enabled {
+            let sched_state = state.clone();
+            let interval = std::env::var("AUTO_MATCH_INTERVAL_SECS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(300u64);
+            let batch = std::env::var("AUTO_MATCH_USER_BATCH")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(200i64);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(interval)).await;
+                    let stats = services::matchmaker::run_round(&sched_state, &mm_cfg, batch).await;
+                    info!(
+                        "auto-match round: users={} proposals={} auto_matched={}",
+                        stats.users_processed, stats.proposals_created, stats.auto_matched
+                    );
+                }
+            });
+            info!("Auto-match scheduler started (interval {}s)", interval);
+        } else {
+            info!("Auto-match scheduler disabled (AUTO_MATCH_ENABLED=false)");
+        }
+    }
+
+    // FedLoRA training scheduler — optionally produce server-side signals, then
+    // enqueue training jobs for the Python worker. Off unless LORA_AUTO_TRAIN_ENABLED.
+    if std::env::var("LORA_AUTO_TRAIN_ENABLED")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on")).unwrap_or(false)
+    {
+        let lora_state = state.clone();
+        let produce = std::env::var("LORA_SERVER_SIGNALS")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on")).unwrap_or(false);
+        let interval = std::env::var("LORA_TRAIN_INTERVAL_SECS")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(3600u64);
+        let min_samples = std::env::var("LORA_MIN_SAMPLES")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(10i64);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+                if produce {
+                    let n = ai_bootstrap::produce_lora_signals(&lora_state.db).await;
+                    info!("lora: produced {} training signals", n);
+                }
+                let enq = ai_bootstrap::enqueue_lora_training(&lora_state.db, min_samples).await;
+                info!("lora: enqueued {} training jobs", enq);
+            }
+        });
+        info!("FedLoRA training scheduler started (interval {}s, server_signals={})",
+              interval, produce);
+    }
+
     // Start replica lag monitor (if read replica is configured)
     if state.db_read.is_some() {
         let replica_pool = state.db_read.clone().unwrap();
@@ -1198,6 +1262,9 @@ async fn main() {
         .route("/matches/auto/decline", post(decline_auto_match))
         .route("/agent/matchmaker/prompt", post(agent_matchmaker_prompt))
         .route("/admin/matches/auto/run", post(admin_run_matchmaker))
+        // GNN embedding worker (offline-trained graph embeddings)
+        .route("/admin/gnn/edges", get(gnn_export_edges))
+        .route("/admin/gnn/embeddings", post(gnn_upsert_embeddings))
         // ML Computation Endpoints
         .route("/ml/rl/rank", post(handlers::ml_rank_candidates))
         .route("/ml/linucb/score", post(handlers::ml_linucb_score))

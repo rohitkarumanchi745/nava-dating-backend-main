@@ -32,6 +32,10 @@ pub struct MatchmakerConfig {
     pub top_k_reciprocal: usize,
     /// Max new proposals per user per round.
     pub max_proposals_per_user: i64,
+    /// Weight of the GNN graph-structure score blended into the reciprocal
+    /// score, in [0,1]. 0 = off (default; no GNN lookups happen). This flag is
+    /// actually checked — blending only runs when > 0.
+    pub gnn_weight: f64,
 }
 
 impl Default for MatchmakerConfig {
@@ -44,6 +48,7 @@ impl Default for MatchmakerConfig {
             candidates_per_user: 80,
             top_k_reciprocal: 20,
             max_proposals_per_user: 5,
+            gnn_weight: 0.0,
         }
     }
 }
@@ -62,7 +67,20 @@ impl MatchmakerConfig {
             candidates_per_user: i("AUTO_MATCH_CANDIDATES_PER_USER", d.candidates_per_user),
             top_k_reciprocal: i("AUTO_MATCH_TOP_K", d.top_k_reciprocal as i64) as usize,
             max_proposals_per_user: i("AUTO_MATCH_MAX_PROPOSALS", d.max_proposals_per_user),
+            gnn_weight: f("GNN_SCORE_WEIGHT", d.gnn_weight).clamp(0.0, 1.0),
         }
+    }
+}
+
+/// Blend a GNN graph-structure score into a base reciprocal score.
+/// No-op (and no DB lookup) when `weight <= 0` or the pair has no embeddings.
+async fn blend_gnn(state: &AppState, a: i64, b: i64, base: f64, weight: f64) -> f64 {
+    if weight <= 0.0 {
+        return base;
+    }
+    match crate::services::gnn::score(&state.db, a, b).await {
+        Some(g) => (1.0 - weight) * base + weight * g,
+        None => base,
     }
 }
 
@@ -150,7 +168,9 @@ pub async fn run_round(state: &AppState, cfg: &MatchmakerConfig, user_limit: i64
             // Reverse direction: does B like A?
             let rscore = forward_scores(state, b, &[a]).await
                 .first().map(|x| x.1).unwrap_or(0.0);
-            let mutual = reciprocal(fscore, rscore);
+            let base = reciprocal(fscore, rscore);
+            // Blend in higher-order graph structure (no-op unless GNN_SCORE_WEIGHT > 0).
+            let mutual = blend_gnn(state, a_i64, b as i64, base, cfg.gnn_weight).await;
             if mutual < cfg.propose_threshold { continue; }
 
             let auto = mutual >= cfg.auto_confirm_threshold
@@ -392,11 +412,15 @@ pub async fn agent_query(state: &AppState, user_id: i32, filters: &AgentFilters)
     forward.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     forward.truncate(limit as usize);
 
+    // Read the GNN blend weight once per request (0 = off).
+    let gnn_weight = MatchmakerConfig::from_env().gnn_weight;
+
     let mut out = Vec::with_capacity(forward.len());
     for (b, f) in forward {
         let r = forward_scores(state, b, &[user_id]).await
             .first().map(|x| x.1).unwrap_or(0.0);
-        let m = reciprocal(f, r);
+        let base = reciprocal(f, r);
+        let m = blend_gnn(state, user_id as i64, b as i64, base, gnn_weight).await;
         if filters.propose && m >= 0.5 {
             let _ = insert_proposal(state, user_id as i64, b as i64, m, f, r).await;
         }

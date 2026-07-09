@@ -10,6 +10,8 @@ pub mod ambassador;
 pub mod lora;
 // Agentic auto-match endpoints
 pub mod matchmaker;
+// GNN embedding worker endpoints
+pub mod gnn;
 
 use std::collections::HashMap;
 use std::path::Path;

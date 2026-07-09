@@ -26,3 +26,5 @@ pub mod graph_replay;
 pub mod shadow_scoring;
 // Agentic auto-matcher (reciprocal scoring + auto-match policy)
 pub mod matchmaker;
+// GNN graph-structure embeddings (offline-trained, served as a pairwise score)
+pub mod gnn;

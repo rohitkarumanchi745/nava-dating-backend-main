@@ -1515,3 +1515,80 @@ Operational script at `rust-backend/deploy/canary-shadow-notif.sh` for safe noti
 
 **Guardrails:** min 200 samples, throttle rate < 40%, variant skew < 80%, uplift threshold 2pp.
 Dry-run test harness at `rust-backend/deploy/test-canary-guardrails.sh` (28 tests).
+
+## AI, Personalization & Agentic Matching
+
+On-device chat suggestions support, per-user personalization, and agentic
+matching. The guiding principle: reuse what we already run (Redis, federated
+learning, the RL/bandit ranker, our governed API), keep the user-facing path
+fast and offline-capable, and add nothing we can't run cheaply at scale.
+Everything below is **additive** and **degrades gracefully** when its dependency
+(Redis, a configured model, a trained adapter) is absent.
+
+`AI_ARCHITECTURE.md` holds the same write-up spanning both repos; the backend
+detail is inlined here.
+
+### Real-time cross-instance fanout — `src/realtime.rs`
+- **What:** chat, call, and app-event WebSocket traffic fans out across pods over
+  Redis Pub/Sub, with call sessions shared in Redis so a callee on a different
+  pod can join.
+- **Why:** our WebSocket rooms lived in per-process memory, so two users on
+  different pods couldn't see each other's messages. This is the change that
+  makes "10k+ users" real.
+- **How it fits:** reuses the Redis we already run; single-pod behavior is
+  unchanged when Redis is absent.
+
+### FedLoRA — per-user chat personalization
+- **What:** migration `032_lora_adapters.sql`, `handlers/lora.rs`, and the
+  training worker `scripts/fedlora_trainer.py`. The device submits privacy-safe
+  signal and downloads a small per-user LoRA adapter; the worker trains it and
+  registers a new version, which we push to the device over the outbox + fanout.
+- **Why:** chat suggestions that match each user's voice. A **per-user LoRA
+  adapter** on a shared base is the cost-efficient way — *not* a full model per
+  user (millions of models is infeasible).
+- **How it fits:** reuses our existing federated-learning + differential-privacy
+  setup. Training is offline/GPU and stops when done; the adapter is applied
+  on-device at inference.
+
+### Agentic auto-matcher — `services/matchmaker.rs`, migration `033`
+- **What:** reciprocal preference scoring — we score A→B *and* B→A and combine
+  them (geometric mean, so one-sided interest stays low). High-scoring pairs
+  become proposals or, above a higher bar with safety gates, instant matches.
+- **Why:** "instant match without swiping." The prediction is a classic ML
+  problem we already solve.
+- **How it fits:** **reuses `MlService::rank_candidates`** (RL + LinUCB + geo +
+  affinity, already learned from swipes) in both directions — no new model.
+  Accept/decline calls the existing `record_swipe_weighted`, closing the RL loop.
+- **Safety:** disabled by default (`AUTO_MATCH_ENABLED=false`); proposals are the
+  default, instant auto-create is gated behind a high score + both-verified.
+
+### Prompt-driven matchmaker agent — `POST /agent/matchmaker/prompt`
+- **What:** a natural-language intent ("verified grad students who love hiking,
+  late 20s") is parsed into structured filters *in Rust* (`parse_intent`), then
+  run through the reciprocal scorer via a **governed tool** (`agent_query`).
+- **Why:** conversational matching, but with **no LLM inside the data layer**.
+- **How it fits — the key security decision:** the agent sits **above our API
+  boundary**, not in the data layer. It only ever produces *structured,
+  user-scoped filters* — never raw SQL — so every query inherits our existing
+  auth, row-scoping, and rate limits. Learning from engagement is the existing
+  Rust RL bandit; no Python and no per-request LLM.
+
+### Payments hardening
+- **Server-side Apple receipt verification** (`services/payments/apple.rs`) —
+  previously trusted a client-supplied transaction id (revenue-fraud hole); now
+  verifies against Apple and fails closed in production.
+- **Constant-time webhook signatures** (Razorpay/Stripe/RevenueCat) plus a
+  **5-minute Stripe replay window** — the old `expected == signature` leaked
+  timing and had no replay protection.
+
+### Why these decisions (trade-offs)
+
+| Decision | Why |
+|---|---|
+| **Per-user LoRA + retrieval**, not a full LLM per user | A model per user is infeasible; adapters + retrieval are cheap and scale. |
+| **Matching = bandit/RL in Rust**, not an LLM | Match prediction is a classic ML problem; an LLM would be slower, costlier, no better. |
+| **Agent above the API boundary** with governed tools | An LLM with DB access over user prompts is a PII/injection risk; governed tools reuse existing authz. |
+| **All-Rust + ONNX serving**; Python only for offline training | Serving stays in-stack and fast; only offline LLM/LoRA training needs Python/GPU, which then exports weights for Rust to serve. |
+
+See **[AI_ARCHITECTURE.md](AI_ARCHITECTURE.md)** for the cross-repo version,
+including the iOS on-device engine.
