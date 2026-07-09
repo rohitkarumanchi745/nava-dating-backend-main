@@ -206,9 +206,21 @@ pub async fn admin_run_matchmaker(
         .get("limit")
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(200);
+    let force = params
+        .get("force")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
 
     let cfg = MatchmakerConfig::from_env();
-    let stats = run_round(&state, &cfg, user_limit).await;
+    // Honor the AUTO_MATCH_ENABLED switch; admins can override for a manual run.
+    if !cfg.enabled && !force {
+        return Ok(Json(json!({
+            "ok": false,
+            "reason": "AUTO_MATCH_ENABLED=false",
+            "hint": "set AUTO_MATCH_ENABLED=true, or pass ?force=1 for a one-off run"
+        })));
+    }
 
+    let stats = run_round(&state, &cfg, user_limit).await;
     Ok(Json(json!({ "ok": true, "stats": stats })))
 }
