@@ -752,7 +752,13 @@ pub async fn verify_apple_payment(
         (Some(receipt), true) => {
             // Safe: apple_ready == true implies payment_service is Some.
             let service = state.payment_service.as_ref().unwrap();
-            let txns = service.verify_apple_receipt(receipt).await?;
+            // StoreKit 2 clients send a signed transaction (JWS) → verify via the
+            // App Store Server API; otherwise fall back to a legacy base64 receipt.
+            let txns = if service.has_apple_server_api() {
+                service.verify_apple_transaction(receipt).await?
+            } else {
+                service.verify_apple_receipt(receipt).await?
+            };
             let matched = txns.into_iter().find(|t| {
                 t.transaction_id == payload.transaction_id
                     || (!t.original_transaction_id.is_empty()

@@ -55,8 +55,10 @@ COPY --from=builder /app/migrations /app/migrations
 RUN mkdir -p /app/uploads /app/models && chown -R appuser:appuser /app
 
 # Environment defaults (production-ready for 10k+ users)
-ENV BIND_ADDR=0.0.0.0:8080 \
-    RUST_LOG=info,telugu_dating_backend=info,sqlx=warn \
+# NOTE: BIND_ADDR is intentionally NOT set here. The app binds Railway's $PORT
+# (and any PaaS that injects it) and falls back to 0.0.0.0:8080 locally. Setting
+# BIND_ADDR would override $PORT and cause a 502 on Railway.
+ENV RUST_LOG=info,telugu_dating_backend=info,sqlx=warn \
     UPLOAD_DIR=/app/uploads \
     VISION_MODEL_DIR=/app/models \
     ENVIRONMENT=production \
@@ -77,7 +79,7 @@ EXPOSE 8080
 # Health check (K8s handles probes, but useful for local testing)
 # In K8s, disable with: docker run --health-cmd=none
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl -sf http://localhost:8080/ready || exit 1
+    CMD curl -sf http://localhost:${PORT:-8080}/ready || exit 1
 
 # Run as non-root user
 USER appuser

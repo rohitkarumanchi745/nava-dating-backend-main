@@ -140,6 +140,11 @@ pub struct Config {
     // Apple App Store receipt verification (server-side)
     pub apple_shared_secret: String,
     pub apple_bundle_id: String,
+    // App Store Server API (StoreKit 2 JWS verification)
+    pub apple_issuer_id: String,
+    pub apple_key_id: String,
+    pub apple_private_key: String,   // .p8 PEM contents
+    pub apple_api_production: bool,
 
     // Payment Gateways
     // Razorpay (India)
@@ -212,7 +217,16 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+        // Bind address resolution, in priority order:
+        //   1. BIND_ADDR (explicit override)
+        //   2. PORT (Railway / most PaaS inject this and route traffic to it)
+        //   3. default 0.0.0.0:8080
+        let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| {
+            match env::var("PORT") {
+                Ok(port) if !port.trim().is_empty() => format!("0.0.0.0:{}", port.trim()),
+                _ => "0.0.0.0:8080".to_string(),
+            }
+        });
         let database_url = env::var("DATABASE_URL").unwrap_or_default();
         let secret_key = secret_from_file_or_env(
             "SECRET_KEY_FILE", "SECRET_KEY", "your-secret-key-change-in-production",
@@ -500,6 +514,15 @@ impl Config {
             "APPLE_SHARED_SECRET_FILE", "APPLE_SHARED_SECRET", "",
         );
         let apple_bundle_id = env::var("APPLE_BUNDLE_ID").unwrap_or_default();
+        let apple_issuer_id = env::var("APPLE_ISSUER_ID").unwrap_or_default();
+        let apple_key_id = env::var("APPLE_KEY_ID").unwrap_or_default();
+        let apple_private_key = secret_from_file_or_env(
+            "APPLE_PRIVATE_KEY_FILE", "APPLE_PRIVATE_KEY", "",
+        );
+        let apple_api_production = env::var("APPLE_API_PRODUCTION")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(is_prod);
 
         // Payment Gateways - Razorpay (India) — supports file-based secrets for rotation
         let razorpay_key_id = env::var("RAZORPAY_KEY_ID").unwrap_or_default();
@@ -706,6 +729,10 @@ impl Config {
             revenuecat_webhook_secret,
             apple_shared_secret,
             apple_bundle_id,
+            apple_issuer_id,
+            apple_key_id,
+            apple_private_key,
+            apple_api_production,
             razorpay_key_id,
             razorpay_key_secret,
             razorpay_webhook_secret,
