@@ -1515,3 +1515,22 @@ Operational script at `rust-backend/deploy/canary-shadow-notif.sh` for safe noti
 
 **Guardrails:** min 200 samples, throttle rate < 40%, variant skew < 80%, uplift threshold 2pp.
 Dry-run test harness at `rust-backend/deploy/test-canary-guardrails.sh` (28 tests).
+
+## AI, Personalization & Agentic Matching
+
+On-device chat suggestions support, per-user personalization, and agentic
+matching — all additive and reusing existing systems (Redis, federated learning,
+the RL/bandit ranker, the governed API).
+
+- **Real-time fanout** over Redis so chat/calls/events work across pods (`src/realtime.rs`)
+- **FedLoRA** per-user chat personalization — adapter lifecycle + Python trainer
+  (migration `032`, `handlers/lora.rs`, `scripts/fedlora_trainer.py`)
+- **Agentic auto-matcher** — reciprocal scoring reusing `MlService`
+  (migration `033`, `services/matchmaker.rs`, `handlers/matchmaker.rs`)
+- **Prompt-driven matchmaker agent** — Rust intent parser + governed tool over
+  the API boundary (`POST /agent/matchmaker/prompt`)
+- **Payments hardening** — server-side Apple verification, constant-time webhook
+  signatures, Stripe replay window
+
+See **[AI_ARCHITECTURE.md](AI_ARCHITECTURE.md)** for what changed, why we made
+each decision, and how it fits the existing architecture.
