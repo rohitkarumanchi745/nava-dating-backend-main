@@ -12,6 +12,8 @@ pub mod lora;
 pub mod matchmaker;
 // GNN embedding worker endpoints
 pub mod gnn;
+// Visual embedding worker endpoints
+pub mod visual;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -6994,6 +6996,70 @@ fn get_user_photos(user: &UserRow) -> Vec<String> {
         }
     }
     photos
+}
+
+/// Build `DiscoverProfile` cards for a set of user ids, reusing the discover
+/// feed's shape. Used to enrich the auto-match and agent-matchmaker responses so
+/// clients can render the same cards without a second profile fetch. Distance is
+/// left None (no viewer location context here).
+pub async fn fetch_profile_cards(
+    state: &AppState,
+    ids: &[i32],
+) -> std::collections::HashMap<i32, DiscoverProfile> {
+    if ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let ids64: Vec<i64> = ids.iter().map(|x| *x as i64).collect();
+    let rows = sqlx::query_as::<_, DiscoverUserRow>(
+        "SELECT u.id, u.name, u.display_name, u.show_verified_name, u.dob, u.gender, u.bio, \
+                u.profile_photo_url, u.profile_photos, u.profile_photo_1, u.profile_photo_2, u.profile_photo_3, \
+                u.is_verified, u.attractiveness_score, u.looking_for, u.profession_title, u.height_cm, \
+                l.city, l.latitude, l.longitude \
+         FROM users u LEFT JOIN user_locations l ON l.user_id = u.id \
+         WHERE u.id = ANY($1)",
+    )
+    .bind(&ids64)
+    .fetch_all(state.read_pool())
+    .await
+    .unwrap_or_default();
+
+    let uni_map = batch_lookup_university(state.read_pool(), ids).await.unwrap_or_default();
+
+    let mut cards = std::collections::HashMap::new();
+    for c in rows {
+        let photos = get_photos_from_row(&c);
+        let public_name = public_name_for_viewer(
+            c.name.as_deref(),
+            c.display_name.as_deref(),
+            c.show_verified_name,
+        );
+        let uni = uni_map.get(&c.id);
+        cards.insert(
+            c.id,
+            DiscoverProfile {
+                id: c.id,
+                name: public_name,
+                display_name: c.display_name.clone(),
+                age: c.dob.map(calculate_age),
+                gender: c.gender.clone(),
+                bio: c.bio.clone(),
+                photos,
+                is_verified: c.is_verified.unwrap_or(false),
+                looking_for: c.looking_for.clone(),
+                profession_title: c.profession_title.clone(),
+                height_cm: c.height_cm,
+                distance_km: None,
+                distance_text: None,
+                city: c.city.clone(),
+                compatibility_score: None,
+                university: uni.map(|(n, _)| n.clone()),
+                university_tier: uni.map(|(_, t)| t.clone()),
+                interaction_status: None,
+                super_liked_you: None,
+            },
+        );
+    }
+    cards
 }
 
 fn get_photos_from_row(row: &DiscoverUserRow) -> Vec<String> {

@@ -28,3 +28,5 @@ pub mod shadow_scoring;
 pub mod matchmaker;
 // GNN graph-structure embeddings (offline-trained, served as a pairwise score)
 pub mod gnn;
+// Visual (photo) compatibility embeddings
+pub mod visual;

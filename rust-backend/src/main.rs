@@ -183,6 +183,8 @@ use handlers::{
     },
     // GNN embedding worker
     gnn::{export_edges as gnn_export_edges, upsert_embeddings as gnn_upsert_embeddings},
+    // Visual embedding worker
+    visual::{recompute_embeddings as visual_recompute, upsert_embeddings as visual_upsert},
 };
 
 async fn metrics_middleware(
@@ -546,6 +548,21 @@ async fn main() {
         } else {
             None
         };
+        // StoreKit 2 JWS verification (App Store Server API) — enabled when all
+        // three App Store Connect key fields are present.
+        let apple_server_api = if !config.apple_issuer_id.is_empty()
+            && !config.apple_key_id.is_empty()
+            && !config.apple_private_key.is_empty()
+        {
+            Some(services::payments::apple::AppStoreServerConfig {
+                issuer_id: config.apple_issuer_id.clone(),
+                key_id: config.apple_key_id.clone(),
+                private_key_pem: config.apple_private_key.clone(),
+                production: config.apple_api_production,
+            })
+        } else {
+            None
+        };
 
         let service = PaymentService::new(
             razorpay_key_id,
@@ -555,6 +572,7 @@ async fn main() {
             stripe_webhook,
             apple_shared_secret,
             apple_bundle_id,
+            apple_server_api,
         );
 
         if service.has_razorpay() || service.has_stripe() || service.has_apple() {
@@ -1265,6 +1283,9 @@ async fn main() {
         // GNN embedding worker (offline-trained graph embeddings)
         .route("/admin/gnn/edges", get(gnn_export_edges))
         .route("/admin/gnn/embeddings", post(gnn_upsert_embeddings))
+        // Visual (photo) embedding worker
+        .route("/admin/visual/recompute", post(visual_recompute))
+        .route("/admin/visual/embeddings", post(visual_upsert))
         // ML Computation Endpoints
         .route("/ml/rl/rank", post(handlers::ml_rank_candidates))
         .route("/ml/linucb/score", post(handlers::ml_linucb_score))

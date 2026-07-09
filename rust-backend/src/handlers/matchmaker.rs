@@ -26,30 +26,27 @@ pub async fn get_auto_suggestions(
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
 
-    let rows = sqlx::query_as::<_, (i32, i64, f64, Option<String>, Option<String>)>(
-        r#"
-        SELECT a.id, a.candidate_id, a.mutual_score, u.name, u.profile_photo_url
-        FROM auto_match_suggestions a
-        JOIN users u ON u.id = a.candidate_id
-        WHERE a.user_id = $1 AND a.status = 'pending'
-        ORDER BY a.mutual_score DESC
-        LIMIT 20
-        "#,
+    let rows = sqlx::query_as::<_, (i32, i64, f64)>(
+        "SELECT id, candidate_id, mutual_score FROM auto_match_suggestions \
+         WHERE user_id = $1 AND status = 'pending' ORDER BY mutual_score DESC LIMIT 20",
     )
     .bind(user_id as i64)
     .fetch_all(state.read_pool())
     .await?;
 
+    // Enrich with full DiscoverProfile cards so the client renders like discover.
+    let ids: Vec<i32> = rows.iter().map(|(_, cid, _)| *cid as i32).collect();
+    let cards = crate::handlers::fetch_profile_cards(&state, &ids).await;
+
     let suggestions: Vec<Value> = rows
         .into_iter()
-        .map(|(id, candidate_id, score, name, photo)| {
-            json!({
+        .filter_map(|(id, candidate_id, score)| {
+            let profile = cards.get(&(candidate_id as i32))?;
+            Some(json!({
                 "suggestion_id": id,
-                "candidate_id": candidate_id,
                 "score": score,
-                "name": name,
-                "photo": photo,
-            })
+                "profile": profile,
+            }))
         })
         .collect();
 
@@ -188,12 +185,27 @@ pub async fn agent_matchmaker_prompt(
         (None, None) => return Err(AppError::bad_request("Provide `intent` or `filters`")),
     };
 
-    let candidates = crate::services::matchmaker::agent_query(&state, user_id, &filters).await;
+    let scored = crate::services::matchmaker::agent_query(&state, user_id, &filters).await;
 
-    Ok(Json(json!({
-        "filters": filters,
-        "candidates": candidates,
-    })))
+    // Enrich with DiscoverProfile cards so results render like the discover feed.
+    let ids: Vec<i32> = scored.iter().map(|c| c.candidate_id as i32).collect();
+    let cards = crate::handlers::fetch_profile_cards(&state, &ids).await;
+
+    let candidates: Vec<Value> = scored
+        .into_iter()
+        .filter_map(|c| {
+            let profile = cards.get(&(c.candidate_id as i32))?;
+            Some(json!({
+                "candidate_id": c.candidate_id,
+                "mutual_score": c.mutual_score,
+                "forward_score": c.forward_score,
+                "reverse_score": c.reverse_score,
+                "profile": profile,
+            }))
+        })
+        .collect();
+
+    Ok(Json(json!({ "filters": filters, "candidates": candidates })))
 }
 
 /// POST /admin/matches/auto/run — trigger a matchmaking round.

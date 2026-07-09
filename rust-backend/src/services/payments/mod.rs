@@ -313,6 +313,7 @@ impl PaymentService {
         stripe_webhook_secret: Option<String>,
         apple_shared_secret: Option<String>,
         apple_bundle_id: Option<String>,
+        apple_server_api: Option<apple::AppStoreServerConfig>,
     ) -> Self {
         let razorpay = match (razorpay_key_id, razorpay_key_secret) {
             (Some(key_id), Some(key_secret)) => {
@@ -328,11 +329,17 @@ impl PaymentService {
             _ => None,
         };
 
-        // Apple only needs the shared secret to verify receipts. The bundle id
-        // is an optional extra guard (defaults to empty = no bundle check).
-        let apple = apple_shared_secret.map(|secret| {
-            apple::AppleClient::new(secret, apple_bundle_id.unwrap_or_default())
-        });
+        // Apple is enabled if either legacy receipt verification (shared secret)
+        // or StoreKit 2 JWS verification (App Store Server API) is configured.
+        let apple = if apple_shared_secret.is_some() || apple_server_api.is_some() {
+            Some(apple::AppleClient::new(
+                apple_shared_secret.unwrap_or_default(),
+                apple_bundle_id.unwrap_or_default(),
+                apple_server_api,
+            ))
+        } else {
+            None
+        };
 
         Self { razorpay, stripe, apple }
     }
@@ -398,6 +405,23 @@ impl PaymentService {
     /// Check if Apple receipt verification is configured
     pub fn has_apple(&self) -> bool {
         self.apple.is_some()
+    }
+
+    /// Whether StoreKit 2 JWS verification (App Store Server API) is configured.
+    pub fn has_apple_server_api(&self) -> bool {
+        self.apple.as_ref().map(|a| a.has_server_api()).unwrap_or(false)
+    }
+
+    /// Verify a StoreKit 2 signed transaction (JWS) via the App Store Server API.
+    pub async fn verify_apple_transaction(
+        &self,
+        jws: &str,
+    ) -> Result<Vec<apple::VerifiedTransaction>, AppError> {
+        let apple = self
+            .apple
+            .as_ref()
+            .ok_or_else(|| AppError::internal("Apple not configured"))?;
+        apple.verify_signed_transaction(jws).await
     }
 
     /// Verify an Apple App Store receipt server-side. Returns the transactions
