@@ -16,6 +16,8 @@ pub mod gnn;
 pub mod visual;
 // CoreML photo search + attestation verification
 pub mod clip;
+// /uploads streaming proxy for S3-backed media storage
+pub mod media;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -454,11 +456,6 @@ pub async fn update_profile(
     let mut attractiveness_count = 0;
     let mut rejection_reason = String::new();
 
-    let upload_dir = &state.config.upload_dir;
-    fs::create_dir_all(upload_dir)
-        .await
-        .map_err(|_| AppError::internal("Failed to create upload directory"))?;
-
     for (idx, bytes) in raw_photos.into_iter() {
         let photo_slot = format!("profile_photo_{}", idx);
 
@@ -486,7 +483,7 @@ pub async fn update_profile(
                 );
             }
             // Clean up any files already saved in this request
-            cleanup_files(&saved_paths).await;
+            cleanup_files(&state.storage, &saved_paths).await;
             return Err(AppError::bad_request(&rejection_reason));
         }
 
@@ -507,11 +504,10 @@ pub async fn update_profile(
             Utc::now().timestamp(),
             Uuid::new_v4()
         );
-        let path = Path::new(upload_dir).join(&filename);
         let jpeg_bytes = encode_jpeg(image)
             .map_err(|_| AppError::internal("Failed to encode image"))?;
-        if let Err(err) = fs::write(&path, &jpeg_bytes).await {
-            cleanup_files(&saved_paths).await;
+        if let Err(err) = state.storage.put_key(&filename, &jpeg_bytes, "image/jpeg").await {
+            cleanup_files(&state.storage, &saved_paths).await;
             return Err(AppError::internal(format!(
                 "Failed to save photo: {err}"
             )));
@@ -633,7 +629,7 @@ pub async fn update_profile(
     .await?;
 
     if result.rows_affected() == 0 {
-        cleanup_files(&saved_paths).await;
+        cleanup_files(&state.storage, &saved_paths).await;
         return Err(AppError::not_found("User not found"));
     }
 
@@ -812,13 +808,7 @@ pub async fn upload_voice_intro(
 
                 let bytes = read_binary_field(&mut field, 5 * 1024 * 1024).await?; // 5MB max
 
-                // Save the file
-                let upload_dir = &state.config.upload_dir;
-                let voice_dir = Path::new(upload_dir).join("voice");
-                fs::create_dir_all(&voice_dir)
-                    .await
-                    .map_err(|_| AppError::internal("Failed to create voice directory"))?;
-
+                // Save the file (disk or object store)
                 let ext = if content_type.contains("webm") { "webm" }
                     else if content_type.contains("mp4") || content_type.contains("m4a") { "m4a" }
                     else { "mp3" };
@@ -828,9 +818,10 @@ pub async fn upload_voice_intro(
                     Utc::now().timestamp(),
                     ext
                 );
-                let path = voice_dir.join(&filename);
-
-                fs::write(&path, bytes)
+                let stored_ct = if content_type.is_empty() { "audio/mpeg" } else { content_type.as_str() };
+                state
+                    .storage
+                    .put_key(&format!("voice/{}", filename), &bytes, stored_ct)
                     .await
                     .map_err(|_| AppError::internal("Failed to save voice file"))?;
 
@@ -3152,18 +3143,14 @@ pub async fn verify_student_document(
         return Err(AppError::bad_request("Document exceeds 10MB limit"));
     }
 
-    // Store document — save to local uploads dir (production: use S3/GCS)
-    let uploads_dir = std::path::Path::new("uploads/verification");
-    tokio::fs::create_dir_all(uploads_dir).await
-        .map_err(|e| AppError::Internal(format!("Failed to create upload dir: {}", e)))?;
-
+    // Store document via the storage backend (disk or object store)
     let file_ext = "jpg"; // Default; could detect from magic bytes
     let file_name = format!("vdoc_{}_{}.{}", user_id, uuid::Uuid::new_v4(), file_ext);
-    let file_path = uploads_dir.join(&file_name);
-    tokio::fs::write(&file_path, &doc_bytes).await
+    let doc_key = format!("verification/{}", file_name);
+    state.storage.put_key(&doc_key, &doc_bytes, "image/jpeg").await
         .map_err(|e| AppError::Internal(format!("Failed to store document: {}", e)))?;
 
-    let storage_path = file_path.to_string_lossy().to_string();
+    let storage_path = format!("/uploads/{}", doc_key);
     let retention_days = 90i64;
     let expires_at = Utc::now().naive_utc() + chrono::Duration::days(retention_days);
 
@@ -3211,8 +3198,8 @@ pub async fn verify_student_document(
     if let Some(selfie) = selfie_bytes {
         if !selfie.is_empty() {
             let selfie_name = format!("vdoc_selfie_{}_{}.jpg", user_id, uuid::Uuid::new_v4());
-            let selfie_path = uploads_dir.join(&selfie_name);
-            let _ = tokio::fs::write(&selfie_path, &selfie).await;
+            let selfie_key = format!("verification/{}", selfie_name);
+            let _ = state.storage.put_key(&selfie_key, &selfie, "image/jpeg").await;
             let _ = sqlx::query(r#"
                 INSERT INTO verification_documents
                     (user_id, verification_id, doc_type, storage_path, review_status, expires_at)
@@ -3220,7 +3207,7 @@ pub async fn verify_student_document(
             "#)
             .bind(user_id)
             .bind(verification_id)
-            .bind(selfie_path.to_string_lossy().as_ref())
+            .bind(format!("/uploads/{}", selfie_key))
             .bind(expires_at)
             .execute(&state.db)
             .await;
@@ -3283,14 +3270,11 @@ pub async fn verify_alumni_degree(
 
     // Store document — derive extension from magic bytes so HEIC/PNG/PDF are all preserved
     let ext = detect_image_ext(&file_bytes);
-    let uploads_dir = std::path::Path::new("uploads/verification/alumni");
-    tokio::fs::create_dir_all(uploads_dir).await
-        .map_err(|e| AppError::Internal(format!("Upload dir error: {}", e)))?;
     let file_name = format!("alumni_degree_{}_{}_{}.{}", user_id, uuid::Uuid::new_v4(), Utc::now().timestamp(), ext);
-    let file_path = uploads_dir.join(&file_name);
-    tokio::fs::write(&file_path, &file_bytes).await
+    let doc_key = format!("verification/alumni/{}", file_name);
+    state.storage.put_key(&doc_key, &file_bytes, crate::storage::guess_content_type(&doc_key)).await
         .map_err(|e| AppError::Internal(format!("Failed to store file: {}", e)))?;
-    let doc_path = file_path.to_string_lossy().to_string();
+    let doc_path = format!("/uploads/{}", doc_key);
 
     let uni_name = university_name.as_deref().unwrap_or("Unknown University");
     let expires_at = (Utc::now() + chrono::Duration::days(90)).naive_utc();
@@ -3696,16 +3680,11 @@ async fn save_base64_banner(
     encoder.encode(&rgb, rgb.width(), rgb.height(), ColorType::Rgb8.into())
         .map_err(|_| AppError::internal("banner: jpeg encode failed"))?;
 
-    let banner_dir = Path::new(&state.config.upload_dir).join("banners");
-    fs::create_dir_all(&banner_dir).await
-        .map_err(|_| AppError::internal("banner: mkdir failed"))?;
-
     let filename = format!(
         "{}_{}_{}_{}.jpg",
         prefix, user_id, Utc::now().timestamp(), Uuid::new_v4()
     );
-    let path = banner_dir.join(&filename);
-    fs::write(&path, &jpeg_bytes).await
+    state.storage.put_key(&format!("banners/{}", filename), &jpeg_bytes, "image/jpeg").await
         .map_err(|_| AppError::internal("banner: write failed"))?;
 
     Ok(Some(format!("/uploads/banners/{}", filename)))
@@ -3796,16 +3775,11 @@ pub async fn upload_banner(
     encoder.encode(&rgb, rgb.width(), rgb.height(), ColorType::Rgb8.into())
         .map_err(|_| AppError::internal("banner: jpeg encode failed"))?;
 
-    let banner_dir = Path::new(&state.config.upload_dir).join("banners");
-    fs::create_dir_all(&banner_dir).await
-        .map_err(|_| AppError::internal("banner: mkdir failed"))?;
-
     let filename = format!(
         "upload_{}_{}_{}.jpg",
         user_id, Utc::now().timestamp(), Uuid::new_v4()
     );
-    let path = banner_dir.join(&filename);
-    fs::write(&path, &jpeg_bytes).await
+    state.storage.put_key(&format!("banners/{}", filename), &jpeg_bytes, "image/jpeg").await
         .map_err(|_| AppError::internal("banner: write failed"))?;
 
     let url = format!("/uploads/banners/{}", filename);
@@ -3938,6 +3912,16 @@ pub async fn create_spot(
     fs::write(&path, &video_bytes)
         .await
         .map_err(|_| AppError::internal("Failed to save video"))?;
+    // Object store: publish the original so playback works even before (or
+    // without) HLS. The local copy stays as ffmpeg scratch. put_key_vec moves
+    // the buffer — no double-buffering of large videos.
+    if state.storage.is_s3() {
+        state
+            .storage
+            .put_key_vec(&filename, video_bytes, &mime)
+            .await
+            .map_err(|_| AppError::internal("Failed to save video"))?;
+    }
 
     // Calculate expiry
     let expires_at = if is_premium {
@@ -3972,6 +3956,8 @@ pub async fn create_spot(
         let db_clone = state.db.clone();
         let upload_dir_clone = state.config.upload_dir.clone();
         let disk_path_clone = path.clone();
+        let storage_clone = state.storage.clone();
+        let original_key = filename.clone();
         tokio::spawn(async move {
             let _ = sqlx::query("UPDATE spots SET hls_state = 'processing' WHERE id = $1")
                 .bind(spot_id)
@@ -4006,6 +3992,20 @@ pub async fn create_spot(
 
             match result {
                 Ok(hls_url) => {
+                    // Publish HLS segments + (possibly normalized) original to
+                    // the object store before flipping hls_state, so the proxy
+                    // can serve every URL the client is about to request.
+                    if storage_clone.is_s3() {
+                        let hls_local = format!("{}/spots/hls/{}", upload_dir_clone, spot_id);
+                        let n = storage_clone
+                            .sync_dir(&hls_local, &format!("spots/hls/{}", spot_id))
+                            .await;
+                        tracing::info!("Spot {}: uploaded {} HLS files to object store", spot_id, n);
+                        if let Ok(bytes) = fs::read(&disk_path_clone).await {
+                            let ct = crate::storage::guess_content_type(&original_key);
+                            let _ = storage_clone.put_key_vec(&original_key, bytes, ct).await;
+                        }
+                    }
                     let _ = sqlx::query(
                         "UPDATE spots SET hls_url = $1, hls_state = 'ready' WHERE id = $2",
                     )
@@ -6384,17 +6384,13 @@ pub async fn verify_selfie(
 
     let mut best_similarity: Option<f32> = None;
     for path in photo_paths {
-        // photo_paths are URL paths like "/uploads/photos/123.jpg";
-        // strip the leading "/uploads" prefix and resolve against upload_dir
-        let relative = path.trim_start_matches("/uploads/");
-        let disk_path = format!("{}/{}", state.config.upload_dir, relative);
-        let bytes = match fs::read(&disk_path).await {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
+        // photo_paths are URL paths like "/uploads/photos/123.jpg"; strip the
+        // "/uploads" prefix to get the storage key (disk or object store).
+        let key = path.trim_start_matches("/uploads/");
+        let bytes = match state.storage.get_bytes(key, state.config.max_photo_bytes).await {
+            Some(bytes) => bytes,
+            None => continue,
         };
-        if bytes.len() > state.config.max_photo_bytes {
-            continue;
-        }
         let result = match analyze_photo_bytes(vision.clone(), bytes).await {
             Ok(photo) => photo,
             Err(_) => continue,
@@ -6679,9 +6675,13 @@ fn encode_jpeg(image: &DynamicImage) -> Result<Vec<u8>, AppError> {
     Ok(buffer)
 }
 
-async fn cleanup_files(paths: &[String]) {
+/// Remove already-saved uploads after a mid-request failure. Paths are the
+/// stored "/uploads/{key}" form; deletion goes through the storage backend
+/// (disk or object store).
+async fn cleanup_files(storage: &crate::storage::StorageService, paths: &[String]) {
     for path in paths {
-        let _ = fs::remove_file(path).await;
+        let key = path.trim_start_matches("/uploads/");
+        let _ = storage.delete(key).await;
     }
 }
 
@@ -8085,6 +8085,15 @@ pub async fn upload_reel_video(
             }
             file.flush().await.map_err(|_| AppError::internal("Failed to flush video"))?;
 
+            // Object store: publish after the streamed write completes so the
+            // /uploads proxy can serve it (local file is scratch on Railway).
+            if state.storage.is_s3() {
+                let bytes = fs::read(&path).await
+                    .map_err(|_| AppError::internal("Failed to read video back"))?;
+                state.storage.put_key_vec(&filename, bytes, &ct).await
+                    .map_err(|_| AppError::internal("Failed to store video"))?;
+            }
+
             disk_path = Some(filename);
         } else {
             while field.chunk().await.map_err(|_| AppError::bad_request("Read error"))?.is_some() {}
@@ -8174,8 +8183,18 @@ pub async fn create_reel(
         .await
         .map_err(|_| AppError::internal("Failed to save video"))?;
 
-    // Free the in-memory video buffer immediately after writing to disk
-    drop(video_data);
+    // Object store: publish the original (moved, not copied) so playback works
+    // even before HLS. In local mode just free the buffer as before.
+    if state.storage.is_s3() {
+        state
+            .storage
+            .put_key_vec(&filename, video_data, &mime)
+            .await
+            .map_err(|_| AppError::internal("Failed to save video"))?;
+    } else {
+        // Free the in-memory video buffer immediately after writing to disk
+        drop(video_data);
+    }
 
     let video_url = format!("/uploads/{}", filename);
 
@@ -8265,6 +8284,8 @@ pub async fn create_reel(
         let db_clone = state.db.clone();
         let upload_dir_clone = upload_dir.clone();
         let disk_path_clone = disk_path.clone();
+        let storage_clone = state.storage.clone();
+        let original_key = filename.clone();
         tokio::spawn(async move {
             let _ = sqlx::query("UPDATE reels SET hls_state = 'processing' WHERE id = $1")
                 .bind(reel_id)
@@ -8291,50 +8312,48 @@ pub async fn create_reel(
                 }
             };
 
-            if needs_normalize {
+            let (result, pipeline) = if needs_normalize {
                 // Fallback two-step: normalize first, then HLS
                 if let Err(e) = crate::hls::normalize_video(&disk_path_clone).await {
                     tracing::warn!("Normalization failed for reel {} (proceeding with original): {}", reel_id, e);
                 }
-                match crate::hls::transcode_to_hls(reel_id, &disk_path_clone, &upload_dir_clone, "reels").await {
-                    Ok(hls_url) => {
-                        let _ = sqlx::query(
-                            "UPDATE reels SET hls_url = $1, hls_state = 'ready' WHERE id = $2",
-                        )
-                        .bind(&hls_url)
-                        .bind(reel_id)
-                        .execute(&db_clone)
-                        .await;
-                        tracing::info!("HLS ready for reel {} in {:.1}s (two-pass): {}", reel_id, start.elapsed().as_secs_f64(), hls_url);
-                    }
-                    Err(e) => {
-                        let _ = sqlx::query("UPDATE reels SET hls_state = 'failed' WHERE id = $1")
-                            .bind(reel_id)
-                            .execute(&db_clone)
-                            .await;
-                        tracing::warn!("HLS failed for reel {}: {}", reel_id, e);
-                    }
-                }
+                (crate::hls::transcode_to_hls(reel_id, &disk_path_clone, &upload_dir_clone, "reels").await, "two-pass")
             } else {
                 // Fast path: single-pass normalize + HLS (no double encode)
-                match crate::hls::normalize_and_hls(reel_id, &disk_path_clone, &upload_dir_clone, "reels").await {
-                    Ok(hls_url) => {
-                        let _ = sqlx::query(
-                            "UPDATE reels SET hls_url = $1, hls_state = 'ready' WHERE id = $2",
-                        )
-                        .bind(&hls_url)
+                (crate::hls::normalize_and_hls(reel_id, &disk_path_clone, &upload_dir_clone, "reels").await, "single-pass")
+            };
+
+            match result {
+                Ok(hls_url) => {
+                    // Publish HLS segments + (possibly normalized) original to
+                    // the object store before flipping hls_state, so the proxy
+                    // can serve every URL the client is about to request.
+                    if storage_clone.is_s3() {
+                        let hls_local = format!("{}/reels/hls/{}", upload_dir_clone, reel_id);
+                        let n = storage_clone
+                            .sync_dir(&hls_local, &format!("reels/hls/{}", reel_id))
+                            .await;
+                        tracing::info!("Reel {}: uploaded {} HLS files to object store", reel_id, n);
+                        if let Ok(bytes) = fs::read(&disk_path_clone).await {
+                            let ct = crate::storage::guess_content_type(&original_key);
+                            let _ = storage_clone.put_key_vec(&original_key, bytes, ct).await;
+                        }
+                    }
+                    let _ = sqlx::query(
+                        "UPDATE reels SET hls_url = $1, hls_state = 'ready' WHERE id = $2",
+                    )
+                    .bind(&hls_url)
+                    .bind(reel_id)
+                    .execute(&db_clone)
+                    .await;
+                    tracing::info!("HLS ready for reel {} in {:.1}s ({}): {}", reel_id, start.elapsed().as_secs_f64(), pipeline, hls_url);
+                }
+                Err(e) => {
+                    let _ = sqlx::query("UPDATE reels SET hls_state = 'failed' WHERE id = $1")
                         .bind(reel_id)
                         .execute(&db_clone)
                         .await;
-                        tracing::info!("HLS ready for reel {} in {:.1}s (single-pass): {}", reel_id, start.elapsed().as_secs_f64(), hls_url);
-                    }
-                    Err(e) => {
-                        let _ = sqlx::query("UPDATE reels SET hls_state = 'failed' WHERE id = $1")
-                            .bind(reel_id)
-                            .execute(&db_clone)
-                            .await;
-                        tracing::warn!("HLS failed for reel {}: {}", reel_id, e);
-                    }
+                    tracing::warn!("HLS failed for reel {}: {}", reel_id, e);
                 }
             }
         });

@@ -65,8 +65,9 @@ rand = "0.8"
 thiserror = "1.0"
 validator = { version = "0.16", features = ["derive"] }
 
-# HTTP Client (for S3, external APIs)
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# HTTP Client (for S3, external APIs). "stream" feeds object-store bodies
+# straight through the /uploads proxy without buffering whole videos in RAM.
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 
 # Crypto (for AWS Signature V4, CloudFront signing)
 sha2 = "0.10"
