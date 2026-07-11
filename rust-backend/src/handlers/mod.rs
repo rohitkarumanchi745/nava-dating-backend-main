@@ -14,6 +14,8 @@ pub mod matchmaker;
 pub mod gnn;
 // Visual embedding worker endpoints
 pub mod visual;
+// CoreML photo search + attestation verification
+pub mod clip;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -6323,16 +6325,12 @@ pub async fn verify_selfie(
 ) -> Result<Json<Value>, AppError> {
     let token = extract_bearer_token(&headers)?;
     let user_id = decode_access_token(&token, &state.config.secret_key)?;
-    let vision = state
-        .vision
-        .as_ref()
-        .ok_or_else(|| {
-            state.metrics.inc_vision_unavailable();
-            AppError::service_unavailable("Vision service is not available. Try again later.")
-        })?
-        .clone();
 
+    // Read the upload FIRST, always draining the request body. Rejecting before
+    // consuming a multi-MB upload makes the client see a dropped connection
+    // (URLSession -1005) instead of a clean HTTP status.
     let mut selfie_bytes: Option<Vec<u8>> = None;
+    let mut wrong_content_type = false;
 
     while let Some(mut field) = multipart
         .next_field()
@@ -6347,13 +6345,31 @@ pub async fn verify_selfie(
             .map(|value| value.to_string())
             .unwrap_or_default();
         if !content_type.starts_with("image/") {
-            return Err(AppError::bad_request("Selfie must be an image"));
+            // Drain this field's bytes before we bail, so the body is consumed.
+            wrong_content_type = true;
+            let _ = read_binary_field(&mut field, state.config.max_photo_bytes).await;
+            continue;
         }
         selfie_bytes = Some(read_binary_field(&mut field, state.config.max_photo_bytes).await?);
     }
 
+    if wrong_content_type && selfie_bytes.is_none() {
+        return Err(AppError::bad_request("Selfie must be an image"));
+    }
     let selfie_bytes =
         selfie_bytes.ok_or_else(|| AppError::bad_request("selfie is required"))?;
+
+    // Now that the body is fully read, check that vision is available. If the
+    // ONNX models aren't deployed, this returns a clean 503 (not a dropped conn).
+    let vision = state
+        .vision
+        .as_ref()
+        .ok_or_else(|| {
+            state.metrics.inc_vision_unavailable();
+            AppError::service_unavailable("Photo verification is temporarily unavailable.")
+        })?
+        .clone();
+
     let selfie_result = analyze_photo_bytes(vision.clone(), selfie_bytes).await?;
     let selfie_analysis = selfie_result.analysis.ok_or_else(|| AppError::internal("Vision analysis failed"))?;
 

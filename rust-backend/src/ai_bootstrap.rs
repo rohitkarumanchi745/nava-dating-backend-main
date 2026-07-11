@@ -83,10 +83,22 @@ pub async fn ensure_ai_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
             model_version INTEGER NOT NULL DEFAULT 1,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
         "CREATE INDEX IF NOT EXISTS idx_visual_emb_version ON user_visual_embeddings(model_version)",
+        // --- CoreML CLIP photo search (036) --- requires the pgvector extension
+        "CREATE EXTENSION IF NOT EXISTS vector",
+        "CREATE TABLE IF NOT EXISTS user_clip_embeddings (
+            user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            embedding vector(512) NOT NULL,
+            model_version TEXT NOT NULL DEFAULT 'mobileclip_s2',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+        "CREATE INDEX IF NOT EXISTS idx_clip_emb_hnsw ON user_clip_embeddings USING hnsw (embedding vector_cosine_ops)",
     ];
 
+    // Per-statement error isolation: a failure (e.g. pgvector not installed)
+    // logs and continues instead of blocking the other tables.
     for stmt in STATEMENTS {
-        sqlx::query(stmt).execute(pool).await?;
+        if let Err(e) = sqlx::query(stmt).execute(pool).await {
+            warn!("ensure_ai_schema: statement skipped ({e})");
+        }
     }
     Ok(())
 }
