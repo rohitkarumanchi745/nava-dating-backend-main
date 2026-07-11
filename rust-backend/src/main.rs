@@ -185,6 +185,8 @@ use handlers::{
     gnn::{export_edges as gnn_export_edges, upsert_embeddings as gnn_upsert_embeddings},
     // Visual embedding worker
     visual::{recompute_embeddings as visual_recompute, upsert_embeddings as visual_upsert},
+    // CoreML photo search + attestation
+    clip::{verify_attestation, upsert_clip_embedding, search_photos},
 };
 
 async fn metrics_middleware(
@@ -1286,6 +1288,10 @@ async fn main() {
         // Visual (photo) embedding worker
         .route("/admin/visual/recompute", post(visual_recompute))
         .route("/admin/visual/embeddings", post(visual_upsert))
+        // CoreML photo search + on-device verification
+        .route("/verify/attestation", post(verify_attestation))
+        .route("/me/clip-embedding", post(upsert_clip_embedding))
+        .route("/search/photos", post(search_photos))
         // ML Computation Endpoints
         .route("/ml/rl/rank", post(handlers::ml_rank_candidates))
         .route("/ml/linucb/score", post(handlers::ml_linucb_score))
