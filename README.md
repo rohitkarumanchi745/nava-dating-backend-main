@@ -1095,6 +1095,36 @@ cd ambassador-dashboard
 npm install && npm run dev
 ```
 
+## Media Storage (MinIO / S3)
+
+By default uploads are written to local disk (`UPLOAD_DIR`, served at `/uploads`).
+On Railway the container filesystem is **ephemeral** — every deploy wipes user
+photos, voice intros, reels and HLS output. Production must point storage at an
+S3-compatible object store; MinIO is the self-hosted option (Railway template +
+attached Volume), and the same configuration works for Cloudflare R2 or AWS S3.
+
+```bash
+STORAGE_BACKEND=s3
+S3_ENDPOINT=http://minio.railway.internal:9000   # MinIO private-network URL (omit for AWS)
+S3_BUCKET=nava-media
+S3_ACCESS_KEY=...                                # MINIO_ROOT_USER
+S3_SECRET_KEY=...                                # MINIO_ROOT_PASSWORD
+```
+
+Design notes:
+- The backend speaks AWS Signature V4 directly (no AWS SDK dependency); a
+  custom `S3_ENDPOINT` switches to path-style addressing, which is what MinIO
+  expects. The bucket is created automatically at boot.
+- Clients are unaffected: the DB keeps storing relative `/uploads/...` paths
+  and the API serves them either from disk (local mode) or by streaming from
+  the object store through `GET /uploads/{key}` (S3 mode), with HTTP Range
+  passthrough so video seeking keeps working.
+- ffmpeg still transcodes HLS on local scratch; segments and playlists are
+  uploaded to the store when the transcode finishes, before `hls_state` flips
+  to `ready`.
+- Integration test (spins against a throwaway MinIO container):
+  `cargo test --bin telugu-dating-backend minio_roundtrip -- --ignored`
+
 ## Deployment (AWS EKS)
 
 ### Development (in-cluster databases)

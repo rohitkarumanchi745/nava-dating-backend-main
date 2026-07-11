@@ -63,6 +63,7 @@ pub const PREMIUM_CACHE_TTL: u64 = 600;   // 10 min
 use crate::config::Config;
 use crate::models::CallSession;
 use crate::redis_service::RedisService;
+use crate::storage::StorageService;
 use crate::vision::VisionAnalyzer;
 use crate::services::graph_service::GraphService;
 use crate::services::graph::GraphAbstraction;
@@ -88,6 +89,9 @@ pub struct AppState {
     pub graph: Arc<GraphAbstraction>,
     pub dual_write: Arc<DualWriteManager>,
     pub config: Config,
+    /// Media storage: local disk (dev) or S3-compatible object store
+    /// (MinIO/R2/S3) so uploads survive Railway's ephemeral filesystem.
+    pub storage: Arc<StorageService>,
     pub vision: Option<Arc<Mutex<VisionAnalyzer>>>,
     pub chat_rooms: Arc<RwLock<ChatRooms>>,
     pub call_sessions: Arc<RwLock<CallSessions>>,

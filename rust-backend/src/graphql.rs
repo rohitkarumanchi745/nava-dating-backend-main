@@ -1439,8 +1439,6 @@ impl MutationRoot {
 
         // Handle uploaded photo files — run full pipeline (resize, NSFW, EXIF strip, quality)
         let mut uploaded_urls: Vec<String> = Vec::new();
-        let upload_dir = &state.config.upload_dir;
-        tokio::fs::create_dir_all(upload_dir).await.ok();
 
         for (slot_idx, upload) in photos.into_iter().enumerate() {
             let upload_value = upload.value(ctx)?;
@@ -1495,8 +1493,9 @@ impl MutationRoot {
             ).is_err() { continue; }
 
             let unique_name = format!("{}_photo_{}_{}.jpg", user_id, slot_idx + 1, uuid::Uuid::new_v4());
-            let file_path = std::path::Path::new(upload_dir).join(&unique_name);
-            tokio::fs::write(&file_path, &jpeg_bytes).await.ok();
+            if state.storage.put_key_vec(&unique_name, jpeg_bytes, "image/jpeg").await.is_err() {
+                continue;
+            }
 
             let photo_url = format!("/uploads/{}", unique_name);
             uploaded_urls.push(photo_url);

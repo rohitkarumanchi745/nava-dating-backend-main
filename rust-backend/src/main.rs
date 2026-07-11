@@ -651,6 +651,18 @@ async fn main() {
         router
     };
 
+    // Media storage: local disk by default; STORAGE_BACKEND=s3 + S3_ENDPOINT
+    // points at MinIO/R2/S3 so uploads survive Railway's ephemeral filesystem.
+    let storage_config = storage::StorageConfig::from_env();
+    let storage_is_s3 = storage_config.is_s3();
+    let media_storage = Arc::new(storage::StorageService::new(storage_config));
+    if storage_is_s3 {
+        media_storage.ensure_bucket().await;
+        info!("media storage: S3-compatible object store");
+    } else {
+        info!("media storage: local disk (uploads are lost on redeploy — use STORAGE_BACKEND=s3 in production)");
+    }
+
     let state = AppState {
         db,
         db_read: db_read_replica,
@@ -659,6 +671,7 @@ async fn main() {
         graph: graph_abstraction,
         dual_write: dual_write.clone(),
         config,
+        storage: media_storage,
         vision,
         chat_rooms: Arc::new(RwLock::new(chat_rooms)),
         call_sessions: Arc::new(RwLock::new(call_sessions)),
@@ -1007,12 +1020,20 @@ async fn main() {
     };
 
     // Build the application with middleware stack
-    // Ensure uploads directory exists
+    // Ensure uploads directory exists (local fallback / scratch)
     tokio::fs::create_dir_all(&upload_dir).await.ok();
 
+    // Media serving: S3 mode streams objects from MinIO/R2/S3 through the API
+    // (same /uploads/... paths as before); local mode serves straight from disk.
+    let uploads_router: Router<Arc<AppState>> = if storage_is_s3 {
+        Router::new().route("/uploads/{*key}", get(handlers::media::serve_upload))
+    } else {
+        Router::new().nest_service("/uploads", ServeDir::new(&upload_dir))
+    };
+
     let app = Router::new()
-        // Static file serving for uploaded photos
-        .nest_service("/uploads", ServeDir::new(&upload_dir))
+        // Static file serving for uploaded photos (disk or object store)
+        .merge(uploads_router)
         // Health & Metrics (enhanced for load balancers)
         .route("/health", get(health))
         .route("/health/detailed", get(health_detailed))  // Detailed health for monitoring
