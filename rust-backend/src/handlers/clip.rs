@@ -162,7 +162,14 @@ pub async fn search_photos(
                (e.embedding <=> $2::vector)::float8 AS dist
         FROM user_clip_embeddings e
         JOIN users u ON u.id = e.user_id
-        WHERE u.is_verified = TRUE AND u.is_active = TRUE AND u.id <> $1
+        WHERE u.is_active = TRUE AND u.id <> $1
+          -- Pool = verified profiles ∪ the viewer's own matches, so an
+          -- unverified match still surfaces (they get the full dating profile
+          -- via the match-gated path; unverified non-matches are excluded).
+          AND (u.is_verified = TRUE
+               OR EXISTS(SELECT 1 FROM matches m
+                         WHERE (m.user1_id = $1 AND m.user2_id = u.id)
+                            OR (m.user1_id = u.id AND m.user2_id = $1)))
           AND NOT EXISTS (
               SELECT 1 FROM swipes s
               WHERE s.from_user_id = $1 AND s.to_user_id = u.id AND s.action = 'block')

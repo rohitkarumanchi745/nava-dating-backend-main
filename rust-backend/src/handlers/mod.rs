@@ -13369,6 +13369,38 @@ pub async fn get_user_profile(
         target.show_verified_name,
     );
 
+    // Professional-only privacy gate for global search surfaces.
+    // Photo search / Visual span ALL verified users — a broader pool than the
+    // viewer's filtered discover feed — so a non-match reached via search must
+    // see only professional fields, never the dating bio or dating photos.
+    // Discover, reels, and every other surface are unchanged.
+    let professional_only = matches!(source.as_str(), "search" | "visual" | "clip")
+        && interaction_status != "matched";
+
+    if professional_only {
+        return Ok(Json(json!({
+            "profile": {
+                "id": target.id,
+                "name": public_name,
+                "study": target.profession_title,
+                "is_verified": target.is_verified.unwrap_or(false),
+                "city": target.city,
+                "country": uni_info.map(|(_, _, country)| country.clone()),
+                "university": uni_info.map(|(name, _, _)| name.clone()),
+                "university_tier": uni_info.map(|(_, tier, _)| format_tier(tier)),
+                "distance": distance_km,
+                "distance_text": distance_km.map(format_distance),
+                "interaction_status": interaction_status,
+                "is_match": false,
+                "professional_only": true,
+                "can_message": can_message,
+                "can_like": interaction_status == "none"
+            },
+            "source": source,
+            "is_premium": is_premium
+        })));
+    }
+
     Ok(Json(json!({
         "profile": {
             "id": target.id,
