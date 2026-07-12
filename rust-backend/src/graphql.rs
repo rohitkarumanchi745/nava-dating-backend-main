@@ -1423,19 +1423,53 @@ impl MutationRoot {
                 .await?;
         }
 
-        // Filter out placeholder strings (start with #) and base64 data URIs.
-        // Only accept URL paths (/uploads/...) or full https:// URLs.
-        // If iOS accidentally sends base64 image data as a string, reject it here
-        // rather than storing a multi-MB data URI in the profile_photo_N column.
+        // profile_photo_N accepts two forms:
+        // - URL paths ("/uploads/..." or "https://...") — kept as-is (a photo
+        //   the user didn't change this round)
+        // - base64 data URIs ("data:image/jpeg;base64,...") — actual photo
+        //   uploads from the client: decoded and run through the same
+        //   pipeline + object storage as file uploads, slot-preserving.
+        //   (These were previously dropped silently, losing the photos.)
+        // Placeholder strings (starting with #) are ignored.
         let is_valid_photo_url = |p: &str| -> bool {
             !p.is_empty()
                 && !p.starts_with('#')
                 && !p.starts_with("data:")
                 && (p.starts_with('/') || p.starts_with("http"))
         };
-        let clean_photo_1 = profile_photo_1.filter(|p| is_valid_photo_url(p));
-        let clean_photo_2 = profile_photo_2.filter(|p| is_valid_photo_url(p));
-        let clean_photo_3 = profile_photo_3.filter(|p| is_valid_photo_url(p));
+        let clean_photo_1 = profile_photo_1.clone().filter(|p| is_valid_photo_url(p));
+        let clean_photo_2 = profile_photo_2.clone().filter(|p| is_valid_photo_url(p));
+        let clean_photo_3 = profile_photo_3.clone().filter(|p| is_valid_photo_url(p));
+
+        // Decode + store base64 data URIs per slot. Failures are loud (GraphQL
+        // errors), not silent drops — the client must know its photo was lost.
+        let mut slot_urls: [Option<String>; 3] = [None, None, None];
+        for (idx, raw) in [&profile_photo_1, &profile_photo_2, &profile_photo_3]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(s) = raw.as_deref() else { continue };
+            if !s.starts_with("data:") {
+                continue;
+            }
+            let b64 = s.split_once(',').map(|(_, tail)| tail).unwrap_or("");
+            let bytes = {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .map_err(|_| Error::new(format!("Photo {}: invalid base64 data URI", idx + 1)))?
+            };
+            if bytes.len() > state.config.max_photo_bytes {
+                return Err(Error::new(format!(
+                    "Photo {} exceeds the {}MB limit",
+                    idx + 1,
+                    state.config.max_photo_bytes / 1024 / 1024
+                )));
+            }
+            slot_urls[idx] =
+                process_and_store_profile_photo(state, user_id, idx, bytes).await?;
+        }
+        let [slot_url_1, slot_url_2, slot_url_3] = slot_urls;
 
         // Handle uploaded photo files — run full pipeline (resize, NSFW, EXIF strip, quality)
         let mut uploaded_urls: Vec<String> = Vec::new();
@@ -1448,67 +1482,22 @@ impl MutationRoot {
             let mut content = Vec::new();
             std::io::Read::read_to_end(&mut reader, &mut content).ok();
 
-            if content.is_empty() { continue; }
-
-            use crate::services::photo_pipeline::{run_pipeline, PhotoVerdict, PipelineTimeouts};
-            use image::ImageEncoder;
-
-            let photo_slot = format!("profile_photo_{}", slot_idx + 1);
-            let pipeline_timeouts = PipelineTimeouts::default();
-
-            let pipeline_result = match run_pipeline(
-                content,
-                user_id as i32,
-                &photo_slot,
-                state.vision.clone(),
-                state.moderation.clone(),
-                &state.db,
-                &pipeline_timeouts,
-            ).await {
-                Ok(r) => r,
-                Err(e) => return Err(async_graphql::Error::new(format!("Photo processing failed: {}", e))),
-            };
-
-            if pipeline_result.verdict == PhotoVerdict::Rejected {
-                let reason = pipeline_result.stages.iter()
-                    .find(|s| !s.passed)
-                    .and_then(|s| s.detail.as_deref())
-                    .unwrap_or("policy violation");
-                return Err(async_graphql::Error::new(format!("Photo {} rejected: {}", slot_idx + 1, reason)));
+            if let Some(url) =
+                process_and_store_profile_photo(state, user_id, slot_idx, content).await?
+            {
+                uploaded_urls.push(url);
             }
-
-            let image = match pipeline_result.processed_image.as_ref() {
-                Some(img) => img,
-                None => continue,
-            };
-
-            // Encode to JPEG
-            let mut jpeg_bytes = Vec::new();
-            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_bytes, 85);
-            if encoder.encode(
-                image.as_bytes(),
-                image.width(),
-                image.height(),
-                image.color().into(),
-            ).is_err() { continue; }
-
-            let unique_name = format!("{}_photo_{}_{}.jpg", user_id, slot_idx + 1, uuid::Uuid::new_v4());
-            if state.storage.put_key_vec(&unique_name, jpeg_bytes, "image/jpeg").await.is_err() {
-                continue;
-            }
-
-            let photo_url = format!("/uploads/{}", unique_name);
-            uploaded_urls.push(photo_url);
         }
 
         // Build photo array maintaining position order:
         // - If clean_photo_N is a valid URL string, use it
-        // - If clean_photo_N is None but we have uploads, use next upload for that position
+        // - Else if the slot carried a data URI, use its freshly stored URL
+        // - Else if we have file uploads, use the next upload for that position
         // This allows users to replace individual photos while keeping others
         let mut upload_iter = uploaded_urls.into_iter();
-        let final_photo_1 = clean_photo_1.clone().or_else(|| upload_iter.next());
-        let final_photo_2 = clean_photo_2.clone().or_else(|| upload_iter.next());
-        let final_photo_3 = clean_photo_3.clone().or_else(|| upload_iter.next());
+        let final_photo_1 = clean_photo_1.clone().or(slot_url_1).or_else(|| upload_iter.next());
+        let final_photo_2 = clean_photo_2.clone().or(slot_url_2).or_else(|| upload_iter.next());
+        let final_photo_3 = clean_photo_3.clone().or(slot_url_3).or_else(|| upload_iter.next());
 
         // Collect non-None photos in order
         let mut all_photos: Vec<String> = Vec::new();
@@ -2255,4 +2244,74 @@ pub fn build_schema(state: AppState) -> AppSchema {
         .limit_depth(7)         // Max nesting depth (user->matches->partner->... max 7 levels)
         // ====================================================================
         .finish()
+}
+
+// ============================================================================
+// Photo processing helper (GraphQL update_profile)
+// ============================================================================
+
+/// Run one profile photo through the full pipeline (resize, NSFW, EXIF strip,
+/// quality) and persist it via the storage backend (disk or object store).
+/// Returns the public "/uploads/{key}" URL, Ok(None) on soft failures
+/// (encode/store), or a GraphQL error when the photo is rejected by policy.
+/// Shared by the Upload-file path and the base64 data-URI path.
+pub(crate) async fn process_and_store_profile_photo(
+    state: &AppState,
+    user_id: i64,
+    slot_idx: usize,
+    content: Vec<u8>,
+) -> Result<Option<String>, async_graphql::Error> {
+    use crate::services::photo_pipeline::{run_pipeline, PhotoVerdict, PipelineTimeouts};
+
+    if content.is_empty() {
+        return Ok(None);
+    }
+
+    let photo_slot = format!("profile_photo_{}", slot_idx + 1);
+    let pipeline_timeouts = PipelineTimeouts::default();
+
+    let pipeline_result = match run_pipeline(
+        content,
+        user_id as i32,
+        &photo_slot,
+        state.vision.clone(),
+        state.moderation.clone(),
+        &state.db,
+        &pipeline_timeouts,
+    ).await {
+        Ok(r) => r,
+        Err(e) => return Err(async_graphql::Error::new(format!("Photo processing failed: {}", e))),
+    };
+
+    if pipeline_result.verdict == PhotoVerdict::Rejected {
+        let reason = pipeline_result.stages.iter()
+            .find(|s| !s.passed)
+            .and_then(|s| s.detail.as_deref())
+            .unwrap_or("policy violation");
+        return Err(async_graphql::Error::new(format!("Photo {} rejected: {}", slot_idx + 1, reason)));
+    }
+
+    let image = match pipeline_result.processed_image.as_ref() {
+        Some(img) => img,
+        None => return Ok(None),
+    };
+
+    // Encode to JPEG
+    let mut jpeg_bytes = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_bytes, 85);
+    if encoder.encode(
+        image.as_bytes(),
+        image.width(),
+        image.height(),
+        image.color().into(),
+    ).is_err() {
+        return Ok(None);
+    }
+
+    let unique_name = format!("{}_photo_{}_{}.jpg", user_id, slot_idx + 1, uuid::Uuid::new_v4());
+    if state.storage.put_key_vec(&unique_name, jpeg_bytes, "image/jpeg").await.is_err() {
+        return Ok(None);
+    }
+
+    Ok(Some(format!("/uploads/{}", unique_name)))
 }
