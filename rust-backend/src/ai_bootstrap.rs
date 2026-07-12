@@ -91,6 +91,13 @@ pub async fn ensure_ai_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
             model_version TEXT NOT NULL DEFAULT 'mobileclip_s2',
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
         "CREATE INDEX IF NOT EXISTS idx_clip_emb_hnsw ON user_clip_embeddings USING hnsw (embedding vector_cosine_ops)",
+        // --- Face dedup / fake-profile detection (037) ---
+        "CREATE TABLE IF NOT EXISTS user_face_embeddings (
+            user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            embedding vector(512) NOT NULL,
+            photo_key TEXT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+        "CREATE INDEX IF NOT EXISTS idx_face_emb_hnsw ON user_face_embeddings USING hnsw (embedding vector_cosine_ops)",
     ];
 
     // Per-statement error isolation: a failure (e.g. pgvector not installed)

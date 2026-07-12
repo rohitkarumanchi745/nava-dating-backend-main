@@ -2314,8 +2314,8 @@ pub(crate) async fn process_and_store_profile_photo(
     if state.storage.put_key_vec(&unique_name, jpeg_bytes, "image/jpeg").await.is_err() {
         return Ok(None);
     }
-    // Anti-fraud: async celebrity / stolen-photo screening (Rekognition)
-    crate::handlers::spawn_celebrity_screen(state, user_id, unique_name.clone(), screen_copy);
+    // Anti-fraud: async duplicate-face + optional celebrity screening
+    crate::handlers::spawn_photo_fraud_screen(state, user_id, unique_name.clone(), screen_copy);
 
     Ok(Some(format!("/uploads/{}", unique_name)))
 }

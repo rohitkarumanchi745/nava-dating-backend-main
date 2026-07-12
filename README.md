@@ -1142,16 +1142,28 @@ photos. Three backends, tried in order:
    in v1 (slightly below Rekognition accuracy).
 2. **AWS Rekognition CompareFaces** — managed, no RAM cost, ~$0.001/image.
    Enabled automatically when the S3 credentials are present
-   (`REKOGNITION_ENABLED=false` to turn off). Also powers
-   celebrity/stolen-photo screening on photo uploads (`RecognizeCelebrities`,
-   flags to `trust_safety_events` at `CELEB_MATCH_MIN_CONFIDENCE`, default
-   90) — that screening has no self-hosted equivalent, since it requires a
-   curated celebrity face gallery.
+   (`REKOGNITION_ENABLED=false` to turn off).
 3. **Legacy ONNX vision** (`VISION_ENABLED`) — the original style-embedding
    comparison; kept only for compatibility.
 
 Liveness is asserted by the on-device flow (`/verify/attestation`); a still
 image can't prove liveness server-side.
+
+### Fake-profile detection at photo upload
+
+Every stored profile photo is screened asynchronously (flags go to
+`trust_safety_events` for review; uploads are never auto-blocked):
+
+- **Duplicate-face detection** (self-hosted, needs `FACE_VERIFY_ONNX=1`):
+  the photo's ArcFace embedding is upserted into `user_face_embeddings`
+  (pgvector) and ANN-searched against all other accounts — the same face on
+  two accounts is the classic stolen-photo / fake-profile signal. Threshold
+  `FACE_DUP_THRESHOLD` (cosine, default 0.5); flags as
+  `flag_duplicate_face` with the matching user ids + similarities.
+- **Celebrity screening** (opt-in: `CELEB_SCREENING_ENABLED=1`, needs
+  Rekognition): `RecognizeCelebrities` at `CELEB_MATCH_MIN_CONFIDENCE`
+  (default 90), flags as `flag_celebrity_photo`. Off by default; it requires
+  a curated celebrity gallery no self-hosted model provides.
 
 ## Deployment (AWS EKS)
 

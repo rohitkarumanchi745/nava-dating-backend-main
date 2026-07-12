@@ -512,8 +512,8 @@ pub async fn update_profile(
                 "Failed to save photo: {err}"
             )));
         }
-        // Anti-fraud: async celebrity / stolen-photo screening (Rekognition)
-        spawn_celebrity_screen(&state, user_id as i64, filename.clone(), jpeg_bytes.clone());
+        // Anti-fraud: async duplicate-face + optional celebrity screening
+        spawn_photo_fraud_screen(&state, user_id as i64, filename.clone(), jpeg_bytes.clone());
         // Store URL path (not filesystem path) so it's directly usable by clients
         saved_paths.push(format!("/uploads/{}", filename));
 
@@ -6827,17 +6827,112 @@ async fn selfie_match_onnx(
     Ok((best.clamp(0.0, 1.0), 1.0, reasons))
 }
 
-/// Fire-and-forget celebrity / stolen-photo screening on a freshly uploaded
-/// profile photo. High-confidence Rekognition celebrity matches are logged as
-/// trust & safety events for review — the upload itself is not blocked (false
-/// positives, look-alikes, and verified public figures are all possible).
-/// No-op when Rekognition isn't configured.
-pub(crate) fn spawn_celebrity_screen(
+/// Fire-and-forget anti-fraud screening on a freshly uploaded profile photo.
+/// Flags go to trust_safety_events for review — uploads are never blocked
+/// (twins, shared photos, and look-alikes exist).
+///
+/// 1. Duplicate-face detection (self-hosted, needs FACE_VERIFY_ONNX): embed
+///    the face with ArcFace, upsert into user_face_embeddings, and ANN-search
+///    for the same face on OTHER accounts — the classic stolen-photo /
+///    fake-profile pattern. Threshold FACE_DUP_THRESHOLD (cosine, default 0.5).
+/// 2. Celebrity screening (Rekognition, opt-in with CELEB_SCREENING_ENABLED=1).
+pub(crate) fn spawn_photo_fraud_screen(
     state: &AppState,
     user_id: i64,
     photo_key: String,
     jpeg_bytes: Vec<u8>,
 ) {
+    // ── 1. Duplicate face across accounts (self-hosted ONNX + pgvector) ────
+    if let Some(fv) = state.face_verifier.clone() {
+        let db = state.db.clone();
+        let metrics = state.metrics.clone();
+        let key = photo_key.clone();
+        let bytes = jpeg_bytes.clone();
+        let dup_threshold: f64 = std::env::var("FACE_DUP_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.5);
+
+        tokio::spawn(async move {
+            let emb = match tokio::task::spawn_blocking(move || fv.face_embedding(&bytes)).await {
+                Ok(Ok(Some(e))) => e,
+                Ok(Ok(None)) => return, // no face in this photo
+                Ok(Err(e)) => {
+                    tracing::warn!("face dedup embed failed for user {user_id}: {e}");
+                    return;
+                }
+                Err(_) => return,
+            };
+            let vec_str = clip::to_pgvector(&emb);
+
+            // Store/refresh this user's face identity (embeddings are
+            // L2-normalized, so pgvector cosine distance is exact).
+            let _ = sqlx::query(
+                "INSERT INTO user_face_embeddings (user_id, embedding, photo_key, updated_at) \
+                 VALUES ($1, $2::vector, $3, NOW()) \
+                 ON CONFLICT (user_id) DO UPDATE SET \
+                    embedding = EXCLUDED.embedding, photo_key = EXCLUDED.photo_key, updated_at = NOW()",
+            )
+            .bind(user_id)
+            .bind(&vec_str)
+            .bind(&key)
+            .execute(&db)
+            .await;
+
+            // Same face on other accounts?
+            let dupes = sqlx::query_as::<_, (i64, f64)>(
+                "SELECT user_id, (1 - (embedding <=> $1::vector))::float8 AS sim \
+                 FROM user_face_embeddings \
+                 WHERE user_id <> $2 AND (1 - (embedding <=> $1::vector)) >= $3 \
+                 ORDER BY embedding <=> $1::vector \
+                 LIMIT 5",
+            )
+            .bind(&vec_str)
+            .bind(user_id)
+            .bind(dup_threshold)
+            .fetch_all(&db)
+            .await
+            .unwrap_or_default();
+
+            if dupes.is_empty() {
+                return;
+            }
+            metrics.inc_trust_safety_flags();
+            tracing::warn!(
+                "Duplicate-face flag: user {} photo {} matches accounts {:?}",
+                user_id,
+                key,
+                dupes
+            );
+            let signals = json!({
+                "type": "duplicate_face_across_accounts",
+                "photo": key,
+                "matches": dupes
+                    .iter()
+                    .map(|(uid, sim)| json!({ "user_id": uid, "similarity": sim }))
+                    .collect::<Vec<_>>(),
+            });
+            let _ = sqlx::query(
+                r#"INSERT INTO trust_safety_events
+                       (user_id, risk_score, signals, action_taken, trace_id, created_at)
+                   VALUES ($1, $2, $3, 'flag_duplicate_face', $4, NOW())"#,
+            )
+            .bind(user_id as i32)
+            .bind(0.9_f64)
+            .bind(&signals)
+            .bind(Uuid::new_v4().to_string())
+            .execute(&db)
+            .await;
+        });
+    }
+
+    // ── 2. Celebrity screening (opt-in; needs a gallery only Rekognition has) ─
+    let celeb_enabled = std::env::var("CELEB_SCREENING_ENABLED")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if !celeb_enabled {
+        return;
+    }
     let Some(rek) = state.rekognition.clone() else { return };
     let db = state.db.clone();
     let metrics = state.metrics.clone();
