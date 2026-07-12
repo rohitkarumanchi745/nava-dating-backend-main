@@ -6370,8 +6370,20 @@ pub async fn verify_selfie(
         return Err(AppError::bad_request("Complete your profile first"));
     }
 
-    let (face_match_score, liveness_score, mut failure_reasons) = if let Some(rek) =
-        state.rekognition.clone()
+    // ── Preferred: self-hosted ONNX pipeline (UltraFace + ArcFace) ─────────
+    // Free and on-box. Internal errors fall through to Rekognition / legacy
+    // vision below; a definitive "no face in selfie" does not.
+    let mut onnx_result: Option<(f32, f32, Vec<&'static str>)> = None;
+    if let Some(fv) = state.face_verifier.clone() {
+        match selfie_match_onnx(&state, fv, selfie_bytes.clone(), &photo_paths).await {
+            Ok(r) => onnx_result = Some(r),
+            Err(e) => tracing::warn!("ONNX face verify unavailable ({e}); falling back"),
+        }
+    }
+
+    let (face_match_score, liveness_score, mut failure_reasons) = if let Some(r) = onnx_result {
+        r
+    } else if let Some(rek) = state.rekognition.clone()
     {
         // ── Authoritative path: AWS Rekognition CompareFaces ────────────────
         // Selfie vs each stored profile photo; best similarity wins. The
@@ -6755,6 +6767,64 @@ async fn cleanup_files(storage: &crate::storage::StorageService, paths: &[String
         let key = path.trim_start_matches("/uploads/");
         let _ = storage.delete(key).await;
     }
+}
+
+/// Self-hosted selfie face-match: UltraFace detect + ArcFace embeddings +
+/// cosine similarity against each stored profile photo. Returns
+/// (face_match_score, liveness placeholder, failure_reasons). Err means the
+/// pipeline couldn't produce a verdict (model failure, no usable profile
+/// photos) and the caller should fall back to Rekognition / legacy vision.
+async fn selfie_match_onnx(
+    state: &AppState,
+    fv: std::sync::Arc<crate::services::face_verify::FaceVerifier>,
+    selfie_bytes: Vec<u8>,
+    photo_paths: &[String],
+) -> Result<(f32, f32, Vec<&'static str>), String> {
+    use crate::services::face_verify::cosine;
+
+    // Inference is CPU-bound — keep it off the async runtime.
+    let fv_selfie = fv.clone();
+    let selfie_emb =
+        tokio::task::spawn_blocking(move || fv_selfie.face_embedding(&selfie_bytes))
+            .await
+            .map_err(|e| e.to_string())??;
+
+    let Some(selfie_emb) = selfie_emb else {
+        // Definitive verdict: the pipeline ran and found no face in the selfie.
+        return Ok((0.0, 1.0, vec!["no_face_detected"]));
+    };
+
+    let mut best: Option<f32> = None;
+    for path in photo_paths {
+        let key = path.trim_start_matches("/uploads/");
+        let Some(bytes) = state
+            .storage
+            .get_bytes(key, state.config.max_photo_bytes)
+            .await
+        else {
+            continue;
+        };
+        let fv_photo = fv.clone();
+        let emb = match tokio::task::spawn_blocking(move || fv_photo.face_embedding(&bytes)).await
+        {
+            Ok(Ok(Some(e))) => e,
+            _ => continue,
+        };
+        let sim = cosine(&selfie_emb, &emb);
+        if best.map(|b| sim > b).unwrap_or(true) {
+            best = Some(sim);
+        }
+    }
+    let Some(best) = best else {
+        return Err("no usable face in any profile photo".into());
+    };
+
+    let mut reasons = Vec::new();
+    if best < fv.match_threshold {
+        reasons.push("face_mismatch");
+    }
+    // Liveness is asserted by the on-device flow; report cosine clamped to 0..1.
+    Ok((best.clamp(0.0, 1.0), 1.0, reasons))
 }
 
 /// Fire-and-forget celebrity / stolen-photo screening on a freshly uploaded

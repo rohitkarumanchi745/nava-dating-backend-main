@@ -672,6 +672,11 @@ async fn main() {
         info!("rekognition: disabled (no AWS credentials or REKOGNITION_ENABLED=false)");
     }
 
+    // Self-hosted ONNX face verification (FACE_VERIFY_ONNX=1): preferred over
+    // Rekognition for the selfie face-match when loaded. Downloads its model
+    // files at boot when missing (ephemeral filesystems re-fetch per deploy).
+    let face_verifier = services::face_verify::FaceVerifier::from_env().await.map(Arc::new);
+
     let state = AppState {
         db,
         db_read: db_read_replica,
@@ -682,6 +687,7 @@ async fn main() {
         config,
         storage: media_storage,
         rekognition,
+        face_verifier,
         vision,
         chat_rooms: Arc::new(RwLock::new(chat_rooms)),
         call_sessions: Arc::new(RwLock::new(call_sessions)),

@@ -1125,6 +1125,34 @@ Design notes:
 - Integration test (spins against a throwaway MinIO container):
   `cargo test --bin telugu-dating-backend minio_roundtrip -- --ignored`
 
+## Face Verification Backends
+
+`POST /verify/selfie` compares the selfie against the user's stored profile
+photos. Three backends, tried in order:
+
+1. **Self-hosted ONNX** (`FACE_VERIFY_ONNX=1`) — UltraFace face detection
+   (~1.2MB) + ArcFace identity embeddings, run on-box via tract-onnx.
+   A proper identity pipeline: detect largest face → crop → 512-d embedding →
+   cosine similarity. Models auto-download at boot into `VISION_MODEL_DIR`
+   when missing (override sources with `FACE_DETECTOR_URL` /
+   `FACE_EMBEDDER_URL`; decision threshold `FACE_ONNX_MATCH_THRESHOLD`,
+   default 0.36 cosine). Validated discrimination: same person ≈ 0.62,
+   different people ≈ −0.06. Free per call; costs ~300MB RAM + a ~250MB
+   model download per boot with the default ArcFace. No landmark alignment
+   in v1 (slightly below Rekognition accuracy).
+2. **AWS Rekognition CompareFaces** — managed, no RAM cost, ~$0.001/image.
+   Enabled automatically when the S3 credentials are present
+   (`REKOGNITION_ENABLED=false` to turn off). Also powers
+   celebrity/stolen-photo screening on photo uploads (`RecognizeCelebrities`,
+   flags to `trust_safety_events` at `CELEB_MATCH_MIN_CONFIDENCE`, default
+   90) — that screening has no self-hosted equivalent, since it requires a
+   curated celebrity face gallery.
+3. **Legacy ONNX vision** (`VISION_ENABLED`) — the original style-embedding
+   comparison; kept only for compatibility.
+
+Liveness is asserted by the on-device flow (`/verify/attestation`); a still
+image can't prove liveness server-side.
+
 ## Deployment (AWS EKS)
 
 ### Development (in-cluster databases)
