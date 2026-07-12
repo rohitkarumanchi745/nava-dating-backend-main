@@ -663,6 +663,15 @@ async fn main() {
         info!("media storage: local disk (uploads are lost on redeploy — use STORAGE_BACKEND=s3 in production)");
     }
 
+    // Rekognition rides on the same AWS credentials: authoritative selfie
+    // face-match (/verify/selfie) + celebrity screening on photo uploads.
+    let rekognition = services::rekognition::Rekognition::from_env().map(Arc::new);
+    if rekognition.is_some() {
+        info!("rekognition: enabled (selfie face-match + celebrity screening)");
+    } else {
+        info!("rekognition: disabled (no AWS credentials or REKOGNITION_ENABLED=false)");
+    }
+
     let state = AppState {
         db,
         db_read: db_read_replica,
@@ -672,6 +681,7 @@ async fn main() {
         dual_write: dual_write.clone(),
         config,
         storage: media_storage,
+        rekognition,
         vision,
         chat_rooms: Arc::new(RwLock::new(chat_rooms)),
         call_sessions: Arc::new(RwLock::new(call_sessions)),

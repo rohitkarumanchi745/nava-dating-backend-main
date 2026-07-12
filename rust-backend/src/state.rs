@@ -69,6 +69,7 @@ use crate::services::graph_service::GraphService;
 use crate::services::graph::GraphAbstraction;
 use crate::services::payments::PaymentService;
 use crate::services::ads::AdsService;
+use crate::services::rekognition::Rekognition;
 use crate::services::trust_safety::TrustSafetyService;
 use crate::services::moderation::ModerationPipeline;
 use crate::middleware::dual_write::DualWriteManager;
@@ -92,6 +93,9 @@ pub struct AppState {
     /// Media storage: local disk (dev) or S3-compatible object store
     /// (MinIO/R2/S3) so uploads survive Railway's ephemeral filesystem.
     pub storage: Arc<StorageService>,
+    /// AWS Rekognition: authoritative selfie face-match + celebrity screening.
+    /// None when AWS credentials aren't configured.
+    pub rekognition: Option<Arc<Rekognition>>,
     pub vision: Option<Arc<Mutex<VisionAnalyzer>>>,
     pub chat_rooms: Arc<RwLock<ChatRooms>>,
     pub call_sessions: Arc<RwLock<CallSessions>>,

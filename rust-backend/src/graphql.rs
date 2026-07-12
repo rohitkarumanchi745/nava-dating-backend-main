@@ -2309,9 +2309,13 @@ pub(crate) async fn process_and_store_profile_photo(
     }
 
     let unique_name = format!("{}_photo_{}_{}.jpg", user_id, slot_idx + 1, uuid::Uuid::new_v4());
+    // Keep a copy for async anti-fraud screening; the original moves into storage.
+    let screen_copy = jpeg_bytes.clone();
     if state.storage.put_key_vec(&unique_name, jpeg_bytes, "image/jpeg").await.is_err() {
         return Ok(None);
     }
+    // Anti-fraud: async celebrity / stolen-photo screening (Rekognition)
+    crate::handlers::spawn_celebrity_screen(state, user_id, unique_name.clone(), screen_copy);
 
     Ok(Some(format!("/uploads/{}", unique_name)))
 }
