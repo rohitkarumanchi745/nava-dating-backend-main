@@ -693,7 +693,7 @@ pub fn guess_content_type(key: &str) -> &'static str {
     }
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Sha256, Digest};
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -712,11 +712,11 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
+pub(crate) fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
     hex::encode(hmac_sha256(key, data))
 }
 
-fn get_signature_key(secret: &str, date_stamp: &str, region: &str, service: &str) -> Vec<u8> {
+pub(crate) fn get_signature_key(secret: &str, date_stamp: &str, region: &str, service: &str) -> Vec<u8> {
     // AWS Signature V4 key derivation
     let k_date = hmac_sha256(format!("AWS4{}", secret).as_bytes(), date_stamp.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());

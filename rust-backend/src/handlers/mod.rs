@@ -512,6 +512,8 @@ pub async fn update_profile(
                 "Failed to save photo: {err}"
             )));
         }
+        // Anti-fraud: async duplicate-face + optional celebrity screening
+        spawn_photo_fraud_screen(&state, user_id as i64, filename.clone(), jpeg_bytes.clone());
         // Store URL path (not filesystem path) so it's directly usable by clients
         saved_paths.push(format!("/uploads/{}", filename));
 
@@ -6359,20 +6361,6 @@ pub async fn verify_selfie(
     let selfie_bytes =
         selfie_bytes.ok_or_else(|| AppError::bad_request("selfie is required"))?;
 
-    // Now that the body is fully read, check that vision is available. If the
-    // ONNX models aren't deployed, this returns a clean 503 (not a dropped conn).
-    let vision = state
-        .vision
-        .as_ref()
-        .ok_or_else(|| {
-            state.metrics.inc_vision_unavailable();
-            AppError::service_unavailable("Photo verification is temporarily unavailable.")
-        })?
-        .clone();
-
-    let selfie_result = analyze_photo_bytes(vision.clone(), selfie_bytes).await?;
-    let selfie_analysis = selfie_result.analysis.ok_or_else(|| AppError::internal("Vision analysis failed"))?;
-
     let user = fetch_user_by_id(&state.db, user_id)
         .await?
         .ok_or_else(|| AppError::not_found("User not found"))?;
@@ -6382,49 +6370,145 @@ pub async fn verify_selfie(
         return Err(AppError::bad_request("Complete your profile first"));
     }
 
-    let mut best_similarity: Option<f32> = None;
-    for path in photo_paths {
-        // photo_paths are URL paths like "/uploads/photos/123.jpg"; strip the
-        // "/uploads" prefix to get the storage key (disk or object store).
-        let key = path.trim_start_matches("/uploads/");
-        let bytes = match state.storage.get_bytes(key, state.config.max_photo_bytes).await {
-            Some(bytes) => bytes,
-            None => continue,
-        };
-        let result = match analyze_photo_bytes(vision.clone(), bytes).await {
-            Ok(photo) => photo,
-            Err(_) => continue,
-        };
-        if let Some(analysis) = result.analysis {
-            if let Some(similarity) =
-                cosine_similarity(&selfie_analysis.style_embedding, &analysis.style_embedding)
-            {
-                if best_similarity.map(|best| similarity > best).unwrap_or(true) {
-                    best_similarity = Some(similarity);
-                }
-            }
+    // ── Preferred: self-hosted ONNX pipeline (UltraFace + ArcFace) ─────────
+    // Free and on-box. Internal errors fall through to Rekognition / legacy
+    // vision below; a definitive "no face in selfie" does not.
+    let mut onnx_result: Option<(f32, f32, Vec<&'static str>)> = None;
+    if let Some(fv) = state.face_verifier.clone() {
+        match selfie_match_onnx(&state, fv, selfie_bytes.clone(), &photo_paths).await {
+            Ok(r) => onnx_result = Some(r),
+            Err(e) => tracing::warn!("ONNX face verify unavailable ({e}); falling back"),
         }
     }
 
-    let face_match_score = match best_similarity {
-        Some(score) => score,
-        None => return Err(AppError::bad_request("No valid photos found")),
-    };
-    let liveness_score = selfie_analysis.authenticity_score;
+    let (face_match_score, liveness_score, mut failure_reasons) = if let Some(r) = onnx_result {
+        r
+    } else if let Some(rek) = state.rekognition.clone()
+    {
+        // ── Authoritative path: AWS Rekognition CompareFaces ────────────────
+        // Selfie vs each stored profile photo; best similarity wins. The
+        // liveness signal stays with the on-device check (/verify/attestation
+        // + App Attest later) — a still image can't prove liveness server-side.
 
-    let mut failure_reasons = Vec::new();
-    if selfie_analysis.inappropriate_content {
-        failure_reasons.push("inappropriate_content");
-    }
-    if !selfie_analysis.face_detected {
-        failure_reasons.push("no_face_detected");
-    }
-    if face_match_score < state.config.selfie_match_threshold {
-        failure_reasons.push("face_mismatch");
-    }
-    if liveness_score < state.config.selfie_liveness_threshold {
-        failure_reasons.push("liveness_low");
-    }
+        // Rekognition accepts JPEG/PNG bytes only; iOS may send HEIC. Decode
+        // whatever arrived and re-encode as JPEG (also strips EXIF).
+        let selfie_img = image::load_from_memory(&selfie_bytes)
+            .map_err(|_| AppError::bad_request("Could not decode selfie image"))?;
+        let selfie_jpeg = encode_jpeg(&selfie_img)
+            .map_err(|_| AppError::internal("Failed to encode selfie"))?;
+
+        let mut best_similarity: Option<f32> = None;
+        let mut source_face_missing = false;
+        for path in &photo_paths {
+            // photo_paths are URL paths like "/uploads/photos/123.jpg"; strip
+            // the "/uploads" prefix to get the storage key (disk or object store).
+            let key = path.trim_start_matches("/uploads/");
+            let bytes = match state.storage.get_bytes(key, state.config.max_photo_bytes).await {
+                Some(bytes) => bytes,
+                None => continue,
+            };
+            match rek.compare_faces(&selfie_jpeg, &bytes, 50.0).await {
+                Ok(Some(similarity)) => {
+                    if best_similarity.map(|b| similarity > b).unwrap_or(true) {
+                        best_similarity = Some(similarity);
+                    }
+                }
+                Ok(None) => {
+                    // Faces detected, none matched above 50 — counts as a
+                    // comparison that ran; keep best_similarity at 0 floor.
+                    if best_similarity.is_none() {
+                        best_similarity = Some(0.0);
+                    }
+                }
+                Err(e) => {
+                    // InvalidParameterException = no detectable face in one of
+                    // the images. If it's the selfie, every photo will fail
+                    // the same way — flag it instead of erroring the request.
+                    if e.contains("InvalidParameter") {
+                        source_face_missing = true;
+                        continue;
+                    }
+                    tracing::warn!("Rekognition CompareFaces failed: {e}");
+                    return Err(AppError::service_unavailable(
+                        "Photo verification is temporarily unavailable.",
+                    ));
+                }
+            }
+        }
+
+        let mut reasons = Vec::new();
+        let score = match best_similarity {
+            Some(s) => s / 100.0, // Rekognition similarity is 0..100
+            None => {
+                if source_face_missing {
+                    reasons.push("no_face_detected");
+                } else {
+                    return Err(AppError::bad_request("No valid photos found"));
+                }
+                0.0
+            }
+        };
+        if score < state.config.selfie_match_threshold && !reasons.contains(&"no_face_detected") {
+            reasons.push("face_mismatch");
+        }
+        // Liveness is asserted by the on-device flow; not re-scored here.
+        (score, 1.0_f32, reasons)
+    } else if let Some(vision) = state.vision.clone() {
+        // ── Legacy path: local ONNX vision models (if deployed) ─────────────
+        let selfie_result = analyze_photo_bytes(vision.clone(), selfie_bytes).await?;
+        let selfie_analysis = selfie_result
+            .analysis
+            .ok_or_else(|| AppError::internal("Vision analysis failed"))?;
+
+        let mut best_similarity: Option<f32> = None;
+        for path in &photo_paths {
+            let key = path.trim_start_matches("/uploads/");
+            let bytes = match state.storage.get_bytes(key, state.config.max_photo_bytes).await {
+                Some(bytes) => bytes,
+                None => continue,
+            };
+            let result = match analyze_photo_bytes(vision.clone(), bytes).await {
+                Ok(photo) => photo,
+                Err(_) => continue,
+            };
+            if let Some(analysis) = result.analysis {
+                if let Some(similarity) =
+                    cosine_similarity(&selfie_analysis.style_embedding, &analysis.style_embedding)
+                {
+                    if best_similarity.map(|best| similarity > best).unwrap_or(true) {
+                        best_similarity = Some(similarity);
+                    }
+                }
+            }
+        }
+
+        let face_match_score = match best_similarity {
+            Some(score) => score,
+            None => return Err(AppError::bad_request("No valid photos found")),
+        };
+        let liveness_score = selfie_analysis.authenticity_score;
+
+        let mut reasons = Vec::new();
+        if selfie_analysis.inappropriate_content {
+            reasons.push("inappropriate_content");
+        }
+        if !selfie_analysis.face_detected {
+            reasons.push("no_face_detected");
+        }
+        if face_match_score < state.config.selfie_match_threshold {
+            reasons.push("face_mismatch");
+        }
+        if liveness_score < state.config.selfie_liveness_threshold {
+            reasons.push("liveness_low");
+        }
+        (face_match_score, liveness_score, reasons)
+    } else {
+        state.metrics.inc_vision_unavailable();
+        return Err(AppError::service_unavailable(
+            "Photo verification is temporarily unavailable.",
+        ));
+    };
+    failure_reasons.dedup();
 
     let verified = failure_reasons.is_empty();
     if verified {
@@ -6683,6 +6767,220 @@ async fn cleanup_files(storage: &crate::storage::StorageService, paths: &[String
         let key = path.trim_start_matches("/uploads/");
         let _ = storage.delete(key).await;
     }
+}
+
+/// Self-hosted selfie face-match: UltraFace detect + ArcFace embeddings +
+/// cosine similarity against each stored profile photo. Returns
+/// (face_match_score, liveness placeholder, failure_reasons). Err means the
+/// pipeline couldn't produce a verdict (model failure, no usable profile
+/// photos) and the caller should fall back to Rekognition / legacy vision.
+async fn selfie_match_onnx(
+    state: &AppState,
+    fv: std::sync::Arc<crate::services::face_verify::FaceVerifier>,
+    selfie_bytes: Vec<u8>,
+    photo_paths: &[String],
+) -> Result<(f32, f32, Vec<&'static str>), String> {
+    use crate::services::face_verify::cosine;
+
+    // Inference is CPU-bound — keep it off the async runtime.
+    let fv_selfie = fv.clone();
+    let selfie_emb =
+        tokio::task::spawn_blocking(move || fv_selfie.face_embedding(&selfie_bytes))
+            .await
+            .map_err(|e| e.to_string())??;
+
+    let Some(selfie_emb) = selfie_emb else {
+        // Definitive verdict: the pipeline ran and found no face in the selfie.
+        return Ok((0.0, 1.0, vec!["no_face_detected"]));
+    };
+
+    let mut best: Option<f32> = None;
+    for path in photo_paths {
+        let key = path.trim_start_matches("/uploads/");
+        let Some(bytes) = state
+            .storage
+            .get_bytes(key, state.config.max_photo_bytes)
+            .await
+        else {
+            continue;
+        };
+        let fv_photo = fv.clone();
+        let emb = match tokio::task::spawn_blocking(move || fv_photo.face_embedding(&bytes)).await
+        {
+            Ok(Ok(Some(e))) => e,
+            _ => continue,
+        };
+        let sim = cosine(&selfie_emb, &emb);
+        if best.map(|b| sim > b).unwrap_or(true) {
+            best = Some(sim);
+        }
+    }
+    let Some(best) = best else {
+        return Err("no usable face in any profile photo".into());
+    };
+
+    let mut reasons = Vec::new();
+    if best < fv.match_threshold {
+        reasons.push("face_mismatch");
+    }
+    // Liveness is asserted by the on-device flow; report cosine clamped to 0..1.
+    Ok((best.clamp(0.0, 1.0), 1.0, reasons))
+}
+
+/// Fire-and-forget anti-fraud screening on a freshly uploaded profile photo.
+/// Flags go to trust_safety_events for review — uploads are never blocked
+/// (twins, shared photos, and look-alikes exist).
+///
+/// 1. Duplicate-face detection (self-hosted, needs FACE_VERIFY_ONNX): embed
+///    the face with ArcFace, upsert into user_face_embeddings, and ANN-search
+///    for the same face on OTHER accounts — the classic stolen-photo /
+///    fake-profile pattern. Threshold FACE_DUP_THRESHOLD (cosine, default 0.5).
+/// 2. Celebrity screening (Rekognition, opt-in with CELEB_SCREENING_ENABLED=1).
+pub(crate) fn spawn_photo_fraud_screen(
+    state: &AppState,
+    user_id: i64,
+    photo_key: String,
+    jpeg_bytes: Vec<u8>,
+) {
+    // ── 1. Duplicate face across accounts (self-hosted ONNX + pgvector) ────
+    if let Some(fv) = state.face_verifier.clone() {
+        let db = state.db.clone();
+        let metrics = state.metrics.clone();
+        let key = photo_key.clone();
+        let bytes = jpeg_bytes.clone();
+        let dup_threshold: f64 = std::env::var("FACE_DUP_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.5);
+
+        tokio::spawn(async move {
+            let emb = match tokio::task::spawn_blocking(move || fv.face_embedding(&bytes)).await {
+                Ok(Ok(Some(e))) => e,
+                Ok(Ok(None)) => return, // no face in this photo
+                Ok(Err(e)) => {
+                    tracing::warn!("face dedup embed failed for user {user_id}: {e}");
+                    return;
+                }
+                Err(_) => return,
+            };
+            let vec_str = clip::to_pgvector(&emb);
+
+            // Store/refresh this user's face identity (embeddings are
+            // L2-normalized, so pgvector cosine distance is exact).
+            let _ = sqlx::query(
+                "INSERT INTO user_face_embeddings (user_id, embedding, photo_key, updated_at) \
+                 VALUES ($1, $2::vector, $3, NOW()) \
+                 ON CONFLICT (user_id) DO UPDATE SET \
+                    embedding = EXCLUDED.embedding, photo_key = EXCLUDED.photo_key, updated_at = NOW()",
+            )
+            .bind(user_id)
+            .bind(&vec_str)
+            .bind(&key)
+            .execute(&db)
+            .await;
+
+            // Same face on other accounts?
+            let dupes = sqlx::query_as::<_, (i64, f64)>(
+                "SELECT user_id, (1 - (embedding <=> $1::vector))::float8 AS sim \
+                 FROM user_face_embeddings \
+                 WHERE user_id <> $2 AND (1 - (embedding <=> $1::vector)) >= $3 \
+                 ORDER BY embedding <=> $1::vector \
+                 LIMIT 5",
+            )
+            .bind(&vec_str)
+            .bind(user_id)
+            .bind(dup_threshold)
+            .fetch_all(&db)
+            .await
+            .unwrap_or_default();
+
+            if dupes.is_empty() {
+                return;
+            }
+            metrics.inc_trust_safety_flags();
+            tracing::warn!(
+                "Duplicate-face flag: user {} photo {} matches accounts {:?}",
+                user_id,
+                key,
+                dupes
+            );
+            let signals = json!({
+                "type": "duplicate_face_across_accounts",
+                "photo": key,
+                "matches": dupes
+                    .iter()
+                    .map(|(uid, sim)| json!({ "user_id": uid, "similarity": sim }))
+                    .collect::<Vec<_>>(),
+            });
+            let _ = sqlx::query(
+                r#"INSERT INTO trust_safety_events
+                       (user_id, risk_score, signals, action_taken, trace_id, created_at)
+                   VALUES ($1, $2, $3, 'flag_duplicate_face', $4, NOW())"#,
+            )
+            .bind(user_id as i32)
+            .bind(0.9_f64)
+            .bind(&signals)
+            .bind(Uuid::new_v4().to_string())
+            .execute(&db)
+            .await;
+        });
+    }
+
+    // ── 2. Celebrity screening (opt-in; needs a gallery only Rekognition has) ─
+    let celeb_enabled = std::env::var("CELEB_SCREENING_ENABLED")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if !celeb_enabled {
+        return;
+    }
+    let Some(rek) = state.rekognition.clone() else { return };
+    let db = state.db.clone();
+    let metrics = state.metrics.clone();
+    let min_confidence: f32 = std::env::var("CELEB_MATCH_MIN_CONFIDENCE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(90.0);
+
+    tokio::spawn(async move {
+        match rek.recognize_celebrities(&jpeg_bytes).await {
+            Ok(hits) => {
+                let strong: Vec<_> = hits
+                    .into_iter()
+                    .filter(|h| h.confidence >= min_confidence)
+                    .collect();
+                if strong.is_empty() {
+                    return;
+                }
+                metrics.inc_trust_safety_flags();
+                tracing::warn!(
+                    "Celebrity photo flag: user {} photo {} matches {:?}",
+                    user_id,
+                    photo_key,
+                    strong.iter().map(|h| (&h.name, h.confidence)).collect::<Vec<_>>()
+                );
+                let signals = json!({
+                    "type": "celebrity_photo",
+                    "photo": photo_key,
+                    "matches": strong
+                        .iter()
+                        .map(|h| json!({ "name": h.name, "confidence": h.confidence }))
+                        .collect::<Vec<_>>(),
+                });
+                let _ = sqlx::query(
+                    r#"INSERT INTO trust_safety_events
+                           (user_id, risk_score, signals, action_taken, trace_id, created_at)
+                       VALUES ($1, $2, $3, 'flag_celebrity_photo', $4, NOW())"#,
+                )
+                .bind(user_id as i32)
+                .bind(0.9_f64)
+                .bind(&signals)
+                .bind(Uuid::new_v4().to_string())
+                .execute(&db)
+                .await;
+            }
+            Err(e) => tracing::warn!("celebrity screen failed for user {user_id}: {e}"),
+        }
+    });
 }
 
 /// Detect a safe file extension from the first few magic bytes.

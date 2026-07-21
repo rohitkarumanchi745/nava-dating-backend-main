@@ -19,7 +19,7 @@ use crate::{
 const CLIP_DIM: usize = 512;
 
 /// Format a float slice as a pgvector literal (`[1,2,3]`) to bind + cast `::vector`.
-fn to_pgvector(v: &[f32]) -> String {
+pub(crate) fn to_pgvector(v: &[f32]) -> String {
     let mut s = String::with_capacity(v.len() * 8);
     s.push('[');
     for (i, x) in v.iter().enumerate() {

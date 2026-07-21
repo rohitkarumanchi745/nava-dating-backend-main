@@ -30,3 +30,7 @@ pub mod matchmaker;
 pub mod gnn;
 // Visual (photo) compatibility embeddings
 pub mod visual;
+// AWS Rekognition (face compare + celebrity screening, SigV4, no SDK)
+pub mod rekognition;
+// Self-hosted ONNX face verification (UltraFace + ArcFace via tract)
+pub mod face_verify;
