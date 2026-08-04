@@ -164,57 +164,286 @@ The `Spots` feed is the first surface routed through it; `recommend_next_place`,
 
 ## Architecture
 
+A single Rust binary (Axum + Tokio) serving REST, GraphQL and WebSocket from one
+process — a modular monolith rather than a service mesh. Postgres is the system
+of record; Redis is a soft dependency the process degrades around.
+
+```mermaid
+flowchart TB
+    subgraph clients["Clients"]
+        ios["iOS — SwiftUI<br/>on-device MobileCLIP · BitNet · LoRA"]
+        rn["React Native"]
+    end
+
+    subgraph edge["Edge — tower-http layers"]
+        sec["security headers"]
+        rl["rate limit<br/>Redis sliding window"]
+        cors["CORS · trace · request-id<br/>timeout · gzip · body limit"]
+    end
+
+    subgraph app["Rust modular monolith — axum 0.8"]
+        rest["REST router<br/>~239 routes"]
+        gql["GraphQL<br/>async-graphql"]
+        ws["WebSocket<br/>/ws/chat · /ws/call · /ws/events"]
+        analytics["/analytics<br/>DataFusion SQL"]
+
+        subgraph domains["Domain handlers"]
+            auth["auth · profile"]
+            disc["discovery · matching"]
+            reels["reels · spots · playgrounds"]
+            chat["chat · calls"]
+            pay["payments · ads · ambassador"]
+            verif["verification · trust &amp; safety"]
+        end
+
+        bus["in-process EventBus<br/>tokio::broadcast"]
+        svc["services/<br/>matchmaker · ranking · graph · storage"]
+        mlr["ml/ — pure-Rust scoring<br/>LinUCB bandit · RL rank"]
+        vis["vision/ — ONNX CPU<br/>ArcFace · NSFW"]
+        jobs["tokio interval jobs<br/>decay · outbox · DLQ"]
+    end
+
+    subgraph data["Data layer"]
+        pg[("PostgreSQL 16<br/>primary")]
+        ro[("read replica<br/>health-gated")]
+        redis[("Redis<br/>soft dependency")]
+        s3[("S3 / MinIO<br/>media")]
+        ch[("ClickHouse<br/>event sink")]
+    end
+
+    subgraph ext["External"]
+        rek["AWS Rekognition<br/>CompareFaces"]
+        pays["Stripe · Razorpay<br/>Apple · RevenueCat"]
+        push["APNs · FCM"]
+    end
+
+    clients --> edge --> app
+    rest --> domains
+    gql --> domains
+    domains --> svc --> pg
+    svc --> ro
+    svc --> mlr
+    svc --> vis
+    domains --> bus
+    bus --> jobs
+    bus --> ch
+    ws <--> redis
+    rest --> redis
+    svc --> s3
+    vis --> rek
+    pay --> pays
+    bus --> push
+    analytics --> ch
+
+    classDef store fill:#1f6f4a,stroke:#2e9e6b,color:#fff
+    classDef extn fill:#2b4a7d,stroke:#3d6bb3,color:#fff
+    class pg,ro,redis,s3,ch store
+    class rek,pays,push,ios,rn extn
 ```
-            ┌───────────────┐     ┌────────────────────┐
-            │   iOS App     │     │  React Native App  │
-            │   (SwiftUI)   │     │   (Expo / RN)      │
-            └───────┬───────┘     └─────────┬──────────┘
-                    └──────────┬────────────┘
-                               │
-         ┌─────────────────────▼──────────────────────┐
-         │        Rust Modular Monolith (Axum)        │
-         │   JWT · Rate Limiting · GraphQL · REST · WS │
-         │                                             │
-         │  ┌────────┐ ┌────────┐ ┌────────┐ ┌──────┐ │
-         │  │  Auth  │ │  User  │ │  Match │ │ Chat │ │
-         │  │Handler │ │Handler │ │Handler │ │  WS  │ │
-         │  └────────┘ └────────┘ └────────┘ └──────┘ │
-         │  ┌────────┐ ┌──────────────┐ ┌───────────┐ │
-         │  │Payment │ │ Notification │ │ Analytics │ │
-         │  │Handler │ │   Module     │ │  Module   │ │
-         │  └────────┘ └──────────────┘ └───────────┘ │
-         │                                             │
-         │  ┌──────────────────────────────────────┐   │
-         │  │      In-Process Event Bus            │   │
-         │  │   (tokio::broadcast, typed events)   │   │
-         │  └──────────────────────────────────────┘   │
-         │                                             │
-         │  ┌────────────┐  ┌────────────┐             │
-         │  │  ML Engine │  │  Vision    │             │
-         │  │ RL · LinUCB│  │  Pipeline  │             │
-         │  │  FedAvg    │  │ Face·NSFW  │             │
-         │  └────────────┘  └────────────┘             │
-         │                                             │
-         │  ┌────────────────────────────────────┐     │
-         │  │  DataFusion SQL Analytics Engine   │     │
-         │  │  Arrow RecordBatch · In-Process SQL│     │
-         │  └────────────────────────────────────┘     │
-         └─────────────────────────────────────────────┘
-                               │
- ┌──────────────────────────────────────────────────┐
- │              Data Layer                          │
- │  ┌──────────┐ ┌───────┐ ┌─────┐                │
- │  │PostgreSQL│ │ Redis │ │ S3  │                │
- │  │ Primary  │ │(Cache,│ │(Media│               │
- │  │(Writes)  │ │ OTP)  │ │ CDN)│               │
- │  └────┬─────┘ └───────┘ └─────┘                │
- │  ┌────▼─────┐ ┌───────────┐ ┌──────────┐        │
- │  │ PgBouncer│ │  Read     │ │ClickHouse│        │
- │  │ (Conn    │ │  Replica  │ │(Analytics│        │
- │  │  Pool)   │ │  (Reads)  │ │  OLAP)   │        │
- │  └──────────┘ └───────────┘ └──────────┘        │
- └──────────────────────────────────────────────────┘
+
+**Why a monolith.** Every domain shares one connection pool, one process and one
+typed `EventBus` (`tokio::broadcast`), so a match write and the notification it
+triggers cost a channel send rather than a network hop. The `microservices/`
+directory is kept for reference only; nothing in `k8s/` deploys it.
+
+### Request path: a swipe that becomes a match
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant M as Middleware
+    participant H as Handler
+    participant R as Redis
+    participant P as Postgres
+    participant B as EventBus
+
+    C->>M: POST /profiles/like (Bearer JWT)
+    M->>R: ZADD rl:user:{id} — sliding window
+    Note over M,R: Redis unreachable → fail-open, request proceeds
+    M->>H: Claims extractor decodes HS256
+    H->>P: INSERT swipes (hash-partitioned by from_user_id)
+    H->>P: reciprocal swipe present?
+    alt mutual
+        H->>P: INSERT matches (user1_id, user2_id)
+        H->>B: DomainEvent::MatchCreated
+        B-->>C: WS push via /ws/events
+        B->>P: notification outcome row
+    end
+    H-->>C: 200 {matched: bool}
 ```
+
+### Discovery and ranking
+
+```mermaid
+flowchart LR
+    req["GET /discover"] --> cache{"Redis<br/>discover:{user_id}<br/>TTL 120s"}
+    cache -->|hit| out["ranked feed"]
+    cache -->|miss| cand["candidate SQL<br/>preferences · distance · filters"]
+    cand --> rank["RankingRouter"]
+    rank --> heur["heuristic score<br/>freshness · reciprocity"]
+    rank --> bandit["LinUCB bandit<br/>src/ml"]
+    rank --> gnn["GNN embeddings<br/>weight 0.0 by default"]
+    heur --> out
+    bandit --> out
+    gnn --> out
+    out --> write["cache write-back"]
+
+    classDef c fill:#1f6f4a,stroke:#2e9e6b,color:#fff
+    class cache c
+```
+
+Scoring is **pure Rust, in-process** — no model server, no Python on the request
+path. Model *training* (FedLoRA, LightGCN) happens offline in
+`scripts/*_trainer.py` and is handed back through admin endpoints; the Rust
+process only ever stores adapter URLs and embeddings.
+
+---
+
+## Database architecture
+
+PostgreSQL 16 via `sqlx` with compile-time-checked queries (`SQLX_OFFLINE`).
+`pgvector` powers face and photo similarity; `pg_trgm` powers university search.
+The graph is **Postgres CTEs, not Neo4j**.
+
+```mermaid
+erDiagram
+    users ||--|| user_preferences : has
+    users ||--|| user_locations : "last known"
+    users ||--o{ swipes : sends
+    users ||--o{ matches : "participates in"
+    matches ||--o{ messages : contains
+    users ||--o{ reels : creates
+    reels ||--o{ reel_views : accrues
+    users ||--|| student_verifications : verifies
+    universities ||--o{ student_verifications : issues
+    users ||--o{ user_subscriptions : buys
+    products ||--o{ product_prices : "priced per region"
+    users ||--o{ payment_orders : places
+    payment_orders ||--o{ payment_transactions : settles
+    users ||--|| user_face_embeddings : "ArcFace 512d"
+
+    users {
+        bigserial id PK
+        varchar phone_number UK
+        jsonb interests
+        jsonb profile_photos
+        boolean is_student_verified
+    }
+    swipes {
+        bigint id PK
+        bigint from_user_id PK "HASH partitioned x8"
+        bigint to_user_id
+        varchar action "like|pass|superlike|block"
+    }
+    matches {
+        varchar id PK "uuid string"
+        bigint user1_id FK
+        bigint user2_id FK
+        boolean is_mutual_match
+        float ai_compatibility_score
+    }
+    messages {
+        bigint id PK
+        timestamptz created_at PK "RANGE partitioned weekly"
+        varchar match_id
+        text content
+    }
+    user_face_embeddings {
+        bigint user_id PK
+        vector embedding "HNSW cosine"
+    }
+```
+
+**Partitioning.** `swipes` is HASH-partitioned 8 ways on `from_user_id`;
+`messages` and `interaction_events` are RANGE-partitioned weekly. Partition PKs
+are composite (`(id, from_user_id)`, `(id, created_at)`) so upserts and the
+`UNIQUE(from_user_id, to_user_id)` swipe constraint still hold.
+
+> Weekly partitions are created by the `create_weekly_partitions()` plpgsql
+> function. Nothing in `src/` calls it yet — schedule it (pg_cron or a Rust job)
+> before the pre-created partitions run out.
+
+**Connection management.** `PgPoolOptions` with 300 max connections in
+production, optional PgBouncer, and an optional read replica: `AppState.db_read`
+is used only while `metrics.replica_healthy` is true, otherwise reads fall back
+to the primary.
+
+### Redis — what actually uses it
+
+Redis is `Option<ConnectionManager>`. Boot continues if it is unreachable, and
+**every** call site is a graceful `if let Some(..)`.
+
+```mermaid
+flowchart TB
+    subgraph live["Live uses"]
+        a["rate limit<br/>rl:{user|ip}<br/>ZSET window 60s"]
+        b["discovery cache<br/>discover:{user_id}<br/>TTL 120s"]
+        c["cross-pod fan-out<br/>PUBSUB nava:realtime"]
+        d["call sessions<br/>callsession:{id}<br/>TTL 3600s"]
+        e["instance heartbeat<br/>instance:{id}<br/>TTL 30s"]
+    end
+
+    r[("Redis")]
+    a --> r
+    b --> r
+    c --> r
+    d --> r
+    e --> r
+
+    r -.->|"unavailable"| deg["Degradation<br/>rate limiting fails OPEN<br/>feed rebuilt from DB+ML<br/>real-time drops to single-pod<br/>cross-pod call join breaks"]
+
+    classDef s fill:#1f6f4a,stroke:#2e9e6b,color:#fff
+    classDef w fill:#7d3b2b,stroke:#b35a42,color:#fff
+    class r s
+    class deg w
+```
+
+The failure mode worth knowing: **rate limiting fails open**. If Redis is down
+the middleware logs a warning and passes the request through, so a Redis outage
+silently removes throttling rather than rejecting traffic.
+
+`RedisService` also implements session storage, an OTP store, a token denylist,
+presence, distributed locks and WebSocket instance routing — those are written
+but **not currently wired to any caller**, so treat them as scaffolding rather
+than behaviour.
+
+---
+
+## Deployment
+
+```mermaid
+flowchart LR
+    gh["GitHub<br/>rust-backend/**"] --> ci["Actions<br/>fmt · clippy -D warnings<br/>cargo test · migrations"]
+    ci --> ecr["ECR<br/>{sha7}-{timestamp}"]
+    ecr --> k["EKS — nava-production"]
+
+    subgraph k8s["kustomize overlays/prod"]
+        dep["Deployment<br/>HPA 3→10 pods<br/>CPU 70% · mem 80%"]
+        ing["ALB Ingress + ACM"]
+        pvc["PVC — models · uploads (EFS RWX)"]
+    end
+
+    k --> k8s
+    ing --> dep
+    dep --- rds[("RDS Postgres<br/>ExternalName")]
+    dep --- ec[("ElastiCache Redis<br/>ExternalName")]
+    dep --- s3[("S3 / MinIO")]
+    ci -.->|"rollout fails"| undo["kubectl rollout undo"]
+
+    classDef s fill:#1f6f4a,stroke:#2e9e6b,color:#fff
+    class rds,ec,s3 s
+```
+
+A multi-stage Dockerfile produces a single static-ish binary image. Postgres and
+Redis are reached through `ExternalName` Services pointing at RDS and
+ElastiCache, so the cluster runs stateless pods only. Deploys are gated on a
+health check and roll back automatically on failure.
+
+> `k8s/pvc.yaml` is not listed in `base/kustomization.yaml`, so a plain
+> `kubectl apply -k overlays/prod` creates a Deployment referencing PVCs that do
+> not exist. Apply `k8s/pvc.yaml` explicitly, or add it to the base kustomization.
+
 
 ## Client Apps
 
