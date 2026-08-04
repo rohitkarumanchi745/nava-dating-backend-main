@@ -1039,6 +1039,201 @@ Graph powers: collaborative filtering, friend-of-friend discovery, fraud detecti
 
 ## ML & AI Architecture
 
+Four execution tiers, chosen per use case. Nothing on the request path calls a
+model server: ranking is hand-written linear algebra in Rust, vision is ONNX on
+CPU in-process, generative work is on-device, and gradient training is offline.
+
+```mermaid
+flowchart TB
+    subgraph device["On-device — iOS (Swift repo)"]
+        clip["MobileCLIP · Core ML<br/>photo + query embeddings"]
+        bit["BitNet b1.58-2B-4T<br/>chat suggestions"]
+        lora["LoRA adapter<br/>per-user personalization"]
+        head["personalization head<br/>33 params · local SGD"]
+    end
+
+    subgraph rust["In-process Rust — request path"]
+        rl["RL agent · Q-learning<br/>28-dim state · 2 actions"]
+        lin["LinUCB bandit<br/>shadow-only"]
+        geo["geo gravity<br/>1/(1+d^1.5)"]
+        aff["affinity<br/>Jaccard + co-like CF"]
+        eng["engagement<br/>churn · send-time · Thompson"]
+        router["RankingRouter<br/>experiment → canary → default"]
+    end
+
+    subgraph onnx["In-process ONNX — tract, CPU"]
+        arc["ArcFace 112²<br/>512-d identity"]
+        uf["UltraFace RFB-320<br/>detect + crop"]
+        nsfw["NSFW · FER+ · NIMA<br/>liveness"]
+    end
+
+    subgraph offline["Offline Python — outside the binary"]
+        fed["fedlora_trainer.py<br/>torch · PEFT → GGUF"]
+        gnn["gnn_trainer.py<br/>LightGCN"]
+    end
+
+    subgraph stores["Persistence"]
+        pgv[("pgvector<br/>face + CLIP 512-d<br/>HNSW cosine")]
+        js[("Postgres JSON<br/>fl_models · bandit_arm_stats")]
+    end
+
+    cloud["AWS Rekognition<br/>CompareFaces · celebrities"]
+
+    clip --> pgv
+    head --> fed
+    lora -.->|"downloaded by device"| device
+    fed --> lora
+    gnn --> pgv
+    rl --> js
+    lin --> js
+    router --> rl
+    router --> geo
+    router --> aff
+    rl -.->|"agreement rate only"| lin
+    arc --> pgv
+    uf --> arc
+    nsfw --> onnx
+    onnx -.->|"fallback"| cloud
+
+    classDef d fill:#4a2b6b,stroke:#7a4bb0,color:#fff
+    classDef s fill:#1f6f4a,stroke:#2e9e6b,color:#fff
+    classDef o fill:#6b4a1f,stroke:#a8762e,color:#fff
+    class clip,bit,lora,head d
+    class pgv,js s
+    class fed,gnn,cloud o
+```
+
+| Tier | Runs where | Why there |
+|---|---|---|
+| On-device | iOS, Core ML + `bitnet.cpp` | private by construction; no photo or draft message leaves the phone |
+| Rust in-process | request thread | sub-ms scoring, no model-server hop, no OOM risk |
+| ONNX CPU | `spawn_blocking` pool | identity/safety models are small; CPU is enough and keeps GPU cost at zero |
+| Offline Python | cron/worker | gradient training needs torch; results ship back as weights or embeddings |
+
+> On-device model code lives in the **iOS repo** (`Packages/NavAI`). This backend
+> owns the orchestration only: signal collection, aggregation, adapter registry
+> and the vector store.
+
+### Ranking and personalization
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant H as /discover
+    participant R as Redis
+    participant M as MlService
+    participant P as Postgres
+
+    C->>H: GET /discover
+    H->>R: discover:{user_id}
+    alt cache hit (TTL 120s)
+        R-->>C: ranked feed
+    else miss
+        H->>P: candidate SQL — prefs, distance, filters
+        H->>M: score(user, candidates)
+        Note over M: 0.55·RL + 0.20·geo + 0.20·affinity<br/>+ churn boost ≤0.15 + super-like 0.15
+        M->>M: LinUCB scored in shadow — agreement only
+        M-->>H: ordered candidates
+        Note over H,M: 2s timeout → attractiveness ordering<br/>+ inc_ml_fallback()
+        H->>R: cache write-back
+        H-->>C: ranked feed
+    end
+    C->>H: POST /profiles/like
+    H->>M: record_swipe_weighted (like 1.0 · super 3.0 · pass −0.5)
+    Note over M,P: every 10th swipe → train_batch(32)<br/>→ checkpoint weights as JSON
+    M->>P: persist fl_models
+```
+
+Training is **online and in the request path** — there is no separate training
+service for ranking. Every tenth swipe triggers a 32-sample replay batch and a
+checkpoint, so the model warm-starts from Postgres on the next boot.
+
+### Vision, verification and anti-fraud
+
+```mermaid
+flowchart TB
+    up["photo / selfie upload"] --> sel{"POST /verify/selfie"}
+
+    sel --> t1["1 · self-hosted ONNX<br/>ArcFace cosine vs profile photos"]
+    t1 -->|unavailable| t2["2 · AWS Rekognition<br/>CompareFaces, threshold 50"]
+    t2 -->|unavailable| t3["3 · legacy VisionAnalyzer<br/>scene embedding + NSFW"]
+    t3 -->|unavailable| err["503 + inc_vision_unavailable()"]
+
+    t1 --> ok["is_verified"]
+    t2 --> ok
+    t3 --> ok
+
+    up -.->|"fire and forget, never blocks"| fraud["spawn_photo_fraud_screen"]
+    fraud --> emb["ArcFace 512-d"]
+    emb --> ann["pgvector ANN<br/>user_face_embeddings<br/>cosine ≥ 0.5, other accounts"]
+    ann -->|match| flag["trust_safety_events<br/>flag_duplicate_face · risk 0.9"]
+    fraud --> celeb["RecognizeCelebrities<br/>opt-in, confidence ≥ 90"]
+    celeb --> flag2["flag_celebrity_photo"]
+
+    classDef w fill:#7d3b2b,stroke:#b35a42,color:#fff
+    class err,flag,flag2 w
+```
+
+Liveness is **not** proven server-side — a still image cannot demonstrate it, so
+the score is pinned at `1.0` and real liveness is expected from the device.
+`POST /verify/attestation` currently trusts client-supplied match and liveness
+scores; Apple App Attest verification is still a seam.
+
+### Federated learning and the LoRA loop
+
+```mermaid
+flowchart LR
+    subgraph phone["Device"]
+        sig["swipe / chat signals"]
+        sgd["local SGD<br/>33-param head"]
+        inf["BitNet + LoRA<br/>suggestion inference"]
+    end
+
+    subgraph server["Rust backend"]
+        api["POST /fl/lora/signal<br/>POST /fl/update"]
+        agg["FedAvg + Laplace DP<br/>validate: dims, NaN, ‖v‖≤100"]
+        q["lora_jobs<br/>FOR UPDATE SKIP LOCKED"]
+        reg["adapter registry<br/>url + sha256 + rank"]
+    end
+
+    trainer["fedlora_trainer.py<br/>torch · PEFT → GGUF"]
+    obj[("S3 / MinIO")]
+
+    sig --> api --> agg
+    sgd --> api
+    agg -->|"≥20 signals"| q
+    q --> trainer
+    trainer --> obj
+    trainer --> reg
+    reg -->|"GET /suggestions/adapter"| inf
+    obj -.->|"download"| inf
+
+    classDef s fill:#1f6f4a,stroke:#2e9e6b,color:#fff
+    classDef o fill:#6b4a1f,stroke:#a8762e,color:#fff
+    class obj s
+    class trainer o
+```
+
+`FederationSafety` declares face embeddings, GPS and message content
+off-limits; updates are validated for dimension, NaN/Inf and magnitude before
+aggregation. The server never touches adapter weights — it stores a URL and a
+`sha256`, and the device fetches and verifies.
+
+### Defaults worth knowing
+
+| Capability | State | Gate |
+|---|---|---|
+| RL + geo + affinity blend | live | always on, 2s timeout |
+| LinUCB bandit | shadow-only | scored, never orders results |
+| GNN (LightGCN) embeddings | off | `GNN_SCORE_WEIGHT` default `0.0` |
+| Visual similarity score | off | `VISUAL_SCORE_WEIGHT` default `0.0` |
+| Auto-matchmaker rounds | off | `AUTO_MATCH_ENABLED` default `false` |
+| FedLoRA auto-training | off | `LORA_AUTO_TRAIN_ENABLED` default `false` |
+| Celebrity screening | off | `CELEB_SCREENING_ENABLED` |
+| Text toxicity scoring | **stub** | returns `0.0`; only keyword/spam heuristics are live |
+| Matchmaker "agent" | no LLM | intent parsing is Rust string matching |
+
 ### In-Memory ML Engine (Rust)
 
 All ML computation runs in-process for sub-millisecond scoring latency:
