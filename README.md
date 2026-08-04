@@ -1,8 +1,84 @@
-# Nava — High-Performance Dating Platform Backend
+# Nava — Dating Platform Backend
 
-> Production backend powering the Nava dating apps (SwiftUI iOS + React Native). Built as a Rust/Axum modular monolith with in-process event bus, DataFusion SQL analytics, real-time WebSocket chat & calling, and ML-powered matching.
+**A production dating-app backend in Rust.** One Axum binary serves REST,
+GraphQL and WebSocket; matching is ranked by an in-process RL model; photo
+safety and identity run on ONNX over CPU; chat suggestions run on-device so
+drafts never leave the phone.
+
+<p>
+<img alt="Rust" src="https://img.shields.io/badge/Rust-1.8x-000?logo=rust">
+<img alt="Axum" src="https://img.shields.io/badge/Axum-0.8-4b3">
+<img alt="Postgres" src="https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql&logoColor=white">
+<img alt="Redis" src="https://img.shields.io/badge/Redis-soft%20dependency-d33">
+<img alt="ONNX" src="https://img.shields.io/badge/ONNX-tract%20CPU-6b4">
+<img alt="EKS" src="https://img.shields.io/badge/AWS-EKS-232f3e?logo=amazonaws">
+</p>
+
+| | |
+|---|---|
+| **Shape** | Modular monolith — one binary, ~239 REST routes, GraphQL, 3 WebSocket surfaces |
+| **Storage** | PostgreSQL 16 (`sqlx`, compile-time checked) · pgvector · partitioned swipes & messages |
+| **Cache** | Redis, optional — the process boots and serves without it |
+| **ML on the request path** | Pure Rust, no model server: Q-learning ranker + LinUCB shadow, 2s timeout |
+| **Vision** | 6 ONNX models via `tract`, CPU only, in-process |
+| **On-device AI** | MobileCLIP · BitNet · per-user LoRA (iOS repo) |
+| **Deploy** | Multi-stage Docker → ECR → EKS, HPA 3–10 pods, RDS + ElastiCache |
+
+Companion repos: **[iOS client](https://github.com/rohitkarumanchi745/navaswift-ui-iOS-)** (SwiftUI + on-device AI).
+Cross-repo AI write-up: [`AI_ARCHITECTURE.md`](AI_ARCHITECTURE.md).
 
 ---
+
+
+## Contents
+
+- [Quick Start](#quick-start)
+- [The Problems We Solved](#the-problems-we-solved)
+- [Architecture](#architecture)
+- [Data & Storage](#data--storage)
+- [ML & AI Architecture](#ml--ai-architecture)
+- [AI, Personalization & Agentic Matching](#ai-personalization--agentic-matching)
+- [Face Verification Backends](#face-verification-backends)
+- [API Contract](#api-contract)
+- [API Base URLs](#api-base-urls)
+- [Client Apps](#client-apps)
+- [Deployment](#deployment)
+- [Monitoring & Alerting](#monitoring--alerting)
+- [Graceful Degradation](#graceful-degradation)
+- [Operations](#operations)
+- [Testing](#testing)
+- [Performance Targets](#performance-targets)
+- [Data Models](#data-models)
+- [Media Storage (MinIO / S3)](#media-storage-minio--s3)
+- [Tech Stack](#tech-stack)
+- [Libraries, Packages & Connectors](#libraries-packages--connectors)
+- [Modular Monolith Architecture](#modular-monolith-architecture)
+- [Project Structure](#project-structure)
+- [Revenue Model](#revenue-model)
+
+---
+
+## Quick Start
+
+### Rust Backend
+```bash
+cd rust-backend
+cp .env.example .env       # configure DATABASE_URL, REDIS_URL, etc.
+cargo build --release
+cargo run                  # serves on http://127.0.0.1:8080
+```
+
+### Legacy Microservices (superseded)
+```bash
+# The microservices/ directory is preserved for reference but all functionality
+# is now consolidated in the rust-backend modular monolith.
+```
+
+### Ambassador Dashboard
+```bash
+cd ambassador-dashboard
+npm install && npm run dev
+```
 
 ## The Problems We Solved
 
@@ -300,7 +376,7 @@ process only ever stores adapter URLs and embeddings.
 
 ---
 
-## Database architecture
+## Data & Storage
 
 PostgreSQL 16 via `sqlx` with compile-time-checked queries (`SQLX_OFFLINE`).
 `pgvector` powers face and photo similarity; `pg_trgm` powers university search.
@@ -410,48 +486,585 @@ than behaviour.
 
 ---
 
-## Deployment
+
+
+### Connection Pooling (PgBouncer)
+- **Mode:** Transaction pooling (connection returned after each transaction)
+- **Pool:** 50 server connections, 1,000 max client connections
+- **Config:** `rust-backend/deploy/pgbouncer.ini`
+- **Note:** Session-level `SET` statements are lost between transactions — use `SET LOCAL` within transactions or configure in `postgresql.conf`
+
+### Read Replicas
+- **Primary pool** (`state.db`) — all writes + fallback reads
+- **Replica pool** (`state.db_read`) — read-heavy queries (discover, matches, profiles, admin stats, embeddings, reels)
+- **Health check:** Background task every 5s via `pg_last_xact_replay_timestamp()`
+- **Auto-fallback:** If replica lag > 2s, all reads automatically route to primary
+- **~15 read-heavy handlers** migrated to replica: profile, discover, matches, spots, admin stats, embeddings, bandit arms, training events, reels, learned patterns, payment reads
+
+### Swipes Partitioning
+- **Strategy:** Hash-partitioned by `from_user_id` into 8 partitions
+- **Benefit:** Write distribution across partitions, preserves UNIQUE constraint for ON CONFLICT upserts
+- **CI enforced:** Partition regression test runs on every push/PR
+
+### Write Scaling Roadmap
+- **Current capacity:** ~5,000-8,000 write TPS on 4vCPU/16GB primary (adequate for ~50K DAU)
+- **Sharding triggers:** Pool utilization >60% sustained, write p99 >100ms, WAL >500MB/min, DAU >100K
+- **Phase 1:** Functional sharding (swipes DB, messages DB, events DB)
+- **Phase 2:** Horizontal sharding by `user_id % N`
+- Full details in `rust-backend/deploy/ops-runbook.md`
+
+## ML & AI Architecture
+
+Four execution tiers, chosen per use case. Nothing on the request path calls a
+model server: ranking is hand-written linear algebra in Rust, vision is ONNX on
+CPU in-process, generative work is on-device, and gradient training is offline.
+
+```mermaid
+flowchart TB
+    subgraph device["On-device — iOS (Swift repo)"]
+        clip["MobileCLIP · Core ML<br/>photo + query embeddings"]
+        bit["BitNet b1.58-2B-4T<br/>chat suggestions"]
+        lora["LoRA adapter<br/>per-user personalization"]
+        head["personalization head<br/>33 params · local SGD"]
+    end
+
+    subgraph rust["In-process Rust — request path"]
+        rl["RL agent · Q-learning<br/>28-dim state · 2 actions"]
+        lin["LinUCB bandit<br/>shadow-only"]
+        geo["geo gravity<br/>1/(1+d^1.5)"]
+        aff["affinity<br/>Jaccard + co-like CF"]
+        eng["engagement<br/>churn · send-time · Thompson"]
+        router["RankingRouter<br/>experiment → canary → default"]
+    end
+
+    subgraph onnx["In-process ONNX — tract, CPU"]
+        arc["ArcFace 112²<br/>512-d identity"]
+        uf["UltraFace RFB-320<br/>detect + crop"]
+        nsfw["NSFW · FER+ · NIMA<br/>liveness"]
+    end
+
+    subgraph offline["Offline Python — outside the binary"]
+        fed["fedlora_trainer.py<br/>torch · PEFT → GGUF"]
+        gnn["gnn_trainer.py<br/>LightGCN"]
+    end
+
+    subgraph stores["Persistence"]
+        pgv[("pgvector<br/>face + CLIP 512-d<br/>HNSW cosine")]
+        js[("Postgres JSON<br/>fl_models · bandit_arm_stats")]
+    end
+
+    cloud["AWS Rekognition<br/>CompareFaces · celebrities"]
+
+    clip --> pgv
+    head --> fed
+    lora -.->|"downloaded by device"| device
+    fed --> lora
+    gnn --> pgv
+    rl --> js
+    lin --> js
+    router --> rl
+    router --> geo
+    router --> aff
+    rl -.->|"agreement rate only"| lin
+    arc --> pgv
+    uf --> arc
+    nsfw --> onnx
+    onnx -.->|"fallback"| cloud
+
+    classDef d fill:#4a2b6b,stroke:#7a4bb0,color:#fff
+    classDef s fill:#1f6f4a,stroke:#2e9e6b,color:#fff
+    classDef o fill:#6b4a1f,stroke:#a8762e,color:#fff
+    class clip,bit,lora,head d
+    class pgv,js s
+    class fed,gnn,cloud o
+```
+
+| Tier | Runs where | Why there |
+|---|---|---|
+| On-device | iOS, Core ML + `bitnet.cpp` | private by construction; no photo or draft message leaves the phone |
+| Rust in-process | request thread | sub-ms scoring, no model-server hop, no OOM risk |
+| ONNX CPU | `spawn_blocking` pool | identity/safety models are small; CPU is enough and keeps GPU cost at zero |
+| Offline Python | cron/worker | gradient training needs torch; results ship back as weights or embeddings |
+
+> On-device model code lives in the **iOS repo** (`Packages/NavAI`). This backend
+> owns the orchestration only: signal collection, aggregation, adapter registry
+> and the vector store.
+
+### Ranking and personalization
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant H as /discover
+    participant R as Redis
+    participant M as MlService
+    participant P as Postgres
+
+    C->>H: GET /discover
+    H->>R: discover:{user_id}
+    alt cache hit (TTL 120s)
+        R-->>C: ranked feed
+    else miss
+        H->>P: candidate SQL — prefs, distance, filters
+        H->>M: score(user, candidates)
+        Note over M: 0.55·RL + 0.20·geo + 0.20·affinity<br/>+ churn boost ≤0.15 + super-like 0.15
+        M->>M: LinUCB scored in shadow — agreement only
+        M-->>H: ordered candidates
+        Note over H,M: 2s timeout → attractiveness ordering<br/>+ inc_ml_fallback()
+        H->>R: cache write-back
+        H-->>C: ranked feed
+    end
+    C->>H: POST /profiles/like
+    H->>M: record_swipe_weighted (like 1.0 · super 3.0 · pass −0.5)
+    Note over M,P: every 10th swipe → train_batch(32)<br/>→ checkpoint weights as JSON
+    M->>P: persist fl_models
+```
+
+Training is **online and in the request path** — there is no separate training
+service for ranking. Every tenth swipe triggers a 32-sample replay batch and a
+checkpoint, so the model warm-starts from Postgres on the next boot.
+
+### Vision, verification and anti-fraud
+
+```mermaid
+flowchart TB
+    up["photo / selfie upload"] --> sel{"POST /verify/selfie"}
+
+    sel --> t1["1 · self-hosted ONNX<br/>ArcFace cosine vs profile photos"]
+    t1 -->|unavailable| t2["2 · AWS Rekognition<br/>CompareFaces, threshold 50"]
+    t2 -->|unavailable| t3["3 · legacy VisionAnalyzer<br/>scene embedding + NSFW"]
+    t3 -->|unavailable| err["503 + inc_vision_unavailable()"]
+
+    t1 --> ok["is_verified"]
+    t2 --> ok
+    t3 --> ok
+
+    up -.->|"fire and forget, never blocks"| fraud["spawn_photo_fraud_screen"]
+    fraud --> emb["ArcFace 512-d"]
+    emb --> ann["pgvector ANN<br/>user_face_embeddings<br/>cosine ≥ 0.5, other accounts"]
+    ann -->|match| flag["trust_safety_events<br/>flag_duplicate_face · risk 0.9"]
+    fraud --> celeb["RecognizeCelebrities<br/>opt-in, confidence ≥ 90"]
+    celeb --> flag2["flag_celebrity_photo"]
+
+    classDef w fill:#7d3b2b,stroke:#b35a42,color:#fff
+    class err,flag,flag2 w
+```
+
+Liveness is **not** proven server-side — a still image cannot demonstrate it, so
+the score is pinned at `1.0` and real liveness is expected from the device.
+`POST /verify/attestation` currently trusts client-supplied match and liveness
+scores; Apple App Attest verification is still a seam.
+
+### Federated learning and the LoRA loop
 
 ```mermaid
 flowchart LR
-    gh["GitHub<br/>rust-backend/**"] --> ci["Actions<br/>fmt · clippy -D warnings<br/>cargo test · migrations"]
-    ci --> ecr["ECR<br/>{sha7}-{timestamp}"]
-    ecr --> k["EKS — nava-production"]
-
-    subgraph k8s["kustomize overlays/prod"]
-        dep["Deployment<br/>HPA 3→10 pods<br/>CPU 70% · mem 80%"]
-        ing["ALB Ingress + ACM"]
-        pvc["PVC — models · uploads (EFS RWX)"]
+    subgraph phone["Device"]
+        sig["swipe / chat signals"]
+        sgd["local SGD<br/>33-param head"]
+        inf["BitNet + LoRA<br/>suggestion inference"]
     end
 
-    k --> k8s
-    ing --> dep
-    dep --- rds[("RDS Postgres<br/>ExternalName")]
-    dep --- ec[("ElastiCache Redis<br/>ExternalName")]
-    dep --- s3[("S3 / MinIO")]
-    ci -.->|"rollout fails"| undo["kubectl rollout undo"]
+    subgraph server["Rust backend"]
+        api["POST /fl/lora/signal<br/>POST /fl/update"]
+        agg["FedAvg + Laplace DP<br/>validate: dims, NaN, ‖v‖≤100"]
+        q["lora_jobs<br/>FOR UPDATE SKIP LOCKED"]
+        reg["adapter registry<br/>url + sha256 + rank"]
+    end
+
+    trainer["fedlora_trainer.py<br/>torch · PEFT → GGUF"]
+    obj[("S3 / MinIO")]
+
+    sig --> api --> agg
+    sgd --> api
+    agg -->|"≥20 signals"| q
+    q --> trainer
+    trainer --> obj
+    trainer --> reg
+    reg -->|"GET /suggestions/adapter"| inf
+    obj -.->|"download"| inf
 
     classDef s fill:#1f6f4a,stroke:#2e9e6b,color:#fff
-    class rds,ec,s3 s
+    classDef o fill:#6b4a1f,stroke:#a8762e,color:#fff
+    class obj s
+    class trainer o
 ```
 
-A multi-stage Dockerfile produces a single static-ish binary image. Postgres and
-Redis are reached through `ExternalName` Services pointing at RDS and
-ElastiCache, so the cluster runs stateless pods only. Deploys are gated on a
-health check and roll back automatically on failure.
+`FederationSafety` declares face embeddings, GPS and message content
+off-limits; updates are validated for dimension, NaN/Inf and magnitude before
+aggregation. The server never touches adapter weights — it stores a URL and a
+`sha256`, and the device fetches and verifies.
 
-> `k8s/pvc.yaml` is not listed in `base/kustomization.yaml`, so a plain
-> `kubectl apply -k overlays/prod` creates a Deployment referencing PVCs that do
-> not exist. Apply `k8s/pvc.yaml` explicitly, or add it to the base kustomization.
+### Defaults worth knowing
 
+| Capability | State | Gate |
+|---|---|---|
+| RL + geo + affinity blend | live | always on, 2s timeout |
+| LinUCB bandit | shadow-only | scored, never orders results |
+| GNN (LightGCN) embeddings | off | `GNN_SCORE_WEIGHT` default `0.0` |
+| Visual similarity score | off | `VISUAL_SCORE_WEIGHT` default `0.0` |
+| Auto-matchmaker rounds | off | `AUTO_MATCH_ENABLED` default `false` |
+| FedLoRA auto-training | off | `LORA_AUTO_TRAIN_ENABLED` default `false` |
+| Celebrity screening | off | `CELEB_SCREENING_ENABLED` |
+| Text toxicity scoring | **stub** | returns `0.0`; only keyword/spam heuristics are live |
+| Matchmaker "agent" | no LLM | intent parsing is Rust string matching |
 
-## Client Apps
+### Computer vision pipeline
 
-| App | Stack | Repo |
-|-----|-------|------|
-| **iOS** | SwiftUI, StoreKit 2 | `navaswift-ui-iOS-` |
-| **Cross-Platform** | React Native, Expo, RevenueCat | `nava-dating-app-v1-main` |
-| **Ambassador Dashboard** | React, TypeScript, Vite | Included in this repo |
+Six ONNX models run through [`tract`](https://github.com/sonos/tract) — pure
+Rust, CPU only, no Python and no GPU. `VisionAnalyzer::analyze_image`
+(`src/vision/mod.rs:130`) decodes once, derives a centre crop, and fans that one
+decode across every model.
+
+```mermaid
+flowchart TB
+    up["photo bytes"] --> dec["image::load_from_memory<br/>→ to_rgb8()"]
+    dec --> full["full RGB frame"]
+    dec --> crop["center_crop()"]
+
+    full --> nsfw["<b>NSFW</b> · 224²<br/>CHW BGR, mean-sub 104/117/123<br/>→ softmax[1]"]
+    full --> nima["<b>NIMA</b> · 224²<br/>ImageNet mean/std<br/>→ 10-bin MOS = Σ(i+1)·pᵢ"]
+    crop --> fer["<b>FER+</b> · 64² grayscale<br/>→ 8 emotion classes<br/>→ smile intensity"]
+    crop --> live["<b>liveness</b> · 80²<br/>MiniFASNet<br/>→ authenticity"]
+    crop --> arc["<b>ArcFace</b> · 112²<br/>→ 512-d embedding"]
+
+    full --> q["<b>quality.rs</b> — pure Rust<br/>blur · low-light · face-ratio"]
+
+    nsfw --> gate{"score ≥ 0.7"}
+    gate -->|yes| block["inappropriate_content = true"]
+    fer --> fd{"smile ≥ 0.2"}
+    fd -->|yes| face["face_detected = true"]
+
+    nima --> comp["composite_quality()"]
+    q --> comp
+    face --> comp
+    comp --> flags["quality_flags<br/>blurry · too_dark · face_too_small<br/>no_face_detected · low_quality"]
+
+    arc --> outv["style_embedding"]
+    live --> outa["authenticity_score"]
+
+    classDef m fill:#4a2b6b,stroke:#7a4bb0,color:#fff
+    classDef w fill:#7d3b2b,stroke:#b35a42,color:#fff
+    class nsfw,nima,fer,live,arc m
+    class block,flags w
+```
+
+| Stage | Model | Input | Output |
+|---|---|---|---|
+| Safety | NSFW classifier | 224², BGR mean-subtracted | score; `≥ 0.7` blocks |
+| Aesthetics | NIMA | 224², ImageNet norm | mean opinion score, 10-bin expectation |
+| Expression | FER+ | 64² grayscale, centre crop | 8 classes → smile intensity |
+| Liveness | MiniFASNet | 80², centre crop | authenticity score |
+| Identity | ArcFace | 112², centre crop | 512-d embedding |
+| Quality | `quality.rs` | full frame | blur, low-light, face-ratio → composite + flags |
+
+Two honest caveats, both visible in the code:
+
+- **`face_detected` is an expression proxy, not a detector.** It is
+  `smile_intensity >= 0.2` from FER+ (`vision/mod.rs:140`), and the "face box"
+  handed to `face_ratio_score` is a hardcoded centre rectangle. A neutral
+  expression reads as no face.
+- **Inference is serialized.** `VisionAnalyzer` sits behind
+  `Arc<Mutex<..>>` (`state.rs:104`) and is invoked through `spawn_blocking`, so
+  concurrent uploads queue on one mutex rather than running in parallel.
+
+### Identity verification pipeline
+
+`services/face_verify.rs` is the newer, purpose-built path — a real detector
+instead of a centre crop, and cosine similarity over L2-normalized embeddings.
+
+```mermaid
+flowchart LR
+    a["selfie bytes"] --> b["<b>UltraFace RFB-320</b><br/>320×240 · min score 0.7"]
+    b --> c["highest-confidence box<br/>+ 25% margin"]
+    c --> d["resize 112×112"]
+    d --> e["<b>ArcFace</b><br/>512-d"]
+    e --> f["L2 normalize<br/>cosine = dot product"]
+    f --> g{"cosine ≥ 0.36"}
+    g -->|yes| ok["same person"]
+    g -->|no| no["reject"]
+
+    classDef m fill:#4a2b6b,stroke:#7a4bb0,color:#fff
+    class b,e m
+```
+
+Enabled with `FACE_VERIFY_ONNX=1`. It **downloads its own weights on first boot**
+from the ONNX model zoo into `VISION_MODEL_DIR`, so it self-heals where the
+six-model `VisionAnalyzer` needs a volume.
+
+> **v1 limitation, stated in the source:** there is no 5-point landmark
+> alignment — the crop is the padded detector box. That costs a few points of
+> accuracy against aligned ArcFace or Rekognition, which is why the threshold is
+> tunable via `FACE_ONNX_MATCH_THRESHOLD` (default `0.36`).
+
+**Model files ship separately from the image.** `rust-backend/models/` is in both
+`.gitignore` and `.dockerignore`; the Dockerfile only creates the directory. The
+six-model analyzer therefore requires the `nava-models-pvc` volume (or the
+compose bind mount) to be present — otherwise vision endpoints return `503` and
+`inc_vision_unavailable()` fires.
+
+### In-Memory ML Engine (Rust)
+
+All ML computation runs in-process for sub-millisecond scoring latency:
+
+| Component | Algorithm | Details |
+|-----------|-----------|---------|
+| **RL Agent** | Q-Learning | 28-dim state (14 user + 14 candidate features), epsilon-greedy (0.3→0.01, decay 0.995), per-user model blending (70% global + 30% personal), 10K experience replay buffer, warm-start from DB checkpoint |
+| **LinUCB Bandit** | Contextual Bandit | UCB scoring with Gauss-Jordan matrix inverse, per-arm A-matrix + b-vector, alpha=0.6, observation decay 0.995, JSONB persistence to PostgreSQL, warm-start on boot |
+| **Shadow Scoring** | RL vs LinUCB | Top-half agreement tracking between RL and LinUCB rankings for model comparison and observability |
+| **FedAvg** | Federated Learning | Weighted averaging by sample count, Laplace noise differential privacy (scale 0.1), min 2 clients per round, global learning rate 0.1 |
+| **Personalization Head** | On-Device FL | 33-param last-layer (32 weights + 1 bias), devices fine-tune via SGD on local swipe outcomes, FedAvg deltas aggregated server-side with DP |
+| **Cold-Start Biasing** | Affinity FL | Per-intent-bucket weight adjustments (5-dim: interest, language, intent, CF, geo), EMA smoothing (0.7/0.3), ±0.3 clamping, DP noise |
+| **Notif Click Predictor** | Engagement FL | 6-feature on-device logistic regression (hour, day, category, recency, daily count, match flag), federated updates, feeds bandit priors |
+| **Federation Safety** | Privacy Boundary | Explicit allow/deny list for federated data, gradient clipping (\|val\| < 100), NaN/Inf validation, dimension checks per update type |
+| **Geo Scorer** | Gravity Model | Haversine distance + local density smoothing (KDE bandwidth 50km), gravity beta=1.5, configurable max distance + units (km/miles) |
+| **Affinity Scorer** | Multi-Signal Overlap | Interest Jaccard (35%), language overlap (15%), intent alignment (20%), collaborative filtering via CoLikeMatrix (30%) |
+| **Engagement Scorer** | Churn + Timing | Logistic regression churn predictor (5 features), per-user send-time histograms (24 hourly buckets), Thompson Sampling notification bandit |
+| **CoLike Matrix** | Collaborative Filtering | User-user co-like signals rebuilt periodically, feeds into affinity scorer CF weight |
+
+**Discovery Ranking Blend (multi-signal):**
+```
+SQL candidates → Multi-signal scoring → Re-rank by blended score → Return to client
+     ↓                ↓                                                 ↓
+  Filters       ┌─── 55% RL score (Q-learning)                  Like/Pass feeds back
+  (age, dist,   ├─── 20% Geo score (gravity model + density)    into RL + LinUCB training
+   verified)    ├─── 20% Affinity score (interest/lang/intent/CF)(every 10 swipes → checkpoint)
+                ├─── + churn boost (up to 0.15 for at-risk users)
+                └─── + super like boost (+0.15 if candidate super-liked you)
+                      LinUCB shadow scoring (observability, top-half agreement)
+```
+
+**2s timeout on ML ranking** — if scoring takes too long, falls back to `attractiveness_score` ordering. Fallback rate tracked via `app_ml_fallback_total` with SLO alert at >5%.
+
+**Feature Vector (14 dimensions per user):**
+
+| # | Feature | Category | Range | Source |
+|---|---------|----------|-------|--------|
+| 1 | `age_norm` | Profile | 0-1 | Normalized age (18-60) |
+| 2 | `attractiveness` | Profile | 0-1 | Attractiveness score from users table |
+| 3 | `profile_completeness` | Profile | 0-1 | Ratio of filled fields (9 total) |
+| 4 | `verification_score` | Profile | 0-1 | Selfie (0.5) + student (0.5) verification |
+| 5 | `photo_count` | Profile | 0-1 | Normalized photo count (max 4) |
+| 6 | `height_norm` | Profile | 0-1 | Normalized height (140-200cm) |
+| 7 | `has_profession` | Profile | 0/1 | Whether profession_category is set |
+| 8 | `gender_enc` | Profile | 0-1 | male=0.0, female=1.0, non_binary=0.5 |
+| 9 | `intent_enc` | Richness | 0-1 | relationship=1.0, casual=0.5, friendship=0.25 |
+| 10 | `language_count` | Richness | 0-1 | Languages spoken (capped at 5) |
+| 11 | `interest_count` | Richness | 0-1 | Interests listed (capped at 10) |
+| 12 | `activity_score` | Engagement | 0-1 | 7-day interaction count (normalized) |
+| 13 | `like_rate` | Swipe | 0-1 | Fraction of swipes that were likes |
+| 14 | `match_rate` | Swipe | 0-1 | Fraction of likes that became mutual matches |
+
+**RL state** = user features (14) + candidate features (14) = **28 dimensions**
+
+**Feature Defaults:** Population-level means computed from DB on startup, with hardcoded neutral fallback if DB is unavailable. Used when per-user features can't be fetched.
+
+**Model Persistence:**
+- RL checkpoint saved to `fl_models` table (versioned, active flag) every 10 swipes
+- LinUCB arms saved to `bandit_arm_stats` table (A-matrix, b-vector, pulls, reward)
+- Both warm-started from DB on service boot
+
+### On-Device Federated Learning
+- **Privacy-preserving model aggregation** across clients (min 10 clients, 10% fraction per round)
+- **Differential Privacy** — Noise multiplier (1.0) + gradient clipping (norm 1.0) for user data protection
+- **FL Training Data** — `/fl/training-data` endpoint provides labeled swipe pairs (like=1.0, pass=0.0, mutual=1.5) with 28-dim combined state vectors and feature schema
+- **Personalization Head** — 33-param last-layer fine-tuned on-device; server aggregates deltas via FedAvg with DP noise; head norm monitored for weight divergence (alert at L2 > 10.0)
+- **Cold-Start Biasing** — Per-intent affinity weight adjustments aggregated from early swipe patterns; EMA smoothing prevents oscillation; clamped to ±0.3 to prevent wild swings
+- **Notification Click Predictor** — 6-feature on-device logistic regression predicting push notification open probability; federated updates feed Thompson Sampling bandit priors
+- **Federation Safety Boundary** — Explicit allow/deny for federated data: behavioral gradients (allowed), face embeddings/device-risk/location (forbidden); gradient clipping at |val| < 100, NaN/Inf rejection
+- **Config:** `FL_ENABLED`, `FL_MIN_CLIENTS`, `FL_CLIENT_FRACTION`, `FL_LOCAL_EPOCHS`, `FL_LEARNING_RATE`, `FL_DP_ENABLED`
+
+### LLM Integration (LLaMA 3)
+- **Content Labeling** — Automated profile/bio moderation and tagging
+- **Auto-Queue on Send** — All chat messages (WebSocket, GraphQL, reel, spot, like) auto-queued for toxicity/intent labeling with priority-based processing
+- **Batch Inference** — Configurable batch size (10) with retry logic (max 3)
+- **Config:** `LLM_ENABLED`, `LLM_API_URL`, `LLM_MODEL_NAME=llama3`, `LLM_BATCH_SIZE`
+
+### Computer Vision Pipeline
+- **Face Recognition** — ArcFace embedding extraction + cosine similarity matching
+- **Selfie Liveness Detection** — LBP entropy + FFT frequency + HSV color analysis (weights 0.4/0.4/0.2)
+- **Emotion Detection** — FER+ 8-emotion classification
+- **NSFW Detection** — CNN/ViT classification for explicit content, nudity scoring, and moderation flagging
+- **Image Quality** — NIMA aesthetic scoring + blur detection (Laplacian variance) + low-light detection (luminance histogram)
+- **Photo Ranking** — Composite score from aesthetic quality, face ratio checks (face area / frame area), blur/noise levels; auto-ranks user photos for optimal profile ordering
+- **Duplicate Face Detection** — Cross-user ArcFace embedding comparison to detect stolen/catfish photos
+
+### Trust & Safety ML
+- **Graph Anomaly Detection** — Postgres CTE-based queries detecting suspicious swipe/match/message patterns (ring detection, velocity anomalies, fan-out clusters)
+- **Device Fingerprinting** — Device model, OS version, screen resolution, timezone, language; hashed fingerprint stored for multi-account detection and ban evasion tracking
+- **Behavioral Classifiers (GBDT)** — Gradient-boosted decision tree models on behavioral signals: swipe velocity, like-to-match ratio, message response time distribution, report frequency; produces per-user trust score (0-1)
+- **Ban Evasion Detection** — Device fingerprint + IP + behavioral similarity matching against banned accounts; auto-flags accounts with >80% similarity
+
+### Content Moderation Pipeline
+
+| Layer | Technique | Coverage |
+|-------|-----------|----------|
+| **Visual** | CNN/ViT NSFW detection, face/liveness verification, duplicate face detection | Photos, selfies, reels |
+| **Text (NLP)** | Toxicity classifiers (hate, harassment, threats), intent detection | Bios, chat messages, reel captions |
+| **Spam** | URL/link detection, keyword blocklist, regex patterns, message frequency throttling | Chat, bios, reel captions |
+| **Graph** | Anomaly detection on messaging/swipe graphs, coordinated behavior detection | Cross-user interaction patterns |
+
+**Moderation Transparency:**
+- Blocked/blurred photos and muted messages include user-facing reason codes (e.g., `nsfw_detected`, `spam_url`, `hate_speech`)
+- Lightweight appeal path: users can submit appeals via `/moderation/appeal` with the decision trace ID
+- All moderation decisions logged with trace IDs for support team review and audit
+- Moderation dashboard shows false positive rates, appeal outcomes, and per-model accuracy
+
+### Content Freshness & Anti-Gaming
+- **Profile Decay Scoring** — Time-weighted freshness decay on profiles and media; stale profiles (no activity >30 days) receive reduced discover ranking via exponential decay multiplier
+- **Media Freshness** — Photos/reels older than 90 days flagged for refresh prompt; fresh content receives temporary ranking boost
+- **Profile Edit Rate Limiting** — Sliding window rate limits on profile field updates (max 10 edits/hour, 50/day) to prevent gaming/A-B testing of bios and photos
+- **Score Recalculation** — Attractiveness and ML scores periodically recomputed to reflect current engagement patterns, not historical peaks
+
+### Media Optimization
+- **Responsive Image Variants** — Pre-generate multiple photo sizes on upload: thumbnail (150px), card (400px), full (1080px), original
+- **Modern Formats** — AV1/WEBP transcoding for avatars and thumbnails; JPEG fallback for older clients
+- **Smallest Rendition Serving** — CDN serves the smallest acceptable rendition based on `Accept` header, device pixel ratio, and requested viewport size
+- **Reel Compression** — On-device H.264 compression via `AVAssetExportSession` with `shouldOptimizeForNetworkUse = true` (moov atom → front for fast-start streaming). Upload begins immediately on video pick — before user types caption or selects filter. Client-side progressive resolution reduction (2160p→1080p→720p→540p→480p) targets 50MB max file size; 4K kept if already under limit.
+- **Reel Filters** — 7 client-side filters (Original, Vivid, Warm, Cool, Vintage, Drama, Fade) applied via `AVVideoComposition` + `CIFilter` pipeline. Filter thumbnails generated instantly from first frame. Filtered video exported + uploaded in background while user types caption.
+- **HLS Adaptive Streaming** — Server-side FFmpeg transcoding to 3-variant HLS (360p/720p/1080p) with `master.m3u8`. AVPlayer selects optimal quality based on bandwidth. Background processing: upload returns immediately, HLS transcoding runs async. States: `pending` → `processing` → `ready`/`failed`. iOS falls back to direct `video_url` when HLS not ready.
+- **Server-Side Video Normalization** — Accepts uploads up to 2GB. FFmpeg trims to 30s max, progressively reduces resolution only if file exceeds 50MB (tries 2160p→1440p→1080p→720p→480p). 4K video that fits under 50MB is never downscaled.
+- **Apple Music Integration** — Reels support attached music metadata (Apple Music song ID, title, artist, artwork, preview URL, start offset). MusicKit 30s previews — free for all users, no subscription required. Trending music endpoint aggregates most-used songs across reels.
+
+### Client Adaptive Behavior
+- **Battery-Aware Throttling** — Client reports battery level + charging state; server defers non-critical work (reel transcoding notifications, background sync) when battery <20%
+- **Temperature Throttling** — Thermal state reported by client; server reduces media quality and defers heavy uploads when device is thermally throttled
+- **Network-Class Adaptation** — Client reports connection type (WiFi/5G/4G/3G/2G); server adjusts response payloads:
+  - **2G/3G:** Compressed JSON, thumbnail-only photos, no auto-play reels
+  - **4G/WiFi:** Full payloads, card-size photos, reel previews
+  - **5G/WiFi:** Full resolution, HD reels, prefetch next page
+- **Deferred Uploads** — Reel and high-res photo uploads queued client-side when on low battery (<15%) or 2G; auto-resume on WiFi/charging
+
+### Notification Intelligence
+- **Thompson Sampling Bandit** — Beta-distributed arms for 4 notification categories (NewMatch, ReEngage, Like, Message), each with 3 copy variants; shadow mode logs bandit choice but sends control for safe A/B
+- **Send-Time Optimization** — Per-user engagement hour histograms (24 buckets), defers notifications outside peak activity windows
+- **Policy Gate Chain** — 6-stage check: opt-out → daily cap (12/day) → cooldown (5 min) → quiet hours (22:00-07:00 local) → send-time activity → variant selection
+- **Region-Aware Timezone** — 3-tier resolution: device offset → country_code mapping (50+ ISO codes) → UTC fallback
+- **Variant Logging** — All sends logged to `notification_outcomes` table with variant_id, category, sent_at, opened_at for offline evaluation
+- **Shadow-Mode Canary** — Bandit selects variant but always sends control; evaluate uplift with safety gates before promoting to live
+
+### Background Jobs
+- **Graph Query Cache** — Postgres CTE-based friend-of-friend, university network, and fraud detection queries with Redis cache (TTL 5m)
+- **DLQ Processor** — Auto-retry dead letter queue entries with exponential backoff; stats endpoint at `/api/payments/dlq/stats`
+- **Send-Time Refresh** — Notification send-time histograms rebuilt every 6 hours from engagement data
+
+## AI, Personalization & Agentic Matching
+
+On-device chat suggestions support, per-user personalization, and agentic
+matching. The guiding principle: reuse what we already run (Redis, federated
+learning, the RL/bandit ranker, our governed API), keep the user-facing path
+fast and offline-capable, and add nothing we can't run cheaply at scale.
+Everything below is **additive** and **degrades gracefully** when its dependency
+(Redis, a configured model, a trained adapter) is absent.
+
+`AI_ARCHITECTURE.md` holds the same write-up spanning both repos; the backend
+detail is inlined here.
+
+### Real-time cross-instance fanout — `src/realtime.rs`
+- **What:** chat, call, and app-event WebSocket traffic fans out across pods over
+  Redis Pub/Sub, with call sessions shared in Redis so a callee on a different
+  pod can join.
+- **Why:** our WebSocket rooms lived in per-process memory, so two users on
+  different pods couldn't see each other's messages. This is the change that
+  makes "10k+ users" real.
+- **How it fits:** reuses the Redis we already run; single-pod behavior is
+  unchanged when Redis is absent.
+
+### FedLoRA — per-user chat personalization
+- **What:** migration `032_lora_adapters.sql`, `handlers/lora.rs`, and the
+  training worker `scripts/fedlora_trainer.py`. The device submits privacy-safe
+  signal and downloads a small per-user LoRA adapter; the worker trains it and
+  registers a new version, which we push to the device over the outbox + fanout.
+- **Why:** chat suggestions that match each user's voice. A **per-user LoRA
+  adapter** on a shared base is the cost-efficient way — *not* a full model per
+  user (millions of models is infeasible).
+- **How it fits:** reuses our existing federated-learning + differential-privacy
+  setup. Training is offline/GPU and stops when done; the adapter is applied
+  on-device at inference.
+
+### Agentic auto-matcher — `services/matchmaker.rs`, migration `033`
+- **What:** reciprocal preference scoring — we score A→B *and* B→A and combine
+  them (geometric mean, so one-sided interest stays low). High-scoring pairs
+  become proposals or, above a higher bar with safety gates, instant matches.
+- **Why:** "instant match without swiping." The prediction is a classic ML
+  problem we already solve.
+- **How it fits:** **reuses `MlService::rank_candidates`** (RL + LinUCB + geo +
+  affinity, already learned from swipes) in both directions — no new model.
+  Accept/decline calls the existing `record_swipe_weighted`, closing the RL loop.
+- **Safety:** disabled by default (`AUTO_MATCH_ENABLED=false`); proposals are the
+  default, instant auto-create is gated behind a high score + both-verified.
+
+### Prompt-driven matchmaker agent — `POST /agent/matchmaker/prompt`
+- **What:** a natural-language intent ("verified grad students who love hiking,
+  late 20s") is parsed into structured filters *in Rust* (`parse_intent`), then
+  run through the reciprocal scorer via a **governed tool** (`agent_query`).
+- **Why:** conversational matching, but with **no LLM inside the data layer**.
+- **How it fits — the key security decision:** the agent sits **above our API
+  boundary**, not in the data layer. It only ever produces *structured,
+  user-scoped filters* — never raw SQL — so every query inherits our existing
+  auth, row-scoping, and rate limits. Learning from engagement is the existing
+  Rust RL bandit; no Python and no per-request LLM.
+
+### Payments hardening
+- **Server-side Apple receipt verification** (`services/payments/apple.rs`) —
+  previously trusted a client-supplied transaction id (revenue-fraud hole); now
+  verifies against Apple and fails closed in production.
+- **Constant-time webhook signatures** (Razorpay/Stripe/RevenueCat) plus a
+  **5-minute Stripe replay window** — the old `expected == signature` leaked
+  timing and had no replay protection.
+
+### Why these decisions (trade-offs)
+
+| Decision | Why |
+|---|---|
+| **Per-user LoRA + retrieval**, not a full LLM per user | A model per user is infeasible; adapters + retrieval are cheap and scale. |
+| **Matching = bandit/RL in Rust**, not an LLM | Match prediction is a classic ML problem; an LLM would be slower, costlier, no better. |
+| **Agent above the API boundary** with governed tools | An LLM with DB access over user prompts is a PII/injection risk; governed tools reuse existing authz. |
+| **All-Rust + ONNX serving**; Python only for offline training | Serving stays in-stack and fast; only offline LLM/LoRA training needs Python/GPU, which then exports weights for Rust to serve. |
+
+See **[AI_ARCHITECTURE.md](AI_ARCHITECTURE.md)** for the cross-repo version,
+including the iOS on-device engine.
+
+## Face Verification Backends
+
+`POST /verify/selfie` compares the selfie against the user's stored profile
+photos. Three backends, tried in order:
+
+1. **Self-hosted ONNX** (`FACE_VERIFY_ONNX=1`) — UltraFace face detection
+   (~1.2MB) + ArcFace identity embeddings, run on-box via tract-onnx.
+   A proper identity pipeline: detect largest face → crop → 512-d embedding →
+   cosine similarity. Models auto-download at boot into `VISION_MODEL_DIR`
+   when missing (override sources with `FACE_DETECTOR_URL` /
+   `FACE_EMBEDDER_URL`; decision threshold `FACE_ONNX_MATCH_THRESHOLD`,
+   default 0.36 cosine). Validated discrimination: same person ≈ 0.62,
+   different people ≈ −0.06. Free per call; costs ~300MB RAM + a ~250MB
+   model download per boot with the default ArcFace. No landmark alignment
+   in v1 (slightly below Rekognition accuracy).
+2. **AWS Rekognition CompareFaces** — managed, no RAM cost, ~$0.001/image.
+   Enabled automatically when the S3 credentials are present
+   (`REKOGNITION_ENABLED=false` to turn off).
+3. **Legacy ONNX vision** (`VISION_ENABLED`) — the original style-embedding
+   comparison; kept only for compatibility.
+
+Liveness is asserted by the on-device flow (`/verify/attestation`); a still
+image can't prove liveness server-side.
+
+### Fake-profile detection at photo upload
+
+Every stored profile photo is screened asynchronously (flags go to
+`trust_safety_events` for review; uploads are never auto-blocked):
+
+- **Duplicate-face detection** (self-hosted, needs `FACE_VERIFY_ONNX=1`):
+  the photo's ArcFace embedding is upserted into `user_face_embeddings`
+  (pgvector) and ANN-searched against all other accounts — the same face on
+  two accounts is the classic stolen-photo / fake-profile signal. Threshold
+  `FACE_DUP_THRESHOLD` (cosine, default 0.5); flags as
+  `flag_duplicate_face` with the matching user ids + similarities.
+- **Celebrity screening** (opt-in: `CELEB_SCREENING_ENABLED=1`, needs
+  Rekognition): `RecognizeCelebrities` at `CELEB_MATCH_MIN_CONFIDENCE`
+  (default 90), flags as `flag_celebrity_photo`. Off by default; it requires
+  a curated celebrity gallery no self-hosted model provides.
 
 ## API Contract
 
@@ -858,6 +1471,363 @@ Every user interaction automatically populates the graph:
 
 Graph powers: collaborative filtering, friend-of-friend discovery, fraud detection, community clustering.
 
+## API Base URLs
+
+| Environment | HTTP | WebSocket |
+|------------|------|-----------|
+| Development | `http://127.0.0.1:8080` | `ws://127.0.0.1:8080` |
+| Production | `https://api.nava.app` | `wss://api.nava.app` |
+
+## Client Apps
+
+| App | Stack | Repo |
+|-----|-------|------|
+| **iOS** | SwiftUI, StoreKit 2 | `navaswift-ui-iOS-` |
+| **Cross-Platform** | React Native, Expo, RevenueCat | `nava-dating-app-v1-main` |
+| **Ambassador Dashboard** | React, TypeScript, Vite | Included in this repo |
+
+## Deployment
+
+```mermaid
+flowchart LR
+    gh["GitHub<br/>rust-backend/**"] --> ci["Actions<br/>fmt · clippy -D warnings<br/>cargo test · migrations"]
+    ci --> ecr["ECR<br/>{sha7}-{timestamp}"]
+    ecr --> k["EKS — nava-production"]
+
+    subgraph k8s["kustomize overlays/prod"]
+        dep["Deployment<br/>HPA 3→10 pods<br/>CPU 70% · mem 80%"]
+        ing["ALB Ingress + ACM"]
+        pvc["PVC — models · uploads (EFS RWX)"]
+    end
+
+    k --> k8s
+    ing --> dep
+    dep --- rds[("RDS Postgres<br/>ExternalName")]
+    dep --- ec[("ElastiCache Redis<br/>ExternalName")]
+    dep --- s3[("S3 / MinIO")]
+    ci -.->|"rollout fails"| undo["kubectl rollout undo"]
+
+    classDef s fill:#1f6f4a,stroke:#2e9e6b,color:#fff
+    class rds,ec,s3 s
+```
+
+A multi-stage Dockerfile produces a single static-ish binary image. Postgres and
+Redis are reached through `ExternalName` Services pointing at RDS and
+ElastiCache, so the cluster runs stateless pods only. Deploys are gated on a
+health check and roll back automatically on failure.
+
+> `k8s/pvc.yaml` is not listed in `base/kustomization.yaml`, so a plain
+> `kubectl apply -k overlays/prod` creates a Deployment referencing PVCs that do
+> not exist. Apply `k8s/pvc.yaml` explicitly, or add it to the base kustomization.
+
+
+
+
+### Development (in-cluster databases)
+```bash
+kubectl create namespace nava-dev
+kubectl apply -k rust-backend/k8s/overlays/dev/
+```
+
+### Production (RDS + ElastiCache)
+```bash
+kubectl create namespace nava-prod
+
+# Configure secrets (use AWS Secrets Manager in production)
+kubectl create secret generic nava-secrets \
+  --from-env-file=.env.production -n nava-prod
+
+# Deploy
+kubectl apply -k rust-backend/k8s/overlays/prod/
+
+# Verify
+kubectl get pods -n nava-prod
+kubectl get hpa -n nava-prod
+```
+
+### CI/CD Pipeline
+Automated via GitHub Actions (`.github/workflows/rust-ci.yml`):
+1. **Test** — `cargo fmt`, `cargo clippy`, `cargo test --lib`
+2. **DB Integration Tests** — PostgreSQL 16 service container, runs migrations, swipes partition regression test, statement_timeout verification (direct + PgBouncer modes)
+3. **Build** — Multi-stage Docker build, push to ECR
+4. **Deploy** — Rolling update to EKS with auto-rollback on failure
+
+### Kubernetes Features
+- **HPA** — Auto-scales 3→20 pods based on CPU (65%) and memory (75%)
+- **PDB** — Minimum 2 pods always available during upgrades
+- **Rolling updates** — Zero-downtime with `maxUnavailable: 0`
+- **Topology spread** — Pods distributed across AZs
+- **Network policies** — Restricted pod-to-pod traffic
+- **IRSA** — IAM Roles for Service Accounts (no embedded credentials)
+- **ALB Ingress** — TLS via ACM, WebSocket sticky sessions
+
+## Monitoring & Alerting
+
+### Prometheus Metrics (`/metrics`)
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `app_http_requests_total` | Counter | Total HTTP requests by method/path/status |
+| `http_request_duration_seconds` | Histogram | Request latency by endpoint |
+| `app_db_pool_size` / `app_db_pool_idle` | Gauge | Database connection pool utilization |
+| `app_websocket_connections` | Gauge | Active WebSocket connections |
+| `app_photos_rejected_quality` | Counter | Photos rejected by aesthetic/blur/light scoring |
+| `app_moderation_actions_total` | Counter | Content moderation decisions applied |
+| `app_trust_safety_flags_total` | Counter | Trust & safety suspicious behavior flags |
+| `app_upload_deferrals_total` | Counter | Uploads deferred due to client battery/thermal state |
+| `app_ml_fallback_total` | Counter | Discover requests that fell back to attractiveness scoring |
+| `app_discover_requests_total` | Counter | Total discover requests (for fallback rate calculation) |
+| `app_ml_avg_scoring_latency_us` | Gauge | Average ML scoring latency in microseconds |
+| `app_vision_unavailable_total` | Counter | Vision endpoint requests when sidecar unavailable |
+| `app_swipe_writes_total` | Counter | Total swipe writes (like + pass) for TPS monitoring |
+| `app_replica_lag_ms` | Gauge | Read replica replication lag in milliseconds |
+| `app_replica_healthy` | Gauge | Read replica health (1=healthy, 0=degraded) |
+| `app_reads_from_replica` | Counter | Reads served by replica |
+| `app_reads_fallback_to_primary` | Counter | Reads that fell back to primary |
+| `dlq_entries_pending` | Gauge | Pending DLQ entries by queue |
+| `app_fl_rounds_completed` | Counter | Federated learning aggregation rounds completed |
+| `app_fl_head_weight_norm` | Gauge | L2 norm of personalization head weights (stability signal) |
+| `app_fl_cold_start_buckets` | Gauge | Number of active cold-start intent buckets |
+| `app_fl_notif_predictor_norm` | Gauge | L2 norm of notification click predictor weights |
+| `app_fl_dp_enabled` | Gauge | Whether differential privacy is enabled for FL (1/0) |
+| `notif_sent_total` | Counter | Total notifications sent (notification service) |
+| `notif_blocked_cap` | Counter | Notifications blocked by daily cap |
+| `notif_blocked_cooldown` | Counter | Notifications blocked by cooldown period |
+| `notif_blocked_optout` | Counter | Notifications blocked by user opt-out |
+| `notif_deferred_quiet` | Counter | Notifications deferred due to quiet hours |
+| `notif_deferred_timing` | Counter | Notifications deferred by send-time optimizer |
+| `notif_engagement_success` | Counter | Notification opens/clicks (success) |
+| `notif_engagement_failure` | Counter | Notification ignores (failure) |
+| `notif_variant_sends` | Gauge | Per-variant send count (bandit arms) |
+| `notif_variant_expected_rate` | Gauge | Per-variant expected open rate (Thompson Sampling) |
+
+### SLO Definitions
+
+| SLO | Target | Alert Threshold |
+|-----|--------|----------------|
+| **Availability** | 99.9% (43 min/month) | Error rate > 0.1% for 5m |
+| **API Latency** | p99 < 500ms | > 500ms for 5m |
+| **Discover Latency** | p99 < 200ms | > 200ms for 5m |
+| **DB Pool** | < 80% utilization | > 80% for 3m |
+| **Payment DLQ** | < 50 pending | > 50 for 10m |
+| **ML Scoring** | avg < 10ms | > 10ms for 5m |
+| **ML Fallback Rate** | < 5% | > 5% for 5m (warning), > 20% (critical) |
+| **WebSocket Capacity** | < 8,000 connections | > 8,000 for 5m |
+| **Notif Throttle Rate** | < 40% blocked/deferred | > 40% for 15m |
+| **Notif Engagement** | > 5% open rate | < 5% for 2h |
+| **Notif Variant Skew** | No single variant > 80% | > 80% for 1h |
+| **FL Aggregation** | Continuous rounds | Stalled for 6h (warning) |
+| **FL Weight Stability** | Head norm < 10.0 | > 10.0 for 15m |
+| **FL DP Enabled** | Always on in prod | Disabled for 5m (critical) |
+| **Canary Staleness** | Evaluate within 48h | Shadow mode > 48h without eval |
+
+### Alert Routing
+
+| Severity | Channels |
+|----------|----------|
+| **Warning** | Slack (`#nava-platform-alerts`, `#nava-payments-alerts`) |
+| **Critical** | Slack urgent channels + PagerDuty on-call |
+| **Security** | `#nava-security-alerts` + email to security team |
+
+**Alert Groups (15):** availability, latency, database, payments, ML scoring, vision, WebSocket, infrastructure, replica, PgBouncer, query, notification policy, content pipeline, FL stability, canary.
+
+Alert rules defined in `rust-backend/deploy/slo-alerts.yml` (38 alerts). Alertmanager config in `rust-backend/monitoring/alertmanager.yaml`.
+
+### Health Probes
+
+| Endpoint | Purpose | Details |
+|----------|---------|---------|
+| `/health` | Basic liveness | Returns 200 if app is running |
+| `/health/detailed` | Component health | DB pool, Redis, replica status, ML engine |
+| `/ready` | K8s readiness | Checks DB connectivity |
+| `/metrics` | Prometheus scrape | All counters, gauges, histograms |
+
+## Graceful Degradation
+
+| Component | When Unavailable | User Impact |
+|-----------|-----------------|-------------|
+| **Vision sidecar** | 503 on `/vision/analyze`, `/verify/selfie` | Photo analysis skipped, verification unavailable |
+| **ML ranking** | 2s timeout → attractiveness score fallback | Lower-quality discover rankings |
+| **ML `record_swipe`** | Fire-and-forget (`tokio::spawn`) | Zero impact on swipe latency |
+| **Read replica** | Auto-fallback to primary (lag >2s) | No user impact, higher primary load |
+| **Redis (cache)** | App runs without cache | Slightly slower responses |
+| **Notification bandit** | Shadow mode sends control variant | No variant optimization, baseline behavior |
+| **FL aggregation** | Stalled rounds, head weights frozen | Personalization stops improving, cold-start biases stale |
+| **Notif click predictor** | Falls back to uniform bandit priors | Bandit explores without informative priors |
+
+### Webhook Resilience
+- Razorpay and Stripe webhooks catch processing failures and auto-enqueue to DLQ
+- Always return 200 to payment gateway (prevents infinite retries)
+- DLQ entries can be retried or manually reviewed via `/api/payments/dlq/*` endpoints
+
+## Operations
+
+Full ops runbook at `rust-backend/deploy/ops-runbook.md` covering:
+- K8s secret rotation procedure (`SECRET_KEY_FILE` pattern)
+- SLO definitions and burn rate windows
+- Alert response playbooks for every alert (38 alerts across 15 groups)
+- ML fallback investigation and remediation
+- PgBouncer admin commands and scaling
+- Read replica monitoring and scaling
+- Write scaling roadmap and sharding strategy
+- Notification policy operations (bandit, caps, quiet hours, send-time)
+- Shadow-mode canary rollout procedure (6-step with SQL validation)
+- FL aggregation monitoring and weight drift investigation
+
+### Shadow-Mode Canary Script
+
+Operational script at `rust-backend/deploy/canary-shadow-notif.sh` for safe notification variant rollout:
+
+```bash
+./canary-shadow-notif.sh --enable     # Enable shadow mode (bandit selects but sends control)
+./canary-shadow-notif.sh --monitor    # Check canary health: metrics, alerts, DB outcomes
+./canary-shadow-notif.sh --evaluate   # Evaluate uplift with safety gates (sample size, skew, throttle)
+./canary-shadow-notif.sh --promote    # Promote bandit to live (sends winning variant)
+./canary-shadow-notif.sh --rollback   # Roll back to shadow mode
+```
+
+**Guardrails:** min 200 samples, throttle rate < 40%, variant skew < 80%, uplift threshold 2pp.
+Dry-run test harness at `rust-backend/deploy/test-canary-guardrails.sh` (28 tests).
+
+## Testing
+
+```bash
+# Unit & integration tests (127 tests: 84 unit + 43 integration)
+cd rust-backend && cargo test
+
+# Database integration tests (CI-automated)
+psql -f rust-backend/tests/swipes_partition_test.sql    # Partition regression
+psql -f rust-backend/tests/statement_timeout_test.sql   # Timeout verification
+
+# Load testing (PgBouncer + replica validation)
+k6 run tests/load/k6-pgbouncer-replica.js               # ML fallback, replica lag, pool saturation
+
+# Other test suites
+tests/e2e/run_tests.sh          # End-to-end user flows
+tests/load/k6 run load_tests.js # k6 load tests
+tests/contract/run_tests.sh     # API contract validation
+tests/smoke/run_tests.sh        # Health checks
+tests/fuzz/cargo +nightly fuzz  # Fuzz testing
+tests/chaos/chaos_tests.sh      # Resilience testing
+```
+
+## Performance Targets
+
+| Metric | Target | SLO Alert |
+|--------|--------|-----------|
+| Availability | 99.9% (43 min/month) | Error rate > 0.1% for 5m |
+| API latency (p99) | < 500ms | > 500ms for 5m |
+| Discover latency (p99) | < 200ms | > 200ms for 5m |
+| ML scoring latency | < 10ms avg (in-memory) | > 10ms for 5m |
+| ML fallback rate | < 5% | > 5% warning, > 20% critical |
+| WebSocket connections | 10K+ per node | > 8,000 for 5m |
+| WebSocket latency | < 50ms | — |
+| DB pool utilization | < 80% | > 80% for 3m |
+| Write TPS capacity | ~5,000-8,000 | > 500 TPS sustained 10m |
+| Replica lag | < 2s | > 2s auto-fallback to primary |
+| Notif throttle rate | < 40% | > 40% blocked/deferred for 15m |
+| FL head weight norm | < 10.0 | > 10.0 for 15m (weight divergence) |
+
+## Data Models
+
+### UserProfile
+```
+id, name, phoneNumber, dob, age, gender, bio, location,
+profession, professionCategory, professionTitle,
+interests[], languages[], photos[], heightCm,
+lookingFor (long_term | short_term | casual | friendship | figuring_out),
+voiceIntroUrl, isProfileComplete, isVerified, isStudentVerified
+```
+
+### DiscoverProfile
+```
+id, name, age, bio, location, photos[], interests[], languages[],
+compatibilityScore (RL-scored), professionTitle, isVerified,
+voiceIntroUrl, hasVoiceIntro, hasReels, superLikedYou
+```
+
+### ChatMessage
+```
+id, matchId, senderId, receiverId, content, createdAt, isRead
+status: sending → sent → delivered → read
+```
+
+### Match
+```
+id, partner { id, name, age, location, bio, photos[] }, isMutual, status, matchedAt
+```
+
+### Reel / Spot
+```
+id, userId, userName, userAge, userPhoto, videoUrl, title, description,
+likeCount, viewCount, isVerified, location, tags[], compatibilityScore
+```
+
+### Call
+```
+callId, callType (audio | video), token, signalingUrl
+status: idle → connecting → ringing → active → idle
+```
+
+### Preferences
+```
+minAge, maxAge, maxDistanceKm, preferredGenders[], onlyVerified, onlyStudents
+```
+
+### Internal Database Tables
+
+| Table | Purpose |
+|-------|---------|
+| `notification_outcomes` | Sent notifications with variant_id, category, sent_at, opened_at for offline eval |
+| `notification_preferences` | Per-user opt-outs, daily caps, quiet hours |
+| `in_app_notifications` | In-app notification feed |
+| `fl_local_data` | Per-user FL local dataset stats (sample count, quality) |
+| `llm_labeling_queue` | Queue of reels/messages for LLM labeling |
+| `reel_llm_labels` | LLM-generated labels for reels (genre, mood, tags) |
+| `message_llm_labels` | NLP labels for messages (toxicity, intent) |
+| `user_llm_labels` | User-level labels from profile analysis |
+| `llm_training_snapshots` | Exported snapshots for model training |
+| `device_fingerprints` | Device model, OS, screen, timezone, language hashes |
+| `trust_safety_events` | Flagged anomalies (ring detection, velocity) |
+| `moderation_appeals` | User appeals of moderation decisions |
+| `content_moderation` | Moderation decisions (blurred, muted, etc.) |
+| `photo_quality_log` | Photo scoring and rejection reasons |
+| `media_renditions` | Image variants (150px, 400px, 1080px) |
+| `user_content_preferences` | Learned engagement scores with content genres |
+| `universities` | University database (name, country, domain) |
+| `student_discovery_swipes` | Swipes from university-specific discovery |
+| `payment_retry_tracking` | Webhook retry state for idempotency |
+
+## Media Storage (MinIO / S3)
+
+By default uploads are written to local disk (`UPLOAD_DIR`, served at `/uploads`).
+On Railway the container filesystem is **ephemeral** — every deploy wipes user
+photos, voice intros, reels and HLS output. Production must point storage at an
+S3-compatible object store; MinIO is the self-hosted option (Railway template +
+attached Volume), and the same configuration works for Cloudflare R2 or AWS S3.
+
+```bash
+STORAGE_BACKEND=s3
+S3_ENDPOINT=http://minio.railway.internal:9000   # MinIO private-network URL (omit for AWS)
+S3_BUCKET=nava-media
+S3_ACCESS_KEY=...                                # MINIO_ROOT_USER
+S3_SECRET_KEY=...                                # MINIO_ROOT_PASSWORD
+```
+
+Design notes:
+- The backend speaks AWS Signature V4 directly (no AWS SDK dependency); a
+  custom `S3_ENDPOINT` switches to path-style addressing, which is what MinIO
+  expects. The bucket is created automatically at boot.
+- Clients are unaffected: the DB keeps storing relative `/uploads/...` paths
+  and the API serves them either from disk (local mode) or by streaming from
+  the object store through `GET /uploads/{key}` (S3 mode), with HTTP Range
+  passthrough so video seeking keeps working.
+- ffmpeg still transcodes HLS on local scratch; segments and playlists are
+  uploaded to the store when the transcode finishes, before `hls_state` flips
+  to `ready`.
+- Integration test (spins against a throwaway MinIO container):
+  `cargo test --bin telugu-dating-backend minio_roundtrip -- --ignored`
+
 ## Tech Stack
 
 | Layer | Technologies |
@@ -1037,348 +2007,6 @@ Graph powers: collaborative filtering, friend-of-friend discovery, fraud detecti
 | **cargo** | Rust build system and package manager |
 | **protoc / prost** | Protocol Buffers code generation |
 
-## ML & AI Architecture
-
-Four execution tiers, chosen per use case. Nothing on the request path calls a
-model server: ranking is hand-written linear algebra in Rust, vision is ONNX on
-CPU in-process, generative work is on-device, and gradient training is offline.
-
-```mermaid
-flowchart TB
-    subgraph device["On-device — iOS (Swift repo)"]
-        clip["MobileCLIP · Core ML<br/>photo + query embeddings"]
-        bit["BitNet b1.58-2B-4T<br/>chat suggestions"]
-        lora["LoRA adapter<br/>per-user personalization"]
-        head["personalization head<br/>33 params · local SGD"]
-    end
-
-    subgraph rust["In-process Rust — request path"]
-        rl["RL agent · Q-learning<br/>28-dim state · 2 actions"]
-        lin["LinUCB bandit<br/>shadow-only"]
-        geo["geo gravity<br/>1/(1+d^1.5)"]
-        aff["affinity<br/>Jaccard + co-like CF"]
-        eng["engagement<br/>churn · send-time · Thompson"]
-        router["RankingRouter<br/>experiment → canary → default"]
-    end
-
-    subgraph onnx["In-process ONNX — tract, CPU"]
-        arc["ArcFace 112²<br/>512-d identity"]
-        uf["UltraFace RFB-320<br/>detect + crop"]
-        nsfw["NSFW · FER+ · NIMA<br/>liveness"]
-    end
-
-    subgraph offline["Offline Python — outside the binary"]
-        fed["fedlora_trainer.py<br/>torch · PEFT → GGUF"]
-        gnn["gnn_trainer.py<br/>LightGCN"]
-    end
-
-    subgraph stores["Persistence"]
-        pgv[("pgvector<br/>face + CLIP 512-d<br/>HNSW cosine")]
-        js[("Postgres JSON<br/>fl_models · bandit_arm_stats")]
-    end
-
-    cloud["AWS Rekognition<br/>CompareFaces · celebrities"]
-
-    clip --> pgv
-    head --> fed
-    lora -.->|"downloaded by device"| device
-    fed --> lora
-    gnn --> pgv
-    rl --> js
-    lin --> js
-    router --> rl
-    router --> geo
-    router --> aff
-    rl -.->|"agreement rate only"| lin
-    arc --> pgv
-    uf --> arc
-    nsfw --> onnx
-    onnx -.->|"fallback"| cloud
-
-    classDef d fill:#4a2b6b,stroke:#7a4bb0,color:#fff
-    classDef s fill:#1f6f4a,stroke:#2e9e6b,color:#fff
-    classDef o fill:#6b4a1f,stroke:#a8762e,color:#fff
-    class clip,bit,lora,head d
-    class pgv,js s
-    class fed,gnn,cloud o
-```
-
-| Tier | Runs where | Why there |
-|---|---|---|
-| On-device | iOS, Core ML + `bitnet.cpp` | private by construction; no photo or draft message leaves the phone |
-| Rust in-process | request thread | sub-ms scoring, no model-server hop, no OOM risk |
-| ONNX CPU | `spawn_blocking` pool | identity/safety models are small; CPU is enough and keeps GPU cost at zero |
-| Offline Python | cron/worker | gradient training needs torch; results ship back as weights or embeddings |
-
-> On-device model code lives in the **iOS repo** (`Packages/NavAI`). This backend
-> owns the orchestration only: signal collection, aggregation, adapter registry
-> and the vector store.
-
-### Ranking and personalization
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client
-    participant H as /discover
-    participant R as Redis
-    participant M as MlService
-    participant P as Postgres
-
-    C->>H: GET /discover
-    H->>R: discover:{user_id}
-    alt cache hit (TTL 120s)
-        R-->>C: ranked feed
-    else miss
-        H->>P: candidate SQL — prefs, distance, filters
-        H->>M: score(user, candidates)
-        Note over M: 0.55·RL + 0.20·geo + 0.20·affinity<br/>+ churn boost ≤0.15 + super-like 0.15
-        M->>M: LinUCB scored in shadow — agreement only
-        M-->>H: ordered candidates
-        Note over H,M: 2s timeout → attractiveness ordering<br/>+ inc_ml_fallback()
-        H->>R: cache write-back
-        H-->>C: ranked feed
-    end
-    C->>H: POST /profiles/like
-    H->>M: record_swipe_weighted (like 1.0 · super 3.0 · pass −0.5)
-    Note over M,P: every 10th swipe → train_batch(32)<br/>→ checkpoint weights as JSON
-    M->>P: persist fl_models
-```
-
-Training is **online and in the request path** — there is no separate training
-service for ranking. Every tenth swipe triggers a 32-sample replay batch and a
-checkpoint, so the model warm-starts from Postgres on the next boot.
-
-### Vision, verification and anti-fraud
-
-```mermaid
-flowchart TB
-    up["photo / selfie upload"] --> sel{"POST /verify/selfie"}
-
-    sel --> t1["1 · self-hosted ONNX<br/>ArcFace cosine vs profile photos"]
-    t1 -->|unavailable| t2["2 · AWS Rekognition<br/>CompareFaces, threshold 50"]
-    t2 -->|unavailable| t3["3 · legacy VisionAnalyzer<br/>scene embedding + NSFW"]
-    t3 -->|unavailable| err["503 + inc_vision_unavailable()"]
-
-    t1 --> ok["is_verified"]
-    t2 --> ok
-    t3 --> ok
-
-    up -.->|"fire and forget, never blocks"| fraud["spawn_photo_fraud_screen"]
-    fraud --> emb["ArcFace 512-d"]
-    emb --> ann["pgvector ANN<br/>user_face_embeddings<br/>cosine ≥ 0.5, other accounts"]
-    ann -->|match| flag["trust_safety_events<br/>flag_duplicate_face · risk 0.9"]
-    fraud --> celeb["RecognizeCelebrities<br/>opt-in, confidence ≥ 90"]
-    celeb --> flag2["flag_celebrity_photo"]
-
-    classDef w fill:#7d3b2b,stroke:#b35a42,color:#fff
-    class err,flag,flag2 w
-```
-
-Liveness is **not** proven server-side — a still image cannot demonstrate it, so
-the score is pinned at `1.0` and real liveness is expected from the device.
-`POST /verify/attestation` currently trusts client-supplied match and liveness
-scores; Apple App Attest verification is still a seam.
-
-### Federated learning and the LoRA loop
-
-```mermaid
-flowchart LR
-    subgraph phone["Device"]
-        sig["swipe / chat signals"]
-        sgd["local SGD<br/>33-param head"]
-        inf["BitNet + LoRA<br/>suggestion inference"]
-    end
-
-    subgraph server["Rust backend"]
-        api["POST /fl/lora/signal<br/>POST /fl/update"]
-        agg["FedAvg + Laplace DP<br/>validate: dims, NaN, ‖v‖≤100"]
-        q["lora_jobs<br/>FOR UPDATE SKIP LOCKED"]
-        reg["adapter registry<br/>url + sha256 + rank"]
-    end
-
-    trainer["fedlora_trainer.py<br/>torch · PEFT → GGUF"]
-    obj[("S3 / MinIO")]
-
-    sig --> api --> agg
-    sgd --> api
-    agg -->|"≥20 signals"| q
-    q --> trainer
-    trainer --> obj
-    trainer --> reg
-    reg -->|"GET /suggestions/adapter"| inf
-    obj -.->|"download"| inf
-
-    classDef s fill:#1f6f4a,stroke:#2e9e6b,color:#fff
-    classDef o fill:#6b4a1f,stroke:#a8762e,color:#fff
-    class obj s
-    class trainer o
-```
-
-`FederationSafety` declares face embeddings, GPS and message content
-off-limits; updates are validated for dimension, NaN/Inf and magnitude before
-aggregation. The server never touches adapter weights — it stores a URL and a
-`sha256`, and the device fetches and verifies.
-
-### Defaults worth knowing
-
-| Capability | State | Gate |
-|---|---|---|
-| RL + geo + affinity blend | live | always on, 2s timeout |
-| LinUCB bandit | shadow-only | scored, never orders results |
-| GNN (LightGCN) embeddings | off | `GNN_SCORE_WEIGHT` default `0.0` |
-| Visual similarity score | off | `VISUAL_SCORE_WEIGHT` default `0.0` |
-| Auto-matchmaker rounds | off | `AUTO_MATCH_ENABLED` default `false` |
-| FedLoRA auto-training | off | `LORA_AUTO_TRAIN_ENABLED` default `false` |
-| Celebrity screening | off | `CELEB_SCREENING_ENABLED` |
-| Text toxicity scoring | **stub** | returns `0.0`; only keyword/spam heuristics are live |
-| Matchmaker "agent" | no LLM | intent parsing is Rust string matching |
-
-### In-Memory ML Engine (Rust)
-
-All ML computation runs in-process for sub-millisecond scoring latency:
-
-| Component | Algorithm | Details |
-|-----------|-----------|---------|
-| **RL Agent** | Q-Learning | 28-dim state (14 user + 14 candidate features), epsilon-greedy (0.3→0.01, decay 0.995), per-user model blending (70% global + 30% personal), 10K experience replay buffer, warm-start from DB checkpoint |
-| **LinUCB Bandit** | Contextual Bandit | UCB scoring with Gauss-Jordan matrix inverse, per-arm A-matrix + b-vector, alpha=0.6, observation decay 0.995, JSONB persistence to PostgreSQL, warm-start on boot |
-| **Shadow Scoring** | RL vs LinUCB | Top-half agreement tracking between RL and LinUCB rankings for model comparison and observability |
-| **FedAvg** | Federated Learning | Weighted averaging by sample count, Laplace noise differential privacy (scale 0.1), min 2 clients per round, global learning rate 0.1 |
-| **Personalization Head** | On-Device FL | 33-param last-layer (32 weights + 1 bias), devices fine-tune via SGD on local swipe outcomes, FedAvg deltas aggregated server-side with DP |
-| **Cold-Start Biasing** | Affinity FL | Per-intent-bucket weight adjustments (5-dim: interest, language, intent, CF, geo), EMA smoothing (0.7/0.3), ±0.3 clamping, DP noise |
-| **Notif Click Predictor** | Engagement FL | 6-feature on-device logistic regression (hour, day, category, recency, daily count, match flag), federated updates, feeds bandit priors |
-| **Federation Safety** | Privacy Boundary | Explicit allow/deny list for federated data, gradient clipping (\|val\| < 100), NaN/Inf validation, dimension checks per update type |
-| **Geo Scorer** | Gravity Model | Haversine distance + local density smoothing (KDE bandwidth 50km), gravity beta=1.5, configurable max distance + units (km/miles) |
-| **Affinity Scorer** | Multi-Signal Overlap | Interest Jaccard (35%), language overlap (15%), intent alignment (20%), collaborative filtering via CoLikeMatrix (30%) |
-| **Engagement Scorer** | Churn + Timing | Logistic regression churn predictor (5 features), per-user send-time histograms (24 hourly buckets), Thompson Sampling notification bandit |
-| **CoLike Matrix** | Collaborative Filtering | User-user co-like signals rebuilt periodically, feeds into affinity scorer CF weight |
-
-**Discovery Ranking Blend (multi-signal):**
-```
-SQL candidates → Multi-signal scoring → Re-rank by blended score → Return to client
-     ↓                ↓                                                 ↓
-  Filters       ┌─── 55% RL score (Q-learning)                  Like/Pass feeds back
-  (age, dist,   ├─── 20% Geo score (gravity model + density)    into RL + LinUCB training
-   verified)    ├─── 20% Affinity score (interest/lang/intent/CF)(every 10 swipes → checkpoint)
-                ├─── + churn boost (up to 0.15 for at-risk users)
-                └─── + super like boost (+0.15 if candidate super-liked you)
-                      LinUCB shadow scoring (observability, top-half agreement)
-```
-
-**2s timeout on ML ranking** — if scoring takes too long, falls back to `attractiveness_score` ordering. Fallback rate tracked via `app_ml_fallback_total` with SLO alert at >5%.
-
-**Feature Vector (14 dimensions per user):**
-
-| # | Feature | Category | Range | Source |
-|---|---------|----------|-------|--------|
-| 1 | `age_norm` | Profile | 0-1 | Normalized age (18-60) |
-| 2 | `attractiveness` | Profile | 0-1 | Attractiveness score from users table |
-| 3 | `profile_completeness` | Profile | 0-1 | Ratio of filled fields (9 total) |
-| 4 | `verification_score` | Profile | 0-1 | Selfie (0.5) + student (0.5) verification |
-| 5 | `photo_count` | Profile | 0-1 | Normalized photo count (max 4) |
-| 6 | `height_norm` | Profile | 0-1 | Normalized height (140-200cm) |
-| 7 | `has_profession` | Profile | 0/1 | Whether profession_category is set |
-| 8 | `gender_enc` | Profile | 0-1 | male=0.0, female=1.0, non_binary=0.5 |
-| 9 | `intent_enc` | Richness | 0-1 | relationship=1.0, casual=0.5, friendship=0.25 |
-| 10 | `language_count` | Richness | 0-1 | Languages spoken (capped at 5) |
-| 11 | `interest_count` | Richness | 0-1 | Interests listed (capped at 10) |
-| 12 | `activity_score` | Engagement | 0-1 | 7-day interaction count (normalized) |
-| 13 | `like_rate` | Swipe | 0-1 | Fraction of swipes that were likes |
-| 14 | `match_rate` | Swipe | 0-1 | Fraction of likes that became mutual matches |
-
-**RL state** = user features (14) + candidate features (14) = **28 dimensions**
-
-**Feature Defaults:** Population-level means computed from DB on startup, with hardcoded neutral fallback if DB is unavailable. Used when per-user features can't be fetched.
-
-**Model Persistence:**
-- RL checkpoint saved to `fl_models` table (versioned, active flag) every 10 swipes
-- LinUCB arms saved to `bandit_arm_stats` table (A-matrix, b-vector, pulls, reward)
-- Both warm-started from DB on service boot
-
-### On-Device Federated Learning
-- **Privacy-preserving model aggregation** across clients (min 10 clients, 10% fraction per round)
-- **Differential Privacy** — Noise multiplier (1.0) + gradient clipping (norm 1.0) for user data protection
-- **FL Training Data** — `/fl/training-data` endpoint provides labeled swipe pairs (like=1.0, pass=0.0, mutual=1.5) with 28-dim combined state vectors and feature schema
-- **Personalization Head** — 33-param last-layer fine-tuned on-device; server aggregates deltas via FedAvg with DP noise; head norm monitored for weight divergence (alert at L2 > 10.0)
-- **Cold-Start Biasing** — Per-intent affinity weight adjustments aggregated from early swipe patterns; EMA smoothing prevents oscillation; clamped to ±0.3 to prevent wild swings
-- **Notification Click Predictor** — 6-feature on-device logistic regression predicting push notification open probability; federated updates feed Thompson Sampling bandit priors
-- **Federation Safety Boundary** — Explicit allow/deny for federated data: behavioral gradients (allowed), face embeddings/device-risk/location (forbidden); gradient clipping at |val| < 100, NaN/Inf rejection
-- **Config:** `FL_ENABLED`, `FL_MIN_CLIENTS`, `FL_CLIENT_FRACTION`, `FL_LOCAL_EPOCHS`, `FL_LEARNING_RATE`, `FL_DP_ENABLED`
-
-### LLM Integration (LLaMA 3)
-- **Content Labeling** — Automated profile/bio moderation and tagging
-- **Auto-Queue on Send** — All chat messages (WebSocket, GraphQL, reel, spot, like) auto-queued for toxicity/intent labeling with priority-based processing
-- **Batch Inference** — Configurable batch size (10) with retry logic (max 3)
-- **Config:** `LLM_ENABLED`, `LLM_API_URL`, `LLM_MODEL_NAME=llama3`, `LLM_BATCH_SIZE`
-
-### Computer Vision Pipeline
-- **Face Recognition** — ArcFace embedding extraction + cosine similarity matching
-- **Selfie Liveness Detection** — LBP entropy + FFT frequency + HSV color analysis (weights 0.4/0.4/0.2)
-- **Emotion Detection** — FER+ 8-emotion classification
-- **NSFW Detection** — CNN/ViT classification for explicit content, nudity scoring, and moderation flagging
-- **Image Quality** — NIMA aesthetic scoring + blur detection (Laplacian variance) + low-light detection (luminance histogram)
-- **Photo Ranking** — Composite score from aesthetic quality, face ratio checks (face area / frame area), blur/noise levels; auto-ranks user photos for optimal profile ordering
-- **Duplicate Face Detection** — Cross-user ArcFace embedding comparison to detect stolen/catfish photos
-
-### Trust & Safety ML
-- **Graph Anomaly Detection** — Postgres CTE-based queries detecting suspicious swipe/match/message patterns (ring detection, velocity anomalies, fan-out clusters)
-- **Device Fingerprinting** — Device model, OS version, screen resolution, timezone, language; hashed fingerprint stored for multi-account detection and ban evasion tracking
-- **Behavioral Classifiers (GBDT)** — Gradient-boosted decision tree models on behavioral signals: swipe velocity, like-to-match ratio, message response time distribution, report frequency; produces per-user trust score (0-1)
-- **Ban Evasion Detection** — Device fingerprint + IP + behavioral similarity matching against banned accounts; auto-flags accounts with >80% similarity
-
-### Content Moderation Pipeline
-
-| Layer | Technique | Coverage |
-|-------|-----------|----------|
-| **Visual** | CNN/ViT NSFW detection, face/liveness verification, duplicate face detection | Photos, selfies, reels |
-| **Text (NLP)** | Toxicity classifiers (hate, harassment, threats), intent detection | Bios, chat messages, reel captions |
-| **Spam** | URL/link detection, keyword blocklist, regex patterns, message frequency throttling | Chat, bios, reel captions |
-| **Graph** | Anomaly detection on messaging/swipe graphs, coordinated behavior detection | Cross-user interaction patterns |
-
-**Moderation Transparency:**
-- Blocked/blurred photos and muted messages include user-facing reason codes (e.g., `nsfw_detected`, `spam_url`, `hate_speech`)
-- Lightweight appeal path: users can submit appeals via `/moderation/appeal` with the decision trace ID
-- All moderation decisions logged with trace IDs for support team review and audit
-- Moderation dashboard shows false positive rates, appeal outcomes, and per-model accuracy
-
-### Content Freshness & Anti-Gaming
-- **Profile Decay Scoring** — Time-weighted freshness decay on profiles and media; stale profiles (no activity >30 days) receive reduced discover ranking via exponential decay multiplier
-- **Media Freshness** — Photos/reels older than 90 days flagged for refresh prompt; fresh content receives temporary ranking boost
-- **Profile Edit Rate Limiting** — Sliding window rate limits on profile field updates (max 10 edits/hour, 50/day) to prevent gaming/A-B testing of bios and photos
-- **Score Recalculation** — Attractiveness and ML scores periodically recomputed to reflect current engagement patterns, not historical peaks
-
-### Media Optimization
-- **Responsive Image Variants** — Pre-generate multiple photo sizes on upload: thumbnail (150px), card (400px), full (1080px), original
-- **Modern Formats** — AV1/WEBP transcoding for avatars and thumbnails; JPEG fallback for older clients
-- **Smallest Rendition Serving** — CDN serves the smallest acceptable rendition based on `Accept` header, device pixel ratio, and requested viewport size
-- **Reel Compression** — On-device H.264 compression via `AVAssetExportSession` with `shouldOptimizeForNetworkUse = true` (moov atom → front for fast-start streaming). Upload begins immediately on video pick — before user types caption or selects filter. Client-side progressive resolution reduction (2160p→1080p→720p→540p→480p) targets 50MB max file size; 4K kept if already under limit.
-- **Reel Filters** — 7 client-side filters (Original, Vivid, Warm, Cool, Vintage, Drama, Fade) applied via `AVVideoComposition` + `CIFilter` pipeline. Filter thumbnails generated instantly from first frame. Filtered video exported + uploaded in background while user types caption.
-- **HLS Adaptive Streaming** — Server-side FFmpeg transcoding to 3-variant HLS (360p/720p/1080p) with `master.m3u8`. AVPlayer selects optimal quality based on bandwidth. Background processing: upload returns immediately, HLS transcoding runs async. States: `pending` → `processing` → `ready`/`failed`. iOS falls back to direct `video_url` when HLS not ready.
-- **Server-Side Video Normalization** — Accepts uploads up to 2GB. FFmpeg trims to 30s max, progressively reduces resolution only if file exceeds 50MB (tries 2160p→1440p→1080p→720p→480p). 4K video that fits under 50MB is never downscaled.
-- **Apple Music Integration** — Reels support attached music metadata (Apple Music song ID, title, artist, artwork, preview URL, start offset). MusicKit 30s previews — free for all users, no subscription required. Trending music endpoint aggregates most-used songs across reels.
-
-### Client Adaptive Behavior
-- **Battery-Aware Throttling** — Client reports battery level + charging state; server defers non-critical work (reel transcoding notifications, background sync) when battery <20%
-- **Temperature Throttling** — Thermal state reported by client; server reduces media quality and defers heavy uploads when device is thermally throttled
-- **Network-Class Adaptation** — Client reports connection type (WiFi/5G/4G/3G/2G); server adjusts response payloads:
-  - **2G/3G:** Compressed JSON, thumbnail-only photos, no auto-play reels
-  - **4G/WiFi:** Full payloads, card-size photos, reel previews
-  - **5G/WiFi:** Full resolution, HD reels, prefetch next page
-- **Deferred Uploads** — Reel and high-res photo uploads queued client-side when on low battery (<15%) or 2G; auto-resume on WiFi/charging
-
-### Notification Intelligence
-- **Thompson Sampling Bandit** — Beta-distributed arms for 4 notification categories (NewMatch, ReEngage, Like, Message), each with 3 copy variants; shadow mode logs bandit choice but sends control for safe A/B
-- **Send-Time Optimization** — Per-user engagement hour histograms (24 buckets), defers notifications outside peak activity windows
-- **Policy Gate Chain** — 6-stage check: opt-out → daily cap (12/day) → cooldown (5 min) → quiet hours (22:00-07:00 local) → send-time activity → variant selection
-- **Region-Aware Timezone** — 3-tier resolution: device offset → country_code mapping (50+ ISO codes) → UTC fallback
-- **Variant Logging** — All sends logged to `notification_outcomes` table with variant_id, category, sent_at, opened_at for offline evaluation
-- **Shadow-Mode Canary** — Bandit selects variant but always sends control; evaluate uplift with safety gates before promoting to live
-
-### Background Jobs
-- **Graph Query Cache** — Postgres CTE-based friend-of-friend, university network, and fraud detection queries with Redis cache (TTL 5m)
-- **DLQ Processor** — Auto-retry dead letter queue entries with exponential backoff; stats endpoint at `/api/payments/dlq/stats`
-- **Send-Time Refresh** — Notification send-time histograms rebuilt every 6 hours from engagement data
-
 ## Modular Monolith Architecture
 
 Single Rust binary with clean domain boundaries, replacing the previous microservices + Kafka setup.
@@ -1497,254 +2125,6 @@ DomainEvent::SendPush/Email/Sms  →  notification delivery (FCM, APNs, SMTP, Tw
 └── docker-compose.yml         # Dev environment
 ```
 
-## Quick Start
-
-### Rust Backend
-```bash
-cd rust-backend
-cp .env.example .env       # configure DATABASE_URL, REDIS_URL, etc.
-cargo build --release
-cargo run                  # serves on http://127.0.0.1:8080
-```
-
-### Legacy Microservices (superseded)
-```bash
-# The microservices/ directory is preserved for reference but all functionality
-# is now consolidated in the rust-backend modular monolith.
-```
-
-### Ambassador Dashboard
-```bash
-cd ambassador-dashboard
-npm install && npm run dev
-```
-
-## Media Storage (MinIO / S3)
-
-By default uploads are written to local disk (`UPLOAD_DIR`, served at `/uploads`).
-On Railway the container filesystem is **ephemeral** — every deploy wipes user
-photos, voice intros, reels and HLS output. Production must point storage at an
-S3-compatible object store; MinIO is the self-hosted option (Railway template +
-attached Volume), and the same configuration works for Cloudflare R2 or AWS S3.
-
-```bash
-STORAGE_BACKEND=s3
-S3_ENDPOINT=http://minio.railway.internal:9000   # MinIO private-network URL (omit for AWS)
-S3_BUCKET=nava-media
-S3_ACCESS_KEY=...                                # MINIO_ROOT_USER
-S3_SECRET_KEY=...                                # MINIO_ROOT_PASSWORD
-```
-
-Design notes:
-- The backend speaks AWS Signature V4 directly (no AWS SDK dependency); a
-  custom `S3_ENDPOINT` switches to path-style addressing, which is what MinIO
-  expects. The bucket is created automatically at boot.
-- Clients are unaffected: the DB keeps storing relative `/uploads/...` paths
-  and the API serves them either from disk (local mode) or by streaming from
-  the object store through `GET /uploads/{key}` (S3 mode), with HTTP Range
-  passthrough so video seeking keeps working.
-- ffmpeg still transcodes HLS on local scratch; segments and playlists are
-  uploaded to the store when the transcode finishes, before `hls_state` flips
-  to `ready`.
-- Integration test (spins against a throwaway MinIO container):
-  `cargo test --bin telugu-dating-backend minio_roundtrip -- --ignored`
-
-## Face Verification Backends
-
-`POST /verify/selfie` compares the selfie against the user's stored profile
-photos. Three backends, tried in order:
-
-1. **Self-hosted ONNX** (`FACE_VERIFY_ONNX=1`) — UltraFace face detection
-   (~1.2MB) + ArcFace identity embeddings, run on-box via tract-onnx.
-   A proper identity pipeline: detect largest face → crop → 512-d embedding →
-   cosine similarity. Models auto-download at boot into `VISION_MODEL_DIR`
-   when missing (override sources with `FACE_DETECTOR_URL` /
-   `FACE_EMBEDDER_URL`; decision threshold `FACE_ONNX_MATCH_THRESHOLD`,
-   default 0.36 cosine). Validated discrimination: same person ≈ 0.62,
-   different people ≈ −0.06. Free per call; costs ~300MB RAM + a ~250MB
-   model download per boot with the default ArcFace. No landmark alignment
-   in v1 (slightly below Rekognition accuracy).
-2. **AWS Rekognition CompareFaces** — managed, no RAM cost, ~$0.001/image.
-   Enabled automatically when the S3 credentials are present
-   (`REKOGNITION_ENABLED=false` to turn off).
-3. **Legacy ONNX vision** (`VISION_ENABLED`) — the original style-embedding
-   comparison; kept only for compatibility.
-
-Liveness is asserted by the on-device flow (`/verify/attestation`); a still
-image can't prove liveness server-side.
-
-### Fake-profile detection at photo upload
-
-Every stored profile photo is screened asynchronously (flags go to
-`trust_safety_events` for review; uploads are never auto-blocked):
-
-- **Duplicate-face detection** (self-hosted, needs `FACE_VERIFY_ONNX=1`):
-  the photo's ArcFace embedding is upserted into `user_face_embeddings`
-  (pgvector) and ANN-searched against all other accounts — the same face on
-  two accounts is the classic stolen-photo / fake-profile signal. Threshold
-  `FACE_DUP_THRESHOLD` (cosine, default 0.5); flags as
-  `flag_duplicate_face` with the matching user ids + similarities.
-- **Celebrity screening** (opt-in: `CELEB_SCREENING_ENABLED=1`, needs
-  Rekognition): `RecognizeCelebrities` at `CELEB_MATCH_MIN_CONFIDENCE`
-  (default 90), flags as `flag_celebrity_photo`. Off by default; it requires
-  a curated celebrity gallery no self-hosted model provides.
-
-## Deployment (AWS EKS)
-
-### Development (in-cluster databases)
-```bash
-kubectl create namespace nava-dev
-kubectl apply -k rust-backend/k8s/overlays/dev/
-```
-
-### Production (RDS + ElastiCache)
-```bash
-kubectl create namespace nava-prod
-
-# Configure secrets (use AWS Secrets Manager in production)
-kubectl create secret generic nava-secrets \
-  --from-env-file=.env.production -n nava-prod
-
-# Deploy
-kubectl apply -k rust-backend/k8s/overlays/prod/
-
-# Verify
-kubectl get pods -n nava-prod
-kubectl get hpa -n nava-prod
-```
-
-### CI/CD Pipeline
-Automated via GitHub Actions (`.github/workflows/rust-ci.yml`):
-1. **Test** — `cargo fmt`, `cargo clippy`, `cargo test --lib`
-2. **DB Integration Tests** — PostgreSQL 16 service container, runs migrations, swipes partition regression test, statement_timeout verification (direct + PgBouncer modes)
-3. **Build** — Multi-stage Docker build, push to ECR
-4. **Deploy** — Rolling update to EKS with auto-rollback on failure
-
-### Kubernetes Features
-- **HPA** — Auto-scales 3→20 pods based on CPU (65%) and memory (75%)
-- **PDB** — Minimum 2 pods always available during upgrades
-- **Rolling updates** — Zero-downtime with `maxUnavailable: 0`
-- **Topology spread** — Pods distributed across AZs
-- **Network policies** — Restricted pod-to-pod traffic
-- **IRSA** — IAM Roles for Service Accounts (no embedded credentials)
-- **ALB Ingress** — TLS via ACM, WebSocket sticky sessions
-
-## Testing
-
-```bash
-# Unit & integration tests (127 tests: 84 unit + 43 integration)
-cd rust-backend && cargo test
-
-# Database integration tests (CI-automated)
-psql -f rust-backend/tests/swipes_partition_test.sql    # Partition regression
-psql -f rust-backend/tests/statement_timeout_test.sql   # Timeout verification
-
-# Load testing (PgBouncer + replica validation)
-k6 run tests/load/k6-pgbouncer-replica.js               # ML fallback, replica lag, pool saturation
-
-# Other test suites
-tests/e2e/run_tests.sh          # End-to-end user flows
-tests/load/k6 run load_tests.js # k6 load tests
-tests/contract/run_tests.sh     # API contract validation
-tests/smoke/run_tests.sh        # Health checks
-tests/fuzz/cargo +nightly fuzz  # Fuzz testing
-tests/chaos/chaos_tests.sh      # Resilience testing
-```
-
-## API Base URLs
-
-| Environment | HTTP | WebSocket |
-|------------|------|-----------|
-| Development | `http://127.0.0.1:8080` | `ws://127.0.0.1:8080` |
-| Production | `https://api.nava.app` | `wss://api.nava.app` |
-
-## Performance Targets
-
-| Metric | Target | SLO Alert |
-|--------|--------|-----------|
-| Availability | 99.9% (43 min/month) | Error rate > 0.1% for 5m |
-| API latency (p99) | < 500ms | > 500ms for 5m |
-| Discover latency (p99) | < 200ms | > 200ms for 5m |
-| ML scoring latency | < 10ms avg (in-memory) | > 10ms for 5m |
-| ML fallback rate | < 5% | > 5% warning, > 20% critical |
-| WebSocket connections | 10K+ per node | > 8,000 for 5m |
-| WebSocket latency | < 50ms | — |
-| DB pool utilization | < 80% | > 80% for 3m |
-| Write TPS capacity | ~5,000-8,000 | > 500 TPS sustained 10m |
-| Replica lag | < 2s | > 2s auto-fallback to primary |
-| Notif throttle rate | < 40% | > 40% blocked/deferred for 15m |
-| FL head weight norm | < 10.0 | > 10.0 for 15m (weight divergence) |
-
-## Data Models
-
-### UserProfile
-```
-id, name, phoneNumber, dob, age, gender, bio, location,
-profession, professionCategory, professionTitle,
-interests[], languages[], photos[], heightCm,
-lookingFor (long_term | short_term | casual | friendship | figuring_out),
-voiceIntroUrl, isProfileComplete, isVerified, isStudentVerified
-```
-
-### DiscoverProfile
-```
-id, name, age, bio, location, photos[], interests[], languages[],
-compatibilityScore (RL-scored), professionTitle, isVerified,
-voiceIntroUrl, hasVoiceIntro, hasReels, superLikedYou
-```
-
-### ChatMessage
-```
-id, matchId, senderId, receiverId, content, createdAt, isRead
-status: sending → sent → delivered → read
-```
-
-### Match
-```
-id, partner { id, name, age, location, bio, photos[] }, isMutual, status, matchedAt
-```
-
-### Reel / Spot
-```
-id, userId, userName, userAge, userPhoto, videoUrl, title, description,
-likeCount, viewCount, isVerified, location, tags[], compatibilityScore
-```
-
-### Call
-```
-callId, callType (audio | video), token, signalingUrl
-status: idle → connecting → ringing → active → idle
-```
-
-### Preferences
-```
-minAge, maxAge, maxDistanceKm, preferredGenders[], onlyVerified, onlyStudents
-```
-
-### Internal Database Tables
-
-| Table | Purpose |
-|-------|---------|
-| `notification_outcomes` | Sent notifications with variant_id, category, sent_at, opened_at for offline eval |
-| `notification_preferences` | Per-user opt-outs, daily caps, quiet hours |
-| `in_app_notifications` | In-app notification feed |
-| `fl_local_data` | Per-user FL local dataset stats (sample count, quality) |
-| `llm_labeling_queue` | Queue of reels/messages for LLM labeling |
-| `reel_llm_labels` | LLM-generated labels for reels (genre, mood, tags) |
-| `message_llm_labels` | NLP labels for messages (toxicity, intent) |
-| `user_llm_labels` | User-level labels from profile analysis |
-| `llm_training_snapshots` | Exported snapshots for model training |
-| `device_fingerprints` | Device model, OS, screen, timezone, language hashes |
-| `trust_safety_events` | Flagged anomalies (ring detection, velocity) |
-| `moderation_appeals` | User appeals of moderation decisions |
-| `content_moderation` | Moderation decisions (blurred, muted, etc.) |
-| `photo_quality_log` | Photo scoring and rejection reasons |
-| `media_renditions` | Image variants (150px, 400px, 1080px) |
-| `user_content_preferences` | Learned engagement scores with content genres |
-| `universities` | University database (name, country, domain) |
-| `student_discovery_swipes` | Swipes from university-specific discovery |
-| `payment_retry_tracking` | Webhook retry state for idempotency |
-
 ## Revenue Model
 
 ### 1. Subscriptions (Passes)
@@ -1854,235 +2234,3 @@ University-tiered pricing to drive campus adoption:
 | **RevenueCat** | Cross-platform | Subscription management + webhook sync |
 | **Razorpay** | India | UPI, cards, wallets, netbanking |
 | **Stripe** | Global | Cards, subscriptions, webhooks |
-
-## Monitoring & Alerting
-
-### Prometheus Metrics (`/metrics`)
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `app_http_requests_total` | Counter | Total HTTP requests by method/path/status |
-| `http_request_duration_seconds` | Histogram | Request latency by endpoint |
-| `app_db_pool_size` / `app_db_pool_idle` | Gauge | Database connection pool utilization |
-| `app_websocket_connections` | Gauge | Active WebSocket connections |
-| `app_photos_rejected_quality` | Counter | Photos rejected by aesthetic/blur/light scoring |
-| `app_moderation_actions_total` | Counter | Content moderation decisions applied |
-| `app_trust_safety_flags_total` | Counter | Trust & safety suspicious behavior flags |
-| `app_upload_deferrals_total` | Counter | Uploads deferred due to client battery/thermal state |
-| `app_ml_fallback_total` | Counter | Discover requests that fell back to attractiveness scoring |
-| `app_discover_requests_total` | Counter | Total discover requests (for fallback rate calculation) |
-| `app_ml_avg_scoring_latency_us` | Gauge | Average ML scoring latency in microseconds |
-| `app_vision_unavailable_total` | Counter | Vision endpoint requests when sidecar unavailable |
-| `app_swipe_writes_total` | Counter | Total swipe writes (like + pass) for TPS monitoring |
-| `app_replica_lag_ms` | Gauge | Read replica replication lag in milliseconds |
-| `app_replica_healthy` | Gauge | Read replica health (1=healthy, 0=degraded) |
-| `app_reads_from_replica` | Counter | Reads served by replica |
-| `app_reads_fallback_to_primary` | Counter | Reads that fell back to primary |
-| `dlq_entries_pending` | Gauge | Pending DLQ entries by queue |
-| `app_fl_rounds_completed` | Counter | Federated learning aggregation rounds completed |
-| `app_fl_head_weight_norm` | Gauge | L2 norm of personalization head weights (stability signal) |
-| `app_fl_cold_start_buckets` | Gauge | Number of active cold-start intent buckets |
-| `app_fl_notif_predictor_norm` | Gauge | L2 norm of notification click predictor weights |
-| `app_fl_dp_enabled` | Gauge | Whether differential privacy is enabled for FL (1/0) |
-| `notif_sent_total` | Counter | Total notifications sent (notification service) |
-| `notif_blocked_cap` | Counter | Notifications blocked by daily cap |
-| `notif_blocked_cooldown` | Counter | Notifications blocked by cooldown period |
-| `notif_blocked_optout` | Counter | Notifications blocked by user opt-out |
-| `notif_deferred_quiet` | Counter | Notifications deferred due to quiet hours |
-| `notif_deferred_timing` | Counter | Notifications deferred by send-time optimizer |
-| `notif_engagement_success` | Counter | Notification opens/clicks (success) |
-| `notif_engagement_failure` | Counter | Notification ignores (failure) |
-| `notif_variant_sends` | Gauge | Per-variant send count (bandit arms) |
-| `notif_variant_expected_rate` | Gauge | Per-variant expected open rate (Thompson Sampling) |
-
-### SLO Definitions
-
-| SLO | Target | Alert Threshold |
-|-----|--------|----------------|
-| **Availability** | 99.9% (43 min/month) | Error rate > 0.1% for 5m |
-| **API Latency** | p99 < 500ms | > 500ms for 5m |
-| **Discover Latency** | p99 < 200ms | > 200ms for 5m |
-| **DB Pool** | < 80% utilization | > 80% for 3m |
-| **Payment DLQ** | < 50 pending | > 50 for 10m |
-| **ML Scoring** | avg < 10ms | > 10ms for 5m |
-| **ML Fallback Rate** | < 5% | > 5% for 5m (warning), > 20% (critical) |
-| **WebSocket Capacity** | < 8,000 connections | > 8,000 for 5m |
-| **Notif Throttle Rate** | < 40% blocked/deferred | > 40% for 15m |
-| **Notif Engagement** | > 5% open rate | < 5% for 2h |
-| **Notif Variant Skew** | No single variant > 80% | > 80% for 1h |
-| **FL Aggregation** | Continuous rounds | Stalled for 6h (warning) |
-| **FL Weight Stability** | Head norm < 10.0 | > 10.0 for 15m |
-| **FL DP Enabled** | Always on in prod | Disabled for 5m (critical) |
-| **Canary Staleness** | Evaluate within 48h | Shadow mode > 48h without eval |
-
-### Alert Routing
-
-| Severity | Channels |
-|----------|----------|
-| **Warning** | Slack (`#nava-platform-alerts`, `#nava-payments-alerts`) |
-| **Critical** | Slack urgent channels + PagerDuty on-call |
-| **Security** | `#nava-security-alerts` + email to security team |
-
-**Alert Groups (15):** availability, latency, database, payments, ML scoring, vision, WebSocket, infrastructure, replica, PgBouncer, query, notification policy, content pipeline, FL stability, canary.
-
-Alert rules defined in `rust-backend/deploy/slo-alerts.yml` (38 alerts). Alertmanager config in `rust-backend/monitoring/alertmanager.yaml`.
-
-### Health Probes
-
-| Endpoint | Purpose | Details |
-|----------|---------|---------|
-| `/health` | Basic liveness | Returns 200 if app is running |
-| `/health/detailed` | Component health | DB pool, Redis, replica status, ML engine |
-| `/ready` | K8s readiness | Checks DB connectivity |
-| `/metrics` | Prometheus scrape | All counters, gauges, histograms |
-
-## Database Architecture
-
-### Connection Pooling (PgBouncer)
-- **Mode:** Transaction pooling (connection returned after each transaction)
-- **Pool:** 50 server connections, 1,000 max client connections
-- **Config:** `rust-backend/deploy/pgbouncer.ini`
-- **Note:** Session-level `SET` statements are lost between transactions — use `SET LOCAL` within transactions or configure in `postgresql.conf`
-
-### Read Replicas
-- **Primary pool** (`state.db`) — all writes + fallback reads
-- **Replica pool** (`state.db_read`) — read-heavy queries (discover, matches, profiles, admin stats, embeddings, reels)
-- **Health check:** Background task every 5s via `pg_last_xact_replay_timestamp()`
-- **Auto-fallback:** If replica lag > 2s, all reads automatically route to primary
-- **~15 read-heavy handlers** migrated to replica: profile, discover, matches, spots, admin stats, embeddings, bandit arms, training events, reels, learned patterns, payment reads
-
-### Swipes Partitioning
-- **Strategy:** Hash-partitioned by `from_user_id` into 8 partitions
-- **Benefit:** Write distribution across partitions, preserves UNIQUE constraint for ON CONFLICT upserts
-- **CI enforced:** Partition regression test runs on every push/PR
-
-### Write Scaling Roadmap
-- **Current capacity:** ~5,000-8,000 write TPS on 4vCPU/16GB primary (adequate for ~50K DAU)
-- **Sharding triggers:** Pool utilization >60% sustained, write p99 >100ms, WAL >500MB/min, DAU >100K
-- **Phase 1:** Functional sharding (swipes DB, messages DB, events DB)
-- **Phase 2:** Horizontal sharding by `user_id % N`
-- Full details in `rust-backend/deploy/ops-runbook.md`
-
-## Graceful Degradation
-
-| Component | When Unavailable | User Impact |
-|-----------|-----------------|-------------|
-| **Vision sidecar** | 503 on `/vision/analyze`, `/verify/selfie` | Photo analysis skipped, verification unavailable |
-| **ML ranking** | 2s timeout → attractiveness score fallback | Lower-quality discover rankings |
-| **ML `record_swipe`** | Fire-and-forget (`tokio::spawn`) | Zero impact on swipe latency |
-| **Read replica** | Auto-fallback to primary (lag >2s) | No user impact, higher primary load |
-| **Redis (cache)** | App runs without cache | Slightly slower responses |
-| **Notification bandit** | Shadow mode sends control variant | No variant optimization, baseline behavior |
-| **FL aggregation** | Stalled rounds, head weights frozen | Personalization stops improving, cold-start biases stale |
-| **Notif click predictor** | Falls back to uniform bandit priors | Bandit explores without informative priors |
-
-### Webhook Resilience
-- Razorpay and Stripe webhooks catch processing failures and auto-enqueue to DLQ
-- Always return 200 to payment gateway (prevents infinite retries)
-- DLQ entries can be retried or manually reviewed via `/api/payments/dlq/*` endpoints
-
-## Operations
-
-Full ops runbook at `rust-backend/deploy/ops-runbook.md` covering:
-- K8s secret rotation procedure (`SECRET_KEY_FILE` pattern)
-- SLO definitions and burn rate windows
-- Alert response playbooks for every alert (38 alerts across 15 groups)
-- ML fallback investigation and remediation
-- PgBouncer admin commands and scaling
-- Read replica monitoring and scaling
-- Write scaling roadmap and sharding strategy
-- Notification policy operations (bandit, caps, quiet hours, send-time)
-- Shadow-mode canary rollout procedure (6-step with SQL validation)
-- FL aggregation monitoring and weight drift investigation
-
-### Shadow-Mode Canary Script
-
-Operational script at `rust-backend/deploy/canary-shadow-notif.sh` for safe notification variant rollout:
-
-```bash
-./canary-shadow-notif.sh --enable     # Enable shadow mode (bandit selects but sends control)
-./canary-shadow-notif.sh --monitor    # Check canary health: metrics, alerts, DB outcomes
-./canary-shadow-notif.sh --evaluate   # Evaluate uplift with safety gates (sample size, skew, throttle)
-./canary-shadow-notif.sh --promote    # Promote bandit to live (sends winning variant)
-./canary-shadow-notif.sh --rollback   # Roll back to shadow mode
-```
-
-**Guardrails:** min 200 samples, throttle rate < 40%, variant skew < 80%, uplift threshold 2pp.
-Dry-run test harness at `rust-backend/deploy/test-canary-guardrails.sh` (28 tests).
-
-## AI, Personalization & Agentic Matching
-
-On-device chat suggestions support, per-user personalization, and agentic
-matching. The guiding principle: reuse what we already run (Redis, federated
-learning, the RL/bandit ranker, our governed API), keep the user-facing path
-fast and offline-capable, and add nothing we can't run cheaply at scale.
-Everything below is **additive** and **degrades gracefully** when its dependency
-(Redis, a configured model, a trained adapter) is absent.
-
-`AI_ARCHITECTURE.md` holds the same write-up spanning both repos; the backend
-detail is inlined here.
-
-### Real-time cross-instance fanout — `src/realtime.rs`
-- **What:** chat, call, and app-event WebSocket traffic fans out across pods over
-  Redis Pub/Sub, with call sessions shared in Redis so a callee on a different
-  pod can join.
-- **Why:** our WebSocket rooms lived in per-process memory, so two users on
-  different pods couldn't see each other's messages. This is the change that
-  makes "10k+ users" real.
-- **How it fits:** reuses the Redis we already run; single-pod behavior is
-  unchanged when Redis is absent.
-
-### FedLoRA — per-user chat personalization
-- **What:** migration `032_lora_adapters.sql`, `handlers/lora.rs`, and the
-  training worker `scripts/fedlora_trainer.py`. The device submits privacy-safe
-  signal and downloads a small per-user LoRA adapter; the worker trains it and
-  registers a new version, which we push to the device over the outbox + fanout.
-- **Why:** chat suggestions that match each user's voice. A **per-user LoRA
-  adapter** on a shared base is the cost-efficient way — *not* a full model per
-  user (millions of models is infeasible).
-- **How it fits:** reuses our existing federated-learning + differential-privacy
-  setup. Training is offline/GPU and stops when done; the adapter is applied
-  on-device at inference.
-
-### Agentic auto-matcher — `services/matchmaker.rs`, migration `033`
-- **What:** reciprocal preference scoring — we score A→B *and* B→A and combine
-  them (geometric mean, so one-sided interest stays low). High-scoring pairs
-  become proposals or, above a higher bar with safety gates, instant matches.
-- **Why:** "instant match without swiping." The prediction is a classic ML
-  problem we already solve.
-- **How it fits:** **reuses `MlService::rank_candidates`** (RL + LinUCB + geo +
-  affinity, already learned from swipes) in both directions — no new model.
-  Accept/decline calls the existing `record_swipe_weighted`, closing the RL loop.
-- **Safety:** disabled by default (`AUTO_MATCH_ENABLED=false`); proposals are the
-  default, instant auto-create is gated behind a high score + both-verified.
-
-### Prompt-driven matchmaker agent — `POST /agent/matchmaker/prompt`
-- **What:** a natural-language intent ("verified grad students who love hiking,
-  late 20s") is parsed into structured filters *in Rust* (`parse_intent`), then
-  run through the reciprocal scorer via a **governed tool** (`agent_query`).
-- **Why:** conversational matching, but with **no LLM inside the data layer**.
-- **How it fits — the key security decision:** the agent sits **above our API
-  boundary**, not in the data layer. It only ever produces *structured,
-  user-scoped filters* — never raw SQL — so every query inherits our existing
-  auth, row-scoping, and rate limits. Learning from engagement is the existing
-  Rust RL bandit; no Python and no per-request LLM.
-
-### Payments hardening
-- **Server-side Apple receipt verification** (`services/payments/apple.rs`) —
-  previously trusted a client-supplied transaction id (revenue-fraud hole); now
-  verifies against Apple and fails closed in production.
-- **Constant-time webhook signatures** (Razorpay/Stripe/RevenueCat) plus a
-  **5-minute Stripe replay window** — the old `expected == signature` leaked
-  timing and had no replay protection.
-
-### Why these decisions (trade-offs)
-
-| Decision | Why |
-|---|---|
-| **Per-user LoRA + retrieval**, not a full LLM per user | A model per user is infeasible; adapters + retrieval are cheap and scale. |
-| **Matching = bandit/RL in Rust**, not an LLM | Match prediction is a classic ML problem; an LLM would be slower, costlier, no better. |
-| **Agent above the API boundary** with governed tools | An LLM with DB access over user prompts is a PII/injection risk; governed tools reuse existing authz. |
-| **All-Rust + ONNX serving**; Python only for offline training | Serving stays in-stack and fast; only offline LLM/LoRA training needs Python/GPU, which then exports weights for Rust to serve. |
-
-See **[AI_ARCHITECTURE.md](AI_ARCHITECTURE.md)** for the cross-repo version,
-including the iOS on-device engine.
